@@ -106,6 +106,59 @@ if(MIKO_ENABLE_LLVM)
         endforeach()
     endif()
 
+    # LLVM's exported targets name optional dependencies without defining them:
+    # LLVMSupport lists ZLIB::ZLIB and zstd::libzstd_static, LLVMDebugInfoPDB lists
+    # DIASDK::Diaguids. A distribution's LLVM usually defines these through its own
+    # config. The official release archive does not, and LLVMExports.cmake then
+    # refuses to load, one missing name at a time.
+    #
+    # An empty interface target gets configure through but is not enough to link:
+    # LLVMSupport's Compression.cpp really does call crc32/compress2 and the zstd
+    # entry points, and the linker pulls that object in. So when zlib and zstd can
+    # be found, link them for real; when they cannot, the stubs still let configure
+    # succeed and the link error names exactly what is missing.
+    if(NOT TARGET ZLIB::ZLIB)
+        find_package(ZLIB QUIET)
+    endif()
+    if(NOT TARGET ZLIB::ZLIB AND ZLIB_FOUND)
+        add_library(ZLIB::ZLIB UNKNOWN IMPORTED)
+        set_target_properties(ZLIB::ZLIB PROPERTIES
+            IMPORTED_LOCATION "${ZLIB_LIBRARIES}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIRS}")
+    endif()
+
+    # zstd has no FindZstd module, so accept explicit locations and fall back to a
+    # search of the usual prefixes.
+    if(NOT MIKO_ZSTD_LIBRARY)
+        find_library(MIKO_ZSTD_LIBRARY NAMES zstd_static zstd libzstd_static)
+    endif()
+    if(NOT MIKO_ZSTD_INCLUDE_DIR)
+        find_path(MIKO_ZSTD_INCLUDE_DIR NAMES zstd.h)
+    endif()
+    if(MIKO_ZSTD_LIBRARY AND NOT TARGET zstd::libzstd_static)
+        add_library(zstd::libzstd_static UNKNOWN IMPORTED)
+        set_target_properties(zstd::libzstd_static PROPERTIES
+            IMPORTED_LOCATION "${MIKO_ZSTD_LIBRARY}")
+        if(MIKO_ZSTD_INCLUDE_DIR)
+            set_target_properties(zstd::libzstd_static PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${MIKO_ZSTD_INCLUDE_DIR}")
+        endif()
+    endif()
+
+    foreach(_stub
+        ZLIB::ZLIB
+        zstd::libzstd_static
+        zstd::libzstd_shared
+        DIASDK::Diaguids
+        Terminfo::terminfo
+        LibXml2::LibXml2
+        CURL::libcurl
+    )
+        if(NOT TARGET ${_stub})
+            add_library(${_stub} INTERFACE IMPORTED)
+        endif()
+    endforeach()
+
     find_package(LLVM REQUIRED CONFIG)
 
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")

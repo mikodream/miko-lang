@@ -7,6 +7,7 @@
 #include "miko/NumericLiterals.h"
 #include "miko/sema/Type.h"
 
+#include <llvm/Config/llvm-config.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -1877,7 +1878,7 @@ private:
             if (path.type.kind() != TypeKind::String) {
                 throw std::runtime_error("file_exists expects a string path");
             }
-            llvm::Value* mode = builder_.CreateGlobalStringPtr("rb");
+            llvm::Value* mode = cstring("rb");
             llvm::Value* file = builder_.CreateCall(fopen_, {path.value, mode}, "file_exists.handle");
             llvm::Value* exists = builder_.CreateICmpNE(file, llvm::ConstantPointerNull::get(llvm::PointerType::get(context_, 0)), "file_exists.result");
             auto* existsBlock = llvm::BasicBlock::Create(context_, "file_exists.close", builder_.GetInsertBlock()->getParent());
@@ -1934,7 +1935,7 @@ private:
         // could not tell a partial result from a complete one. The runtime
         // function keeps the platform symbol (MSVC's __acrt_iob_func) out of
         // the generated IR.
-        auto* text = builder_.CreateGlobalStringPtr(message);
+        auto* text = cstring(message);
         builder_.CreateCall(runtimeError_, {text});
         builder_.CreateUnreachable();
     }
@@ -1988,6 +1989,21 @@ private:
     }
 
 
+    // LLVM 23 removed IRBuilder::CreateGlobalStringPtr; CreateGlobalString is the
+    // replacement and returns the same thing under opaque pointers (a pointer to
+    // the byte array is the pointer). miko does not set the address space, and every
+    // call site wants exactly "a pointer to this literal". Verified against LLVM 22
+    // (where the old name still exists) and LLVM 23 (where it does not).
+    llvm::Value* cstring(const llvm::StringRef text) {
+#if LLVM_VERSION_MAJOR >= 23
+        // CreateGlobalString returns GlobalVariable*, which is already the pointer
+        // the call sites want under opaque pointers; GlobalVariable derives from
+        // Value, so no cast is needed.
+        return builder_.CreateGlobalString(text, ".miko.str", 0, module_.get());
+#else
+        return builder_.CreateGlobalStringPtr(text);
+#endif
+    }
     void emitWriteFile(llvm::Value* path, llvm::Value* content) {
         // miko_write_file takes the length from the string header, so binary
         // content survives - the fopen/fwrite sequence this replaces measured with
@@ -1998,54 +2014,54 @@ private:
 
     void emitPrint(ValueInfo argument) {
         if (argument.type.kind() == TypeKind::String) {
-            auto* format = builder_.CreateGlobalStringPtr("%s\n");
+            auto* format = cstring("%s\n");
             builder_.CreateCall(printf_, {format, argument.value});
             return;
         }
 
         if (argument.type.kind() == TypeKind::Bool) {
-            auto* trueText = builder_.CreateGlobalStringPtr("true");
-            auto* falseText = builder_.CreateGlobalStringPtr("false");
+            auto* trueText = cstring("true");
+            auto* falseText = cstring("false");
             auto* text = builder_.CreateSelect(argument.value, trueText, falseText);
-            auto* format = builder_.CreateGlobalStringPtr("%s\n");
+            auto* format = cstring("%s\n");
             builder_.CreateCall(printf_, {format, text});
             return;
         }
 
         if (argument.type.kind() == TypeKind::I32) {
-            auto* format = builder_.CreateGlobalStringPtr("%d\n");
+            auto* format = cstring("%d\n");
             builder_.CreateCall(printf_, {format, argument.value});
             return;
         }
 
         if (argument.type.kind() == TypeKind::Byte) {
-            auto* format = builder_.CreateGlobalStringPtr("%u\n");
+            auto* format = cstring("%u\n");
             ValueInfo promoted = convertValue(argument, Type(TypeKind::I32));
             builder_.CreateCall(printf_, {format, promoted.value});
             return;
         }
 
         if (argument.type.kind() == TypeKind::Char) {
-            auto* format = builder_.CreateGlobalStringPtr("%c\n");
+            auto* format = cstring("%c\n");
             builder_.CreateCall(printf_, {format, argument.value});
             return;
         }
 
         if (argument.type.kind() == TypeKind::I64) {
-            auto* format = builder_.CreateGlobalStringPtr("%lld\n");
+            auto* format = cstring("%lld\n");
             builder_.CreateCall(printf_, {format, argument.value});
             return;
         }
 
         if (argument.type.kind() == TypeKind::F32) {
-            auto* format = builder_.CreateGlobalStringPtr("%g\n");
+            auto* format = cstring("%g\n");
             ValueInfo promoted = convertValue(argument, Type(TypeKind::F64));
             builder_.CreateCall(printf_, {format, promoted.value});
             return;
         }
 
         if (argument.type.kind() == TypeKind::F64) {
-            auto* format = builder_.CreateGlobalStringPtr("%g\n");
+            auto* format = cstring("%g\n");
             builder_.CreateCall(printf_, {format, argument.value});
             return;
         }
@@ -2509,9 +2525,28 @@ private:
             argumentsStorage.push_back("-O" + std::to_string(options_.optLevel));
         }
         argumentsStorage.push_back("-Wno-override-module");
+        // The runtime has to be on the link line. Generated code calls
+        // miko_run_command, miko_set_args, miko_write_file and the string helpers,
+        // and none of them exist in libc: without this the link fails with
+        // "undefined symbol: miko_set_args" for any program that uses them. The
+        // self-hosted compiler has always passed it (compiler/main_ll.miko); this
+        // path did not, so stage 0's --compile could not link a program the
+        // self-hosted one built happily.
         argumentsStorage.push_back(result_.irPath);
+        argumentsStorage.push_back("runtime/miko_runtime.c");
         argumentsStorage.push_back("-o");
         argumentsStorage.push_back(options_.outputPath);
+
+        // -lm only where libm is a separate library. On Windows the math functions
+        // live in the CRT and clang passes the flag through to lld-link, which then
+        // fails with "could not open 'm.lib'". The self-hosted compiler sidesteps
+        // this by calling dist/miko-link.bat, which builds its own command line;
+        // stage 0 invokes clang directly, so it has to know the difference.
+        const std::string hostTriple = llvm::sys::getDefaultTargetTriple();
+        if (hostTriple.find("windows") == std::string::npos &&
+            hostTriple.find("msvc") == std::string::npos) {
+            argumentsStorage.push_back("-lm");
+        }
 
         return runClang(argumentsStorage, "linking native executable");
     }

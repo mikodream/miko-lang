@@ -29,34 +29,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # LLVM is not installed here on purpose. The runner image already carries a
-      # full LLVM (20.1.8 on windows-2025) at C:\Program Files\LLVM, with the CMake
-      # package that stage 0 needs. `choco install llvm` puts a clang-only build in
-      # the same place, and that package ships no LLVMConfig.cmake at all - which is
-      # how this workflow came to fail inside find_package(LLVM) on its first real
-      # run. MinGW is still needed: difftest links emitted IR with gcc.
-      - name: Install MinGW and locate LLVM
+      # Windows needs the LLVM release archive, not the LLVM installer. Neither
+      # `choco install llvm` nor the official LLVM-*-win64.exe publishes
+      # LLVMConfig.cmake - both install a clang-only tree whose lib/cmake/llvm holds
+      # LLVMConfigExtensions.cmake and nothing else - so find_package(LLVM) fails
+      # whichever directory is pointed at it. Checked on a machine with both
+      # installed. The release archive carries the whole development tree.
+      #
+      # 22.1.8 specifically: 23.x is configured with zlib and zstd, so its exported
+      # targets reference ZLIB::ZLIB and zstd::libzstd_static and the link needs both
+      # libraries present; it also removes IRBuilder::CreateGlobalStringPtr and
+      # rejects miko's generated IR. The 22.1.8 archive needs neither dependency and
+      # is a version this compiler is verified against.
+      - name: Cache LLVM (Windows)
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm
+          key: llvm-22.1.8-windows-x86_64
+
+      - name: Install LLVM 22.1.8 from the release archive (Windows)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          choco install mingw --yes --no-progress
-          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz"
+          $archive = Join-Path $env:RUNNER_TEMP "llvm.tar.xz"
+          Write-Host "downloading $url"
+          curl.exe -L --fail --retry 3 --output $archive $url
+          if ($LASTEXITCODE -ne 0) { throw "LLVM download failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force -Path C:\llvm | Out-Null
+          # .tar.xz, not .tar.zst: the zstd archives are compressed with a window
+          # size bsdtar refuses by default ("Frame requires too much memory for
+          # decoding"), which was verified here rather than in CI.
+          tar -xf $archive -C C:\llvm --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw "LLVM extraction failed: $LASTEXITCODE" }
+          Remove-Item $archive -Force
 
-          $candidates = @(
-            "C:\Program Files\LLVM\lib\cmake\llvm",
-            "C:\Program Files (x86)\LLVM\lib\cmake\llvm"
-          )
-          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "LLVMConfig.cmake") } | Select-Object -First 1
-          if (-not $found) {
-            # Last resort: ask any llvm-config on the box where its CMake files are.
-            $llvmConfig = Get-Command llvm-config -ErrorAction SilentlyContinue
-            if ($llvmConfig) {
-              $dir = & $llvmConfig.Source --cmakedir 2>$null
-              if ($dir -and (Test-Path (Join-Path $dir.Trim() "LLVMConfig.cmake"))) { $found = $dir.Trim() }
-            }
-          }
-          if (-not $found) { throw "LLVMConfig.cmake not found; the runner image changed" }
+      - name: Locate LLVM and MinGW (Windows)
+        shell: pwsh
+        run: |
+          $found = "C:\llvm\lib\cmake\llvm"
+          if (-not (Test-Path (Join-Path $found "LLVMConfig.cmake"))) { throw "LLVMConfig.cmake missing from the archive layout" }
           Write-Host "LLVM_DIR=$found"
           "LLVM_DIR=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "C:\llvm\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+          # difftest links the emitted IR with gcc, which LLVM does not provide.
+          choco install mingw --yes --no-progress
+          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       - name: Report toolchain
         run: |
