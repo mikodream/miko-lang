@@ -128,6 +128,11 @@ jobs:
           # the IR writer reports "no such file or directory" for a path it was never
           # able to create.
           New-Item -ItemType Directory -Force -Path out | Out-Null
+          # dist/miko.toolchain names the link script and is deliberately not tracked
+          # (it records a build-time path). Without it the compiler falls back to a
+          # bare clang command, which is not how a release is built, so the gate would
+          # be testing a path nobody ships.
+          "dist\miko-link.bat" | Out-File -Encoding ascii -NoNewline miko.toolchain
           & build-vs-llvm\Release\miko.exe compiler\main_ll.miko --compile --emit-ir -o out\self.ll
           if ($LASTEXITCODE -ne 0) { throw "self-hosted IR emission failed" }
           cmd /c "dist\miko-link.bat out\self.ll out\miko_self.exe"

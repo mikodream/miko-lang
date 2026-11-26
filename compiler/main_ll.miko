@@ -312,6 +312,15 @@ fn link_executable(output_prefix: string): i64 {
     let ir = output_prefix + ".ll";
     let exe = output_prefix + exe_suffix;
     if script == "" {
+        // -lm only where libm is a separate library. On Windows the math functions
+        // live in the CRT and clang forwards the flag to lld-link, which then fails
+        // with "could not open 'm.lib'" - so every compile failed on a Windows
+        // checkout that had no toolchain file yet, which is exactly the state of a
+        // fresh clone. The script path below decides the platform itself; this only
+        // matters on the fallback.
+        if file_exists("C:\\Windows") {
+            return run_command("clang \"" + ir + "\" runtime/miko_runtime.c -o \"" + exe + "\"");
+        }
         return run_command("clang \"" + ir + "\" runtime/miko_runtime.c -o \"" + exe + "\" -lm");
     }
     if windows {
