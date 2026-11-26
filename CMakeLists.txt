@@ -161,6 +161,48 @@ if(MIKO_ENABLE_LLVM)
 
     find_package(LLVM REQUIRED CONFIG)
 
+    # LLVM's Windows export file hardcodes the DIA SDK path of the machine the
+    # archive was built on: LLVMDebugInfoPDB's INTERFACE_LINK_LIBRARIES contains
+    # ".../Microsoft Visual Studio/2022/Enterprise/DIA SDK/lib/amd64/diaguids.lib".
+    # Anywhere else that link dies with LNK1181 before producing a binary, which
+    # reads like a miko bug and is not one. There is no DIASDK::Diaguids target to
+    # redirect - the raw path is in the property - so rewrite the property: point it
+    # at the DIA SDK of the Visual Studio that is here, or drop it, since miko never
+    # touches the PDB readers.
+    file(GLOB _dia_candidates
+        "C:/Program Files/Microsoft Visual Studio/*/*/DIA SDK/lib/amd64/diaguids.lib"
+        "C:/Program Files (x86)/Microsoft Visual Studio/*/*/DIA SDK/lib/amd64/diaguids.lib"
+    )
+    list(GET _dia_candidates 0 _dia_real)
+    foreach(_llvm_target ${LLVM_AVAILABLE_LIBS})
+        if(TARGET ${_llvm_target})
+            get_target_property(_link_iface ${_llvm_target} INTERFACE_LINK_LIBRARIES)
+            if(_link_iface)
+                set(_rebuilt "")
+                set(_changed FALSE)
+                foreach(_entry ${_link_iface})
+                    if(_entry MATCHES "[Dd][Ii][Aa] ?[Ss][Dd][Kk]" OR _entry MATCHES "diaguids")
+                        set(_changed TRUE)
+                        if(_dia_real AND EXISTS "${_dia_real}")
+                            list(APPEND _rebuilt "${_dia_real}")
+                        endif()
+                    else()
+                        list(APPEND _rebuilt "${_entry}")
+                    endif()
+                endforeach()
+                if(_changed)
+                    set_target_properties(${_llvm_target} PROPERTIES
+                        INTERFACE_LINK_LIBRARIES "${_rebuilt}")
+                endif()
+            endif()
+        endif()
+    endforeach()
+    if(_dia_real AND EXISTS "${_dia_real}")
+        message(STATUS "DIA SDK: ${_dia_real}")
+    else()
+        message(STATUS "DIA SDK: absent, linking without it")
+    endif()
+
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
     message(STATUS "LLVM_DIR: ${LLVM_DIR}")
     message(STATUS "LLVM include dirs: ${LLVM_INCLUDE_DIRS}")
