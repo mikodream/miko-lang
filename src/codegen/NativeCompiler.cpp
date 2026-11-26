@@ -94,6 +94,29 @@ char unquoteChar(const std::string& value) {
     return decodeCharLiteral(value);
 }
 
+// Module::setTargetTriple accepts a StringRef in older LLVM releases and a
+// llvm::Triple in LLVM 20 and later. A Triple converts to std::string but not to
+// StringRef without a second user-defined conversion, which C++ refuses, so there
+// is no single call that compiles against both. Overload resolution decides:
+// the first form is chosen when setTargetTriple can take the string directly, and
+// the second wraps it in a Triple otherwise. SFINAE keeps this honest without a
+// version constant that would have to be updated for every LLVM release.
+template <typename ModuleT, typename StringT>
+auto setModuleTripleImpl(ModuleT& module, const StringT& triple, int)
+    -> decltype(module.setTargetTriple(triple), void()) {
+    module.setTargetTriple(triple);
+}
+
+template <typename ModuleT, typename StringT>
+void setModuleTripleImpl(ModuleT& module, const StringT& triple, long) {
+    module.setTargetTriple(llvm::Triple(triple));
+}
+
+template <typename ModuleT, typename StringT>
+void setModuleTriple(ModuleT& module, const StringT& triple, int) {
+    setModuleTripleImpl(module, triple, 0);
+}
+
 class LlvmNativeCompiler {
 public:
     explicit LlvmNativeCompiler(const NativeCompileOptions& options)
@@ -102,7 +125,13 @@ public:
           module_(std::make_unique<llvm::Module>(moduleName(), context_)),
           builder_(context_) {
         const std::string triple = options_.targetTriple.empty() ? llvm::sys::getDefaultTargetTriple() : options_.targetTriple;
-        module_->setTargetTriple(llvm::Triple(triple));
+        // Module::setTargetTriple changed shape between LLVM releases: older ones
+        // take a StringRef, LLVM 20 and later take a llvm::Triple. A Triple
+        // converts to std::string but not to StringRef without a second
+        // user-defined conversion, which C++ refuses, so no single spelling works
+        // for both. Rather than hard-code a version boundary that has to be kept
+        // honest, ask the compiler which overload exists.
+        setModuleTriple(*module_, triple, 0);
     }
 
     NativeCompileResult compile(const Program& program) {

@@ -172,7 +172,12 @@ function Run-Cpp($name, $src) {
     $r = Invoke-Captured $script:clang @("-c", $ll, "-o", $obj, "-Wno-override-module")
     if ($r.ExitCode -ne 0) { return @{ Outcome = "reject"; Output = ""; Stderr = ""; Detail = ("IR does not compile: " + (Normalize $r.Stderr)) } }
 
-    $r = Invoke-Captured $script:cc @($obj, $script:runtimeSrc, "-o", $exe)
+    # -lm is not decoration: sqrt/floor/ceil/round lower to libm calls, glibc keeps
+    # them in a separate library, and without it this link fails on Linux while
+    # succeeding on Windows (ucrt has them in the default import libraries). That
+    # asymmetry is how 17_floats came back as "C++ backend rejects" on the first
+    # real Linux run. MinGW accepts the flag and ignores it.
+    $r = Invoke-Captured $script:cc @($obj, $script:runtimeSrc, "-o", $exe, "-lm")
     if ($r.ExitCode -ne 0) { return @{ Outcome = "reject"; Output = ""; Stderr = ""; Detail = ("link failed: " + (Normalize $r.Stderr)) } }
 
     $run = Invoke-Captured $exe @()

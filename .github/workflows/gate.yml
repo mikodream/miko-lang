@@ -42,8 +42,34 @@ jobs:
           gcc --version
           cmake --version
 
+      # Which Visual Studio the runner image ships is not something this workflow
+      # should know. It used to say "Visual Studio 17 2022" and that is exactly how
+      # the first real run failed: windows-latest had already moved to Visual
+      # Studio 18 2026, so configure died before compiling a line. vswhere ships
+      # with every VS 2017+ install, so the generator is detected.
+      #
+      # CMake's default is not usable: it picks Ninja when ninja is on PATH, and
+      # Ninja has no -A platform and would build with MinGW, which cannot link
+      # against the MSVC-built LLVM package.
       - name: Configure
-        run: cmake -S . -B build-vs-llvm -G "Visual Studio 17 2022" -A x64
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" }
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - no Visual Studio on this runner" }
+          $generator = $null
+          foreach ($candidate in @(
+            @{ Major = 18; Name = "Visual Studio 18 2026" },
+            @{ Major = 17; Name = "Visual Studio 17 2022" }
+          )) {
+            $range = "[$($candidate.Major).0,$($candidate.Major + 1).0)"
+            $found = & $vswhere -latest -products * -version $range -property installationPath 2>$null
+            if ($found -and -not $generator) { $generator = $candidate.Name }
+          }
+          if (-not $generator) { throw "no Visual Studio with a C++ toolset found" }
+          Write-Host "using generator: $generator"
+          cmake -S . -B build-vs-llvm -G $generator -A x64 -DMIKO_ENABLE_LLVM=ON
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 
       - name: Build the C++ compiler
         run: cmake --build build-vs-llvm --config Release --target miko
