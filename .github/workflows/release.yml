@@ -57,11 +57,6 @@ jobs:
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
-    # The arm64 images are the ones most likely to be missing a component (LLVM is
-    # not installed everywhere). A release missing one platform is still worth
-    # shipping, and the gap is visible in the run summary, so those jobs are marked
-    # experimental rather than allowed to fail the whole release.
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       # One platform failing must not cancel the others: a release missing only
       # the arm64 Mac is still worth shipping, and the failure is visible in the
@@ -94,12 +89,12 @@ jobs:
             arch: x64
             target: windows-x64
             archive: miko-${{ needs.version.outputs.version }}-windows-x64.zip
-          - name: windows-arm64
-            os: windows-11-arm
-            arch: arm64
-            target: windows-arm64
-            experimental: true
-            archive: miko-${{ needs.version.outputs.version }}-windows-arm64.zip
+          # windows-arm64 is not in this matrix on purpose. windows-11-arm has no
+          # Visual Studio at all - vswhere.exe is absent - so stage 0, which is a C++
+          # program built by MSVC, cannot be built there. Shipping that job as
+          # "experimental" only produced a red run every time without ever producing
+          # a package, which is worse than saying plainly that the platform is not
+          # covered.
 
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +111,12 @@ jobs:
           # whatever `llvm-dev` happens to point at: 23.x removed
           # IRBuilder::CreateGlobalStringPtr and rejects the IR this backend emits,
           # so an unpinned install breaks the build the day the runner updates.
-          sudo apt-get install -y llvm-18 llvm-18-dev clang-18 libclang-18-dev gcc
+          #
+          # libtinfo-dev, zlib1g-dev and libzstd-dev are not optional extras: LLVM's
+          # own archives call into terminfo and zstd, and without the -dev packages
+          # there is no libtinfo.so for the linker to resolve set_curterm against.
+          sudo apt-get install -y llvm-18 llvm-18-dev clang-18 libclang-18-dev gcc \
+            libtinfo-dev zlib1g-dev libzstd-dev
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
@@ -129,12 +129,17 @@ jobs:
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm
+          # zstd and zlib are keg dependencies Homebrew's LLVM links against but does
+          # not re-export; without them the link stops on undefined ZSTD symbols.
+          brew install llvm zstd zlib
           prefix="$(brew --prefix llvm)"
           echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
           # Homebrew's LLVM is keg-only: clang and llvm-config are not on PATH by
           # default, and the link script calls bare `clang`.
           echo "$prefix/bin" >> "$GITHUB_PATH"
+          # find_library has no reason to look inside the kegs.
+          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
+          echo "CPATH=$(brew --prefix zstd)/include:$(brew --prefix zlib)/include" >> "$GITHUB_ENV"
 
       # Windows needs the LLVM release archive, not the LLVM installer: neither
       # `choco install llvm` nor the official LLVM-*-win64.exe publishes

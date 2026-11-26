@@ -241,7 +241,23 @@ if(MIKO_ENABLE_LLVM)
     # not ship, and handing that to the linker turns a working build into
     # "LNK1181: cannot open input file 'xml2s.lib'". Anything already resolvable as
     # a -l flag, or as a file that exists, is kept.
-    find_program(MIKO_LLVM_CONFIG_EXE NAMES llvm-config llvm-config.exe)
+    # Ubuntu installs llvm-config as llvm-config-18 rather than llvm-config, so
+    # looking only for the unversioned name finds nothing there and silently links
+    # no system libraries at all - which is why terminfo stayed missing after this
+    # was first added. The version comes from the package that was just found.
+    set(_llvm_config_names llvm-config llvm-config.exe)
+    if(LLVM_PACKAGE_VERSION_MAJOR)
+        list(APPEND _llvm_config_names
+            "llvm-config-${LLVM_PACKAGE_VERSION_MAJOR}"
+            "llvm-config-${LLVM_PACKAGE_VERSION}")
+    endif()
+    if(LLVM_PACKAGE_VERSION)
+        string(REGEX MATCH "^[0-9]+" _llvm_major "${LLVM_PACKAGE_VERSION}")
+        if(_llvm_major)
+            list(APPEND _llvm_config_names "llvm-config-${_llvm_major}")
+        endif()
+    endif()
+    find_program(MIKO_LLVM_CONFIG_EXE NAMES ${_llvm_config_names})
     set(MIKO_LLVM_SYSTEM_LIBS "")
     if(MIKO_LLVM_CONFIG_EXE)
         execute_process(
@@ -274,6 +290,27 @@ if(MIKO_ENABLE_LLVM)
                     endif()
                 endif()
             endforeach()
+        endif()
+    endif()
+
+    # A second line of defence: llvm-config --system-libs is not dependable across
+    # distributions - Ubuntu's LLVM 18 omits terminfo even though LLVMSupport calls
+    # into it, and Homebrew's LLVM does not publish its zstd/zlib paths outside the
+    # keg. Both are needed to link, so whatever is actually installed is added here
+    # as well and duplicates are harmless. On Windows these live in the CRT or are
+    # imported by name, so none of it applies.
+    if(NOT WIN32)
+        find_library(MIKO_TERMINFO_LIB NAMES tinfo terminfo)
+        if(MIKO_TERMINFO_LIB)
+            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${MIKO_TERMINFO_LIB}")
+        endif()
+        find_library(MIKO_ZLIB_LIB NAMES z libz)
+        if(MIKO_ZLIB_LIB)
+            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${MIKO_ZLIB_LIB}")
+        endif()
+        find_library(MIKO_ZSTD_SYS_LIB NAMES zstd libzstd)
+        if(MIKO_ZSTD_SYS_LIB)
+            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${MIKO_ZSTD_SYS_LIB}")
         endif()
     endif()
 
