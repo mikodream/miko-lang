@@ -222,25 +222,27 @@ if(MIKO_ENABLE_LLVM)
 
     # Static archives mean the linker sees a long list of .a files whose order decides
     # whether anything resolves, and a distribution's LLVMSupport calls into zstd and
-    # terminfo, which have to appear after it. CMake does not preserve that order for
-    # imported targets - the link failed with "undefined reference to
-    # ZSTD_compressBound" while libzstd.so was on the command line twice, both times
-    # too early. Repeating the entries, spelling them -lzstd, and passing them as link
-    # options all failed the same way (options are emitted before the libraries).
+    # terminfo, so those have to come after it. Every attempt to place them by hand
+    # failed, and the reasons are worth keeping:
     #
-    # So on non-Windows the shared library is preferred, through LLVM's own supported
-    # switch rather than by hunting for a file name: LLVM_LINK_LLVM_DYLIB makes
-    # llvm_map_components_to_libnames return the LLVM target that LLVMConfig.cmake
-    # defines, pointing at whatever the distribution actually installed. A shared
-    # library resolves regardless of order, so there is nothing left to get wrong.
-    # Searching for it by hand was the previous attempt and it found libLLVM.so on
-    # arm64 (LLVM 18.1.3) and nothing on x64 (18.1.8) - the same distro, different
-    # patch release, different layout.
+    #   - plain target_link_libraries: CMake put libzstd.so ahead of libLLVMSupport.a
+    #     and the message was "undefined reference to ZSTD_compressBound" while the
+    #     library was on the line, twice.
+    #   - repeating the entries: CMake gathered both copies into the same early block.
+    #   - target_link_options: emitted before the libraries, not after.
+    #   - -Wl,--start-group/--end-group around ${LLVM_LIBS}: only the nine components
+    #     named here land inside the group. CMake appends the transitive archives
+    #     (including a second libLLVMSupport.a) after --end-group, so the order
+    #     problem was still there.
+    #   - LLVM_LINK_LLVM_DYLIB: the mapping still returned archives on Ubuntu.
     #
-    # Windows keeps the static archives: they link there, its zlib and zstd come from
-    # the CRT or are imported by name, and the official archive ships no C++ dylib.
+    # CMAKE_CXX_STANDARD_LIBRARIES is the one place CMake guarantees the end of the
+    # link line, after the target's own libraries and everything they pull in. That is
+    # exactly where these belong. Windows needs none of it: its zlib and zstd come
+    # from the CRT or are imported by name, and it links clean today.
     if(NOT WIN32)
-        set(LLVM_LINK_LLVM_DYLIB ON)
+        set(CMAKE_CXX_STANDARD_LIBRARIES
+            "${CMAKE_CXX_STANDARD_LIBRARIES} -lz -lzstd -ltinfo")
     endif()
 
     llvm_map_components_to_libnames(LLVM_LIBS
@@ -251,21 +253,10 @@ if(MIKO_ENABLE_LLVM)
         passes
     )
 
+    target_link_libraries(miko PRIVATE ${LLVM_LIBS})
     message(STATUS "LLVM link libraries: ${LLVM_LIBS}")
-
-    # If the mapping still produced archives, the order problem is live again, so the
-    # archives and the system libraries go inside a linker group. GNU ld rescans a
-    # group until nothing new resolves, which removes the ordering question entirely.
-    # ld64 on macOS has no such flag, which is why the dylib is the preferred path.
-    if(NOT WIN32 AND NOT "${LLVM_LIBS}" STREQUAL "LLVM")
-        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
-            target_link_libraries(miko PRIVATE
-                -Wl,--start-group ${LLVM_LIBS} -lz -lzstd -ltinfo -Wl,--end-group)
-        else()
-            target_link_libraries(miko PRIVATE ${LLVM_LIBS} -lz -lzstd -ltinfo)
-        endif()
-    else()
-        target_link_libraries(miko PRIVATE ${LLVM_LIBS})
+    if(NOT WIN32)
+        message(STATUS "appended to the end of the link line: -lz -lzstd -ltinfo")
     endif()
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
