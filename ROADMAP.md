@@ -476,3 +476,85 @@ s = append_str(s, piece);
 - 头部涨到 16 字节，短串开销比例更高了。
 - `codegen_c.miko` 有 57 处同样的累加，**没改**——它自带一套无头部的 C 运行时，与头部方案本就分家，且不在 difftest 门禁内（见 #11）。
 - 词法/解析层的累加是按行批量改的，用的是"变量名是 `out`/`body` 且右值是纯拼接"这个模式。若将来有人写 `out = out + f(...) + g(...)` 里带副作用，这个模式仍然成立；但若写 `x = x + ...` 而 `x` 有别名，就踩所有权规则了。
+
+
+---
+
+## 九、发布：把代码交出去，让它在别的机器上建起来
+
+前八节都在本机跑。这一节记录第一次把仓库推到 GitHub 并用 CI 建发布包时发生的事——六个平台、六个不同原因失败，每一个都只在别人的机器上出现。
+
+### 9.1 发布内容
+
+仓库推到 `https://github.com/mikodream/miko-lang.git`，`main` 为默认分支。历史是新建的：原仓库里 `release/miko-development.zip` 有 289 MB，GitHub 单文件上限 100 MB，直接推会被拒。所以用 `--orphan` 起了一条新历史，只提交整理后的 164 个文件（0.94 MB，最大 `compiler/codegen_ll.miko` 138.9 KB）。
+
+不发布的：`release/`（1.07 GB）、`out/`（226 MB）、八个 `build-*`、`cmake-build-*`、`Testing/`、19 个根目录 `*.obj`、`dist/` 下的产物、`miko.toolchain`、`猜数字游戏.miko`、编辑器目录。
+
+**保留 `examples/`**，虽然任务是"删掉实例代码"。原因是 `tools/difftest.ps1` 扫 `examples/*_error.miko` 取 12 个拒绝用例，且 `if (Test-Path $exampleDir)` 意味着目录一没门禁就静默缩小；`CMakeLists.txt` 的 ctest 也引用 35 个例子文件。它们不进发布包，所以在包里看不到，但仍然承担门禁职责。删掉它等于把门禁悄悄拆掉一半。
+
+### 9.2 一个 tag 一条 release，六种架构
+
+`.github/workflows/release.yml`：`push: main` 与 `workflow_dispatch` 触发，读 `CMakeLists.txt` 里的 `MIKO_VERSION` 组成 `v${version}-${run_number}` 作为 tag，发布到 release。矩阵六格：`linux-x64`、`linux-arm64`、`macos-x64`、`macos-arm64`、`windows-x64`、`windows-arm64`。
+
+**不用交叉编译**，每个平台在自己的 runner 上原生建。stage 0 是链 LLVM C++ API 的程序，交叉建要为每个目标配 LLVM 和 sysroot，代价远超原生六格。
+
+包内是扁平布局：`miko`、`miko.toolchain`、`miko-link.{bat,sh}`、`runtime/`、`stdlib/core/`、`compiler/*.miko`。扁平不是审美，是被编译器的相对路径解析逼出来的——`link_executable` 按 CWD 找 `runtime/miko_runtime.c`，`link_script_path()` 依次查 `miko.toolchain`、`dist/miko.toolchain`、`build/miko.toolchain`，`imp_stdlib_root()` 按 CWD 再 `../stdlib` 找 `stdlib/core/math.miko`。
+
+### 9.3 六次失败
+
+都没有在本机出现，因为本机恰好是对的。
+
+**一、`macos-13` 已退役**。矩阵里写的标签不存在，actionlint 直接报。换 `macos-15-intel`。
+
+**二、runner 上是 Visual Studio 18 2026，不是 17 2022**。`cmake -G "Visual Studio 17 2022"` 报 "could not find any instance"。改成用 `vswhere.exe` 探测实际装的是哪版，而不是把某一台机器的版本写进 YAML。
+
+**三、`${{ }}` 在 pwsh 块里炸**。PowerShell 把 `${{` 解析成变量加花括号。表达式移到 step 级 `env:`。
+
+**四、`Compress-Archive -Path "$root\*"` 把文件摊在压缩包根上**，而 `tar -C stage miko` 保留 `miko/` 一层。两边布局不一致，本地冒烟测试在 `Join-Path $work "miko"` 上失败。改成 `-Path $root`。
+
+**五、Windows 上根本没有可用的 LLVM CMake 包**。这是花时间最久的一个。`find_package(LLVM)` 报找不到 `LLVMConfig.cmake`，于是一路排查：
+
+  - `choco install llvm` 装的是只有 clang 的包，`lib/cmake/llvm/` 里只有 `LLVMConfigExtensions.cmake`；
+  - 官方 `LLVM-*-win64.exe`（winget 的 `LLVM.LLVM`，装完 22.1.8）同样没有 `LLVMConfig.cmake`；
+  - Visual Studio 自带的 LLVM 组件只有 `bin/`；
+  - 所以在 Windows 上只能下官方**发布压缩包**，那里面有完整开发树。
+
+  压缩包选 `.tar.xz` 不选 `.tar.zst`：zst 的窗口大小被 bsdtar 拒绝（`Frame requires too much memory for decoding`），本机验证过，没留给 CI 去发现。
+
+  版本钉 22.1.8：23.x 是带 zlib 和 zstd 构建的，导出目标要求链接期两个库都在，而且删了 `IRBuilder::CreateGlobalStringPtr`、连 `fn main() { let a: i32 = 1; }` 都能 IR 验证失败。22.1.8 不要这两个依赖，且是这个编译器验证过的版本。Linux 同样钉 18。
+
+**六、DIA SDK 路径是别人机器上的**。LLVM 的 Windows 导出文件把构建机器的路径硬写进 `LLVMDebugInfoPDB` 的 `INTERFACE_LINK_LIBRARIES`：`.../Visual Studio/2022/Enterprise/DIA SDK/lib/amd64/diaguids.lib`。runner 上是 2026 Enterprise，链接直接 `LNK1181`。这里没有 `DIASDK::Diaguids` 目标可以改指向——路径就在属性里，所以改的是属性本身：换成实际装着的那个 VS 的 DIA SDK，没有就丢掉（miko 不读 PDB）。
+
+### 9.4 门禁抓到的两个真 bug
+
+前五个是环境问题。后两个是代码问题，只是本机环境把它们挡住了。
+
+**stage 0 的 `--compile` 从来链不出东西**。`linkExecutable()` 只把生成的 IR 传给 clang，不带 `runtime/miko_runtime.c`。生成代码要调 `miko_run_command`、`miko_set_args`、`miko_write_file` 和字符串助手，libc 里一个都没有，于是任何用到它们的程序都死在 `undefined symbol: miko_set_args`。自举编译器一直带着 runtime（`compiler/main_ll.miko`），这条路径没带。本机没暴露是因为门禁的 C++ 列不经过这条链；只有真去 `--compile` 一个程序才看得见。
+
+`-lm` 也只在 libm 是独立库的地方加。Windows 上 clang 把它转给 lld-link，报 `could not open 'm.lib'`。
+
+**没有 toolchain 文件的回退链接在 Windows 上必然失败**。`dist/miko.toolchain` 故意不进仓库（它记的是构建期路径），所以干净 clone 里没有它，自举编译器走回退分支，那个分支结尾是 `-lm`——同上，Windows 上链不了。CI 上表现为 difftest 12/31，Self 列每一个用例都 REJECT。本机有这个文件，所以从没出现过。
+
+修法是回退分支在看得见 Windows 系统目录时省掉 `-lm`（周围代码本来就靠这个判断选 `.exe` 后缀），并且 CI 门禁自己写一份 `miko.toolchain`，让门禁走的是发布包真正会走的那条路。
+
+### 9.5 结果
+
+CI 上 `gate.yml` 通过：
+
+| 检查 | 结果 |
+| --- | --- |
+| difftest | 31 / 31，三端一致 |
+| bootstrap gen1 | 1351347 字节，19/19，`3ED78C9CA5CE1E12` |
+| bootstrap gen2 | 1351347 字节，19/19，`3ED78C9CA5CE1E12` |
+| 定点 | 成立 |
+
+定点哈希从 `F023F21A6EE36416` 变成 `3ED78C9CA5CE1E12`，因为改了 `main_ll.miko` 的回退分支。这个检查本来就是为此存在的：源一改，哈希就该变。
+
+本机干净 clone 验证过：`cmake -G "Visual Studio 18 2026" -A x64 -DMIKO_ENABLE_LLVM=ON` → 15.1 s，0 error → stage 1 → difftest 31/31 → bootstrap 定点。
+
+### 9.6 没解决的
+
+- **`windows-arm64` 标了 `experimental`**。那个镜像最可能缺组件（LLVM 不是每处都装）。少一个平台的发布仍值得发，缺口在运行摘要里看得见，但它是缺口。
+- **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没有替他编一个。
+- **`.miko` 文件在库里仍存 CRLF**，虽然 `.gitattributes` 声明了 `text=auto eol=lf`。`git add --renormalize .` 能修；无害，因为词法接受两种换行。
+- **LLVM 版本上限是 22**。23 的 API 删改会让 stage 0 编译失败或 IR 验证失败。要么跟着改 API，要么就用 22——现在是钉住版本。这个约束写在这里，而不是留给下一个人去撞。

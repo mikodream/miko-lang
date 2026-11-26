@@ -169,38 +169,48 @@ if(MIKO_ENABLE_LLVM)
     # redirect - the raw path is in the property - so rewrite the property: point it
     # at the DIA SDK of the Visual Studio that is here, or drop it, since miko never
     # touches the PDB readers.
-    file(GLOB _dia_candidates
-        "C:/Program Files/Microsoft Visual Studio/*/*/DIA SDK/lib/amd64/diaguids.lib"
-        "C:/Program Files (x86)/Microsoft Visual Studio/*/*/DIA SDK/lib/amd64/diaguids.lib"
-    )
-    list(GET _dia_candidates 0 _dia_real)
-    foreach(_llvm_target ${LLVM_AVAILABLE_LIBS})
-        if(TARGET ${_llvm_target})
-            get_target_property(_link_iface ${_llvm_target} INTERFACE_LINK_LIBRARIES)
-            if(_link_iface)
-                set(_rebuilt "")
-                set(_changed FALSE)
-                foreach(_entry ${_link_iface})
-                    if(_entry MATCHES "[Dd][Ii][Aa] ?[Ss][Dd][Kk]" OR _entry MATCHES "diaguids")
-                        set(_changed TRUE)
-                        if(_dia_real AND EXISTS "${_dia_real}")
-                            list(APPEND _rebuilt "${_dia_real}")
+    #
+    # The glob is empty on every non-Windows machine, so the length has to be checked
+    # before GET: list(GET ... 0 ...) on an empty list is a fatal configure error, and
+    # that is how this broke Linux the first time it ran.
+    if(WIN32)
+        file(GLOB _dia_candidates
+            "C:/Program Files/Microsoft Visual Studio/*/*/DIA SDK/lib/amd64/diaguids.lib"
+            "C:/Program Files (x86)/Microsoft Visual Studio/*/*/DIA SDK/lib/amd64/diaguids.lib"
+        )
+        set(_dia_real "")
+        list(LENGTH _dia_candidates _dia_count)
+        if(_dia_count GREATER 0)
+            list(GET _dia_candidates 0 _dia_real)
+        endif()
+        foreach(_llvm_target ${LLVM_AVAILABLE_LIBS})
+            if(TARGET ${_llvm_target})
+                get_target_property(_link_iface ${_llvm_target} INTERFACE_LINK_LIBRARIES)
+                if(_link_iface)
+                    set(_rebuilt "")
+                    set(_changed FALSE)
+                    foreach(_entry ${_link_iface})
+                        if(_entry MATCHES "[Dd][Ii][Aa] ?[Ss][Dd][Kk]" OR _entry MATCHES "diaguids")
+                            set(_changed TRUE)
+                            if(_dia_real AND EXISTS "${_dia_real}")
+                                list(APPEND _rebuilt "${_dia_real}")
+                            endif()
+                        else()
+                            list(APPEND _rebuilt "${_entry}")
                         endif()
-                    else()
-                        list(APPEND _rebuilt "${_entry}")
+                    endforeach()
+                    if(_changed)
+                        set_target_properties(${_llvm_target} PROPERTIES
+                            INTERFACE_LINK_LIBRARIES "${_rebuilt}")
                     endif()
-                endforeach()
-                if(_changed)
-                    set_target_properties(${_llvm_target} PROPERTIES
-                        INTERFACE_LINK_LIBRARIES "${_rebuilt}")
                 endif()
             endif()
+        endforeach()
+        if(_dia_real AND EXISTS "${_dia_real}")
+            message(STATUS "DIA SDK: ${_dia_real}")
+        else()
+            message(STATUS "DIA SDK: absent, linking without it")
         endif()
-    endforeach()
-    if(_dia_real AND EXISTS "${_dia_real}")
-        message(STATUS "DIA SDK: ${_dia_real}")
-    else()
-        message(STATUS "DIA SDK: absent, linking without it")
     endif()
 
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
