@@ -80,7 +80,12 @@ jobs:
             target: macos-x64
             archive: miko-${{ needs.version.outputs.version }}-macos-x64.tar.gz
           - name: macos-arm64
-            os: macos-14
+            # macos-14 here was cancelled the instant it started: no runner was ever
+            # assigned, runner_name came back empty and no step ran. macos-15 is the
+            # current Apple Silicon image. If this one is cancelled the same way, the
+            # account cannot obtain an arm64 macOS runner and the entry should go,
+            # rather than sitting in the matrix failing every release.
+            os: macos-15
             arch: arm64
             target: macos-arm64
             archive: miko-${{ needs.version.outputs.version }}-macos-arm64.tar.gz
