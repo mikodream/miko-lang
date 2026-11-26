@@ -149,15 +149,41 @@ jobs:
 
       # The Visual Studio generator is required on Windows: the LLVM chocolatey
       # package is built with MSVC and its import libraries do not match MinGW.
-      # The architecture arrives through the environment rather than as an inline
-      # ${{ }} expression, which PowerShell would try to read as a variable.
+      # Which Visual Studio is installed is not something this workflow should have
+      # to know - the runner image moves, and a hard-coded "Visual Studio 17 2022"
+      # simply fails once it does. vswhere ships with every VS 2017+ install, so the
+      # generator is discovered instead of assumed. The architecture arrives through
+      # the environment rather than an inline ${{ }} expression, which PowerShell
+      # would try to read as a variable.
       - name: Configure and build stage 0 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           MIKO_ARCH: ${{ matrix.arch }}
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A $env:MIKO_ARCH -DMIKO_ENABLE_LLVM=ON
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" }
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - no Visual Studio on this runner" }
+
+          # Newest first. CMake's own default is not usable here: it picks Ninja when
+          # ninja is on PATH, and Ninja has no -A platform and would build with MinGW,
+          # which cannot link against the MSVC-built LLVM.
+          $generator = $null
+          foreach ($candidate in @(
+            @{ Major = 18; Name = "Visual Studio 18 2026" },
+            @{ Major = 17; Name = "Visual Studio 17 2022" }
+          )) {
+            $range = "[$($candidate.Major).0,$($candidate.Major + 1).0)"
+            $found = & $vswhere -latest -products * -version $range -property installationPath 2>$null
+            if ($found) {
+              if (-not $generator) { $generator = $candidate.Name }
+              Write-Host "found $($candidate.Name) at $found"
+            }
+          }
+          if (-not $generator) { throw "no Visual Studio with a C++ toolset found" }
+          Write-Host "using generator: $generator"
+
+          cmake -S . -B build -G $generator -A $env:MIKO_ARCH -DMIKO_ENABLE_LLVM=ON
           if ($LASTEXITCODE -ne 0) { throw "configure failed" }
           cmake --build build --config Release --target miko
           if ($LASTEXITCODE -ne 0) { throw "stage 0 build failed" }
