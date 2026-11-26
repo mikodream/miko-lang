@@ -109,6 +109,10 @@ jobs:
           sudo apt-get install -y llvm llvm-dev clang libclang-dev gcc
           echo "LLVM_DIR=$(llvm-config --cmakedir)" >> "$GITHUB_ENV"
 
+      # Which directory holds LLVMConfig.cmake depends on the distributor, and the
+      # build cannot guess: it failed here the first time this ran, asking for
+      # LLVM_DIR. Report it explicitly rather than hoping find_package stumbles on
+      # it.
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -121,6 +125,7 @@ jobs:
 
       - name: Install LLVM (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           choco install llvm --yes --no-progress
           "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
@@ -128,6 +133,22 @@ jobs:
           # that a bare clang install cannot find on Windows. MinGW provides both.
           choco install mingw --yes --no-progress
           "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+          # Locate the CMake package wherever the install put it. Both the official
+          # installer and the chocolatey package normally use Program Files, but
+          # the tools directory is checked too because that is where choco unpacks.
+          $candidates = @(
+            "C:\Program Files\LLVM\lib\cmake\llvm",
+            "C:\ProgramData\chocolatey\lib\llvm\tools\LLVM\lib\cmake\llvm"
+          )
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "LLVMConfig.cmake") } | Select-Object -First 1
+          if (-not $found) {
+            $found = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Recurse -Filter "LLVMConfig.cmake" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
+          }
+          if (-not $found) { throw "LLVMConfig.cmake not found after installing LLVM" }
+          Write-Host "LLVM_DIR=$found"
+          "LLVM_DIR=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Report the toolchain
         shell: bash

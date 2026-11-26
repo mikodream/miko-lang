@@ -63,6 +63,49 @@ target_compile_options(miko PRIVATE
 )
 
 if(MIKO_ENABLE_LLVM)
+    # find_package(LLVM) only searches the standard CMake prefixes, and LLVM rarely
+    # lands in one: a user's unpacked tarball, choco's tools directory, and
+    # Homebrew's keg all sit somewhere else. Rather than make every caller pass
+    # LLVM_DIR - which is what the CI workflows had to do, and what made the build
+    # fail the first time it ran anywhere but the machine it was written on - look
+    # in the places LLVM actually installs to before giving up.
+    if(NOT LLVM_DIR)
+        find_program(MIKO_LLVM_CONFIG NAMES llvm-config llvm-config.exe)
+        if(MIKO_LLVM_CONFIG)
+            execute_process(
+                COMMAND ${MIKO_LLVM_CONFIG} --cmakedir
+                OUTPUT_VARIABLE MIKO_LLVM_CMAKEDIR
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+            )
+            if(MIKO_LLVM_CMAKEDIR AND EXISTS "${MIKO_LLVM_CMAKEDIR}/LLVMConfig.cmake")
+                set(LLVM_DIR "${MIKO_LLVM_CMAKEDIR}")
+            endif()
+        endif()
+    endif()
+
+    if(NOT LLVM_DIR)
+        foreach(_candidate
+            "$ENV{LLVM_ROOT}/lib/cmake/llvm"
+            "$ENV{LLVM_INSTALL_DIR}/lib/cmake/llvm"
+            "C:/Program Files/LLVM/lib/cmake/llvm"
+            "C:/ProgramData/chocolatey/lib/llvm/tools/LLVM/lib/cmake/llvm"
+            "$ENV{ProgramFiles}/LLVM/lib/cmake/llvm"
+            "/usr/lib/llvm-22/lib/cmake/llvm"
+            "/usr/lib/llvm-21/lib/cmake/llvm"
+            "/usr/lib/llvm-20/lib/cmake/llvm"
+            "/usr/lib/llvm-19/lib/cmake/llvm"
+            "/usr/lib/llvm-18/lib/cmake/llvm"
+            "/usr/local/opt/llvm/lib/cmake/llvm"
+            "/opt/homebrew/opt/llvm/lib/cmake/llvm"
+        )
+            if(EXISTS "${_candidate}/LLVMConfig.cmake")
+                set(LLVM_DIR "${_candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
     find_package(LLVM REQUIRED CONFIG)
 
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")

@@ -30,11 +30,28 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install LLVM and MinGW
+        shell: pwsh
         run: |
           choco install llvm --yes --no-progress
           choco install mingw --yes --no-progress
           "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
           "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+          # The CMake package is not in a standard search prefix, and find_package
+          # needs telling. This is the second thing that failed on the first real
+          # run, after the generator name.
+          $candidates = @(
+            "C:\Program Files\LLVM\lib\cmake\llvm",
+            "C:\ProgramData\chocolatey\lib\llvm\tools\LLVM\lib\cmake\llvm"
+          )
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "LLVMConfig.cmake") } | Select-Object -First 1
+          if (-not $found) {
+            $found = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Recurse -Filter "LLVMConfig.cmake" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
+          }
+          if (-not $found) { throw "LLVMConfig.cmake not found after installing LLVM" }
+          Write-Host "LLVM_DIR=$found"
+          "LLVM_DIR=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Report toolchain
         run: |
