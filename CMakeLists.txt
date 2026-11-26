@@ -228,7 +228,56 @@ if(MIKO_ENABLE_LLVM)
         passes
     )
 
-    target_link_libraries(miko PRIVATE ${LLVM_LIBS})
+    # The component list covers LLVM's own archives but not the system libraries
+    # those archives were built against, and a distribution's LLVM references them
+    # for real: on Linux LLVMSupport calls set_curterm/setupterm/tigetnum from
+    # terminfo and the zstd entry points, so the link stops with "undefined
+    # reference to set_curterm" on a machine where nothing was installed by hand.
+    # llvm-config knows the set, which beats guessing -lz -lzstd -ltinfo per
+    # platform.
+    #
+    # The list is filtered rather than trusted: the Windows archive reports
+    # xml2s.lib, an internal static library it links while building itself but does
+    # not ship, and handing that to the linker turns a working build into
+    # "LNK1181: cannot open input file 'xml2s.lib'". Anything already resolvable as
+    # a -l flag, or as a file that exists, is kept.
+    find_program(MIKO_LLVM_CONFIG_EXE NAMES llvm-config llvm-config.exe)
+    set(MIKO_LLVM_SYSTEM_LIBS "")
+    if(MIKO_LLVM_CONFIG_EXE)
+        execute_process(
+            COMMAND ${MIKO_LLVM_CONFIG_EXE} --system-libs
+            OUTPUT_VARIABLE _system_libs_raw
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_system_libs_raw)
+            separate_arguments(_system_libs_list UNIX_COMMAND "${_system_libs_raw}")
+            foreach(_lib ${_system_libs_list})
+                if(_lib MATCHES "^-l" OR _lib MATCHES "^-")
+                    list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
+                elseif(IS_ABSOLUTE "${_lib}" AND EXISTS "${_lib}")
+                    list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
+                elseif(NOT IS_ABSOLUTE "${_lib}")
+                    # A bare name such as xml2s.lib: keep it only if the linker could
+                    # actually find it, which is not knowable here. Windows system
+                    # libraries are found by name, so names that look like SDK libraries
+                    # are kept and LLVM's internal ones are not.
+                    if(_lib MATCHES "\\.lib$")
+                        set(_lib_base "${_lib}")
+                        string(REGEX REPLACE "\\.lib$" "" _lib_base "${_lib_base}")
+                        find_library(MIKO_FOUND_${_lib_base} NAMES ${_lib_base})
+                        if(MIKO_FOUND_${_lib_base})
+                            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
+                        endif()
+                    else()
+                        list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
+                    endif()
+                endif()
+            endforeach()
+        endif()
+    endif()
+
+    target_link_libraries(miko PRIVATE ${LLVM_LIBS} ${MIKO_LLVM_SYSTEM_LIBS})
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
 endif()
