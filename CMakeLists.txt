@@ -220,6 +220,29 @@ if(MIKO_ENABLE_LLVM)
     target_include_directories(miko PRIVATE ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(miko PRIVATE ${LLVM_DEFINITIONS} MIKO_ENABLE_LLVM=1)
 
+    # Static archives mean the linker sees a long list of .a files whose order decides
+    # whether anything resolves, and a distribution's LLVMSupport calls into zstd and
+    # terminfo, which have to appear after it. CMake does not preserve that order for
+    # imported targets - the link failed with "undefined reference to
+    # ZSTD_compressBound" while libzstd.so was on the command line twice, both times
+    # too early. Repeating the entries, spelling them -lzstd, and passing them as link
+    # options all failed the same way (options are emitted before the libraries).
+    #
+    # So on non-Windows the shared library is preferred, through LLVM's own supported
+    # switch rather than by hunting for a file name: LLVM_LINK_LLVM_DYLIB makes
+    # llvm_map_components_to_libnames return the LLVM target that LLVMConfig.cmake
+    # defines, pointing at whatever the distribution actually installed. A shared
+    # library resolves regardless of order, so there is nothing left to get wrong.
+    # Searching for it by hand was the previous attempt and it found libLLVM.so on
+    # arm64 (LLVM 18.1.3) and nothing on x64 (18.1.8) - the same distro, different
+    # patch release, different layout.
+    #
+    # Windows keeps the static archives: they link there, its zlib and zstd come from
+    # the CRT or are imported by name, and the official archive ships no C++ dylib.
+    if(NOT WIN32)
+        set(LLVM_LINK_LLVM_DYLIB ON)
+    endif()
+
     llvm_map_components_to_libnames(LLVM_LIBS
         core
         support
@@ -228,38 +251,21 @@ if(MIKO_ENABLE_LLVM)
         passes
     )
 
-    # Linking against LLVM's static archives means the linker sees a long list of .a
-    # files whose order decides whether anything resolves, and a distribution's
-    # LLVMSupport calls into zstd and terminfo, which must therefore appear after it.
-    # CMake does not preserve that order: it groups imported targets and raw paths
-    # however it likes, so the command failed with "undefined reference to
-    # ZSTD_compressBound" while libzstd.so was in it twice, both times too early.
-    # Passing the libraries as link options is no better - those are emitted before
-    # the libraries, not after. Appending them a second time did not help either.
-    #
-    # So the ordering is not fought: on non-Windows the build links the shared library
-    # and the archives are dropped, because a shared library resolves in any order.
-    # Homebrew and the Debian packages both ship one. Windows keeps the static
-    # archives - they were verified to link there, its zlib and zstd come from the CRT
-    # or are imported by name, and the official archive ships no C++ dylib.
-    if(WIN32)
-        target_link_libraries(miko PRIVATE ${LLVM_LIBS})
-    else()
-        # find_library has no reason to look in the LLVM keg or in /usr/lib/llvm-18/lib,
-        # so LLVM's own reported libdir is supplied as a hint.
-        find_library(MIKO_LLVM_SHARED
-            NAMES LLVM-${LLVM_PACKAGE_VERSION_MAJOR} LLVM
-            HINTS ${LLVM_LIBRARY_DIRS}
-        )
-        if(MIKO_LLVM_SHARED)
-            target_link_libraries(miko PRIVATE "${MIKO_LLVM_SHARED}")
-            message(STATUS "LLVM shared library: ${MIKO_LLVM_SHARED}")
+    message(STATUS "LLVM link libraries: ${LLVM_LIBS}")
+
+    # If the mapping still produced archives, the order problem is live again, so the
+    # archives and the system libraries go inside a linker group. GNU ld rescans a
+    # group until nothing new resolves, which removes the ordering question entirely.
+    # ld64 on macOS has no such flag, which is why the dylib is the preferred path.
+    if(NOT WIN32 AND NOT "${LLVM_LIBS}" STREQUAL "LLVM")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
+            target_link_libraries(miko PRIVATE
+                -Wl,--start-group ${LLVM_LIBS} -lz -lzstd -ltinfo -Wl,--end-group)
         else()
-            # Nothing better available: fall back to the archives and the system
-            # libraries, in the order that at least worked where it was tried.
             target_link_libraries(miko PRIVATE ${LLVM_LIBS} -lz -lzstd -ltinfo)
-            message(STATUS "LLVM shared library not found; linking static archives")
         endif()
+    else()
+        target_link_libraries(miko PRIVATE ${LLVM_LIBS})
     endif()
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
