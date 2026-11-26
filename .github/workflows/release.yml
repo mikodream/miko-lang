@@ -151,6 +151,12 @@ jobs:
             mkdir -p llvm-dist
             tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
             rm -f llvm.tar.xz
+            # The archive does not carry libzstd, but its LLVMSupport is built against
+            # it: without the library the link stops at "ld: library 'zstd' not found".
+            # Only the library is needed, so the keg goes on the search path rather
+            # than replacing the compiler that was just unpacked.
+            brew install zstd
+            echo "LIBRARY_PATH=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
             echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
             echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
             "$PWD/llvm-dist/bin/llvm-config" --version

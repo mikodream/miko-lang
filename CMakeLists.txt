@@ -249,17 +249,25 @@ if(MIKO_ENABLE_LLVM)
     #     official macOS release archive, which needs nothing beyond the system.
     #   - z: in the macOS SDK and every Linux distribution.
     if(NOT WIN32)
+        # find_library does not read LIBRARY_PATH, but a CI that installs a library into
+        # a keg or a custom prefix has no other way to say where it is, so the paths are
+        # passed through as hints.
+        set(_lib_hints "")
+        if(DEFINED ENV{LIBRARY_PATH})
+            string(REPLACE ":" ";" _env_lib_dirs "$ENV{LIBRARY_PATH}")
+            list(APPEND _lib_hints ${_env_lib_dirs})
+        endif()
         set(_tail_libs "")
-        find_library(MIKO_SYS_Z NAMES z libz)
+        find_library(MIKO_SYS_Z NAMES z libz HINTS ${_lib_hints})
         if(MIKO_SYS_Z)
             list(APPEND _tail_libs "-lz")
         endif()
-        find_library(MIKO_SYS_ZSTD NAMES zstd libzstd)
+        find_library(MIKO_SYS_ZSTD NAMES zstd libzstd HINTS ${_lib_hints})
         if(MIKO_SYS_ZSTD)
             list(APPEND _tail_libs "-lzstd")
         endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            find_library(MIKO_SYS_TINFO NAMES tinfo terminfo)
+            find_library(MIKO_SYS_TINFO NAMES tinfo terminfo HINTS ${_lib_hints})
             if(MIKO_SYS_TINFO)
                 list(APPEND _tail_libs "-ltinfo")
             endif()
