@@ -1,0 +1,56 @@
+// Fixed arrays through the LLVM IR backend.
+//
+// Expected output:
+//   60        sum of an array literal read at a runtime index
+//   100       the same array after in-place element writes
+//   alpha     string array element
+//   beta
+//
+// These are the constructs whose lowering the IR backend was missing: array
+// literals used to collapse to a scalar 0 with no diagnostic, and `arr[i] = v`
+// used to parse the left side as a load and drop the store. Both produced valid
+// IR that ran and printed the pre-assignment value, so neither showed up as an
+// error - only as a wrong number.
+//
+// Struct field assignment (`p.x = 42`) is deliberately not in this file: the
+// IR chain lowers it, but the stage0 C++ parser rejects the syntax outright, so
+// this file would no longer be interpreter-runnable.
+fn sum_at_runtime_index(): i64 {
+    let nums = [10, 20, 30];
+    let i = 0;
+    let total = 0;
+    while i < 3 {
+        total = total + nums[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn write_then_sum(): i64 {
+    let a = [1, 2, 3, 4];
+    let i = 0;
+    while i < 4 {
+        a[i] = a[i] * 10;
+        i = i + 1;
+    }
+    let total = 0;
+    i = 0;
+    while i < 4 {
+        total = total + a[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    print(sum_at_runtime_index());
+    print(write_then_sum());
+
+    let names = ["alpha", "beta"];
+    print(len(names));
+    let k = 0;
+    while k < len(names) {
+        print(names[k]);
+        k = k + 1;
+    }
+}

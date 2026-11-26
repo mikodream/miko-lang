@@ -1,0 +1,7 @@
+fn main() {
+    let nums = [10, 20, 30, 40];
+    let index = 2;
+    print(nums[0]);
+    print(nums[index]);
+    print(nums[1] + nums[3]);
+}

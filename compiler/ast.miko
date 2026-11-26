@@ -1,0 +1,19 @@
+pub fn line0(text: string): string {
+    return text + "\n";
+}
+
+pub fn line1(text: string): string {
+    return "  " + text + "\n";
+}
+
+pub fn line2(text: string): string {
+    return "    " + text + "\n";
+}
+
+pub fn line3(text: string): string {
+    return "      " + text + "\n";
+}
+
+pub fn line4(text: string): string {
+    return "        " + text + "\n";
+}

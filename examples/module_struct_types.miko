@@ -1,0 +1,6 @@
+import "module_struct_types_lib.miko" as geom;
+
+fn main() {
+    let point: geom.Point = geom.origin();
+    print(geom.sum(point));
+}

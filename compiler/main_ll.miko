@@ -1,0 +1,896 @@
+// main_ll.miko - driver for the self-hosted miko->LLVM IR compiler.
+//
+// Pipeline: read every module -> lex -> parse -> concatenate into ONE program
+// tree -> sema -> codegen_ll -> write a single .ll
+//
+// Compiling the whole program as one LLVM module (rather than one module per
+// source file) is what lets the IR backend resolve every call by signature:
+// the generator sees all definitions at once, so cross-module calls need no
+// external declarations and no guessing of return types. Definitions are
+// disambiguated by module-name mangling (see codegen_ll.mangle_pair), because
+// modules legitimately reuse private helper names such as `find_char`.
+//
+// Self-hosting chain (cmake/BootstrapLLVM.cmake):
+//
+//   stage0 (C++ miko) interprets this driver, emitting one .ll for the whole
+//   compiler; clang turns that .ll plus runtime/miko_runtime.c into an
+//   executable                                                -> stage1_ll
+//   stage1_ll emits the same .ll again                        -> stage2_ll.ll
+//   stage2_ll emits it once more                              -> stage3_ll.ll
+//
+// stage2_ll.ll == stage3_ll.ll byte for byte is the fixed point: the compiler
+// written in miko, compiled through LLVM IR, reproduces its own IR exactly.
+import "lexer.miko" as lexer;
+import "parser.miko" as parser;
+import "sema.miko" as sema;
+import "codegen_ll.miko" as codegen_ll;
+
+// The modules that make up the compiler itself, in dependency order.
+// A comma-separated module list from the command line lets a subset of the
+// compiler be built in isolation while debugging. Flags (anything starting with
+// `--`) are not module lists, so they fall through to the full list - without
+// that check `miko --self out/x` would try to read `compiler/--self.miko`.
+fn module_list(): string {
+    if arg_count() >= 1 {
+        let given = arg_at(0);
+        let is_flag = false;
+        if len(given) >= 2 {
+            if char_at(given, 0) == '-' {
+                if char_at(given, 1) == '-' {
+                    is_flag = true;
+                }
+            }
+        }
+        if !is_flag {
+            let out = "";
+            let i: i64 = 0;
+            let n = len(given);
+            while i < n {
+                let ch = char_at(given, i);
+                if ch == ',' {
+                    out = out + "\n";
+                } else {
+                    out = out + substring(given, i, 1);
+                }
+                i = i + 1;
+            }
+            return out + "\n";
+        }
+    }
+    return "token\nast\nsymbols\ntype\nlexer\nparser\nsema\ncodegen_ll\nmain_ll\n";
+}
+
+fn module_at(list: string, index: i64): string {
+    let i: i64 = 0;
+    let k: i64 = 0;
+    let n = len(list);
+    while i < n {
+        let line_end = i;
+        while line_end < n && char_at(list, line_end) != '\n' {
+            line_end = line_end + 1;
+        }
+        if k == index {
+            return substring(list, i, line_end - i);
+        }
+        k = k + 1;
+        i = line_end + 1;
+    }
+    return "";
+}
+
+fn module_count(list: string): i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n = len(list);
+    while i < n {
+        if char_at(list, i) == '\n' {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn combine_modules(): string {
+    let list = module_list();
+    let out = "";
+    let k: i64 = 0;
+    while k < module_count(list) {
+        let name = module_at(list, k);
+        if name != "" {
+            let source = read_file("compiler/" + name + ".miko");
+            let stream = lexer.lex(source);
+            let tree = parser.parse_program(stream);
+            out = out + "Module " + name + "\n" + tree;
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// ---- toolchain ------------------------------------------------------------
+//
+// Compiling a program should yield a runnable executable, not an intermediate
+// .ll the user has to link by hand. To do that this compiler has to run clang,
+// which needs machine-specific include and lib search paths for the C runtime
+// (the runtime is C, so <stdio.h> must resolve).
+//
+// Those paths belong to the build, not to this source file: they differ between
+// machines and between LLVM installs. The build writes them into a two-line
+// file next to the compiler, read here at run time. Without that file the
+// compiler still works - it falls back to whatever `clang` is on PATH, which is
+// correct inside a Developer Command Prompt.
+
+fn find_char_in(text: string, start: i64, target: char): i64 {
+    let i = start;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == target {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Same search, but blind to text inside a string literal.
+//
+// The checks below look for structural punctuation ([, ], ; and so on) in the
+// AST dump, and the dump prints a string literal with its quotes and its
+// original contents. A line such as
+//
+//     let decl = " = private unnamed_addr constant [" + n + " x i8] c\"" + body
+//
+// therefore has a '[' and a ']' that belong to the *data* of the program, not to
+// its structure. Searching quote-blind paired them up and then judged the text
+// between them an index expression, which rejected a valid compiler source with
+// "array index must be an integer, got a string".
+//
+// Returns len(text) when the character does not occur outside a literal.
+fn find_char_outside_quotes(text: string, start: i64, target: char): i64 {
+    let i = start;
+    let n = len(text);
+    let in_string: bool = false;
+    while i < n {
+        let ch = char_at(text, i);
+        if in_string {
+            if ch == '\\' {
+                i = i + 2;
+            } else {
+                if ch == '"' {
+                    in_string = false;
+                }
+                i = i + 1;
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+                i = i + 1;
+            } else {
+                if ch == target {
+                    return i;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return n;
+}
+
+// Drop leading/trailing spaces, CR, LF and tabs.
+fn trim_line(text: string): string {
+    let start = 0;
+    let n = len(text);
+    let go = true;
+    while start < n && go {
+        let c = char_at(text, start);
+        if c == ' ' || c == '\r' || c == '\n' || c == '\t' {
+            start = start + 1;
+        } else {
+            go = false;
+        }
+    }
+    return trim_line_from(text, start);
+}
+
+fn trim_line_from(text: string, start: i64): string {
+    let end = len(text);
+    while end > start {
+        let c = char_at(text, end - 1);
+        if c == ' ' || c == '\r' || c == '\n' || c == '\t' {
+            end = end - 1;
+        } else {
+            return substring(text, start, end - start);
+        }
+    }
+    return "";
+}
+
+fn nth_line(text: string, index: i64): string {
+    let seen: i64 = 0;
+    let start: i64 = 0;
+    let n = len(text);
+    let i: i64 = 0;
+    let done = false;
+    while i <= n && !done {
+        let at_break = i == n;
+        if !at_break {
+            if char_at(text, i) == '\n' {
+                at_break = true;
+            }
+        }
+        if at_break {
+            if seen == index {
+                return substring(text, start, i - start);
+            }
+            seen = seen + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Where the build recorded the link script.
+//
+// The compiler cannot discover its own location at run time (the language
+// exposes arguments, not argv[0]), so the config is looked for in the places a
+// build puts it. `miko.toolchain` in the working directory wins, so a user can
+// point this compiler at a different toolchain without rebuilding it.
+fn link_script_path(): string {
+    let candidates = "miko.toolchain\ndist/miko.toolchain\nbuild/miko.toolchain\n";
+    let k: i64 = 0;
+    while k < 3 {
+        let path = nth_line(candidates, k);
+        if path != "" {
+            if file_exists(path) {
+                let text = read_file(path);
+                let stop = find_char_in(text, 0, '\n');
+                let script = trim_line(substring(text, 0, stop));
+                if script != "" {
+                    return script;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+fn digits_of(value: i64): string {
+    if value == 0 {
+        return "0";
+    }
+    let digits = "";
+    let v = value;
+    while v > 0 {
+        let d = v % 10;
+        digits = substring("0123456789", d, 1) + digits;
+        v = v / 10;
+    }
+    return digits;
+}
+
+// Whether `text` ends with `suffix`.
+fn ends_with(text: string, suffix: string): bool {
+    let a = len(text);
+    let b = len(suffix);
+    if b > a {
+        return false;
+    }
+    if b == 0 {
+        return true;
+    }
+    return substring(text, a - b, b) == suffix;
+}
+
+// Turn <prefix>.ll into a native executable. Returns the command's exit status.
+//
+// Platform decisions are read from the toolchain script itself rather than
+// guessed: a `.bat` script means the Windows command processor, where output
+// carries `.exe` and a command line starting with a quote has to be guarded by
+// `call` (cmd.exe would otherwise strip the first and last quote and scatter the
+// arguments). Any other script is a POSIX shell script: no extension, no `call`.
+//
+// With no toolchain configured the plain clang command is used, and the same
+// `.bat`-or-not distinction picks the output name.
+fn link_executable(output_prefix: string): i64 {
+    let script = link_script_path();
+    let windows = ends_with(script, ".bat");
+    let exe_suffix = "";
+    if windows {
+        exe_suffix = ".exe";
+    }
+    if script == "" {
+        // No recorded toolchain: treat the host as POSIX unless a Windows
+        // system directory is visible, which keeps the old behaviour when
+        // running from a Windows checkout with no config file.
+        if file_exists("C:\\Windows") {
+            exe_suffix = ".exe";
+        }
+    }
+    let ir = output_prefix + ".ll";
+    let exe = output_prefix + exe_suffix;
+    if script == "" {
+        return run_command("clang \"" + ir + "\" runtime/miko_runtime.c -o \"" + exe + "\" -lm");
+    }
+    if windows {
+        return run_command("call \"" + script + "\" \"" + ir + "\" \"" + exe + "\"");
+    }
+    return run_command("\"" + script + "\" \"" + ir + "\" \"" + exe + "\"");
+}
+
+// ---- const enforcement -----------------------------------------------------
+//
+// compiler/sema.miko only *describes* a program: it writes a report of inferred
+// types and never rejects anything, and compile_file then discards that report.
+// A `const` reassignment therefore compiled and ran, printing the new value,
+// while the C++ frontend refused the same program. This pass is the missing
+// check: it walks the tree keeping the const names of the current function and
+// reports an assignment to one of them.
+
+fn const_line_name(line: string, prefix_len: i64): string {
+    if len(line) <= prefix_len {
+        return "";
+    }
+    return trim_line(substring(line, prefix_len, len(line) - prefix_len));
+}
+
+fn imp_is_name_char(ch: char): bool {
+    if ch >= 'a' && ch <= 'z' {
+        return true;
+    }
+    if ch >= 'A' && ch <= 'Z' {
+        return true;
+    }
+    if ch >= '0' && ch <= '9' {
+        return true;
+    }
+    return ch == '_';
+}
+
+// The identifier an assignment target is rooted at: `nums [ 0 ]` -> `nums`,
+// `p . x` -> `p`, `total` -> `total`. Writing through an element or a field is
+// still a write to the binding, so the const check has to look at the base name
+// rather than the whole target text.
+fn assign_target_base(text: string): string {
+    let n = len(text);
+    let i: i64 = 0;
+    while i < n {
+        if !imp_is_name_char(char_at(text, i)) {
+            return substring(text, 0, i);
+        }
+        i = i + 1;
+    }
+    return text;
+}
+
+// Returns "" when the program is fine, otherwise the offending message.
+fn check_const_assignments(tree: string): string {
+    let consts = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "Function ") {
+            // A new function body cannot assign to a const from another one.
+            consts = "\n";
+        }
+        if imp_starts(line, "Const ") {
+            let name = const_line_name(line, 6);
+            if name != "" {
+                consts = consts + name + "\n";
+            }
+        }
+        if imp_starts(line, "Assign ") {
+            // The assignment carries its target in the child `Expr lhs = rhs`.
+            let child = imp_line_at(tree, imp_next_line(tree, i));
+            if imp_starts(child, "Expr ") {
+                let text = trim_line(substring(child, 5, len(child) - 5));
+                let eq = find_char_in(text, 0, '=');
+                if eq < len(text) {
+                    let lhs = trim_line(substring(text, 0, eq));
+                    let base = assign_target_base(lhs);
+                    if imp_loaded(consts, base) {
+                        return "cannot assign to const variable '" + base + "'";
+                    }
+                }
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return "";
+}
+
+// ---- static checks the self-hosted front end was missing --------------------
+//
+// compiler/sema.miko is a stub: it reports inferred types and rejects nothing.
+// The C++ frontend enforces a set of ordinary static rules, so the shipped
+// compiler accepted programs the other engines refused - a silently wrong
+// binary instead of a diagnostic. These passes close the gap for the rules the
+// negative examples in examples/*_error.miko cover.
+
+// An index must be an integer. `nums[true]` and `nums["a"]` used to compile and
+// then read an address computed from 1 or from a pointer.
+fn check_index_types(tree: string): string {
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        let open = find_char_outside_quotes(line, 0, '[');
+        if open < len(line) {
+            let close = find_char_outside_quotes(line, open + 1, ']');
+            if close < len(line) {
+                let inner = trim_line(substring(line, open + 1, close - open - 1));
+                if inner == "true" || inner == "false" {
+                    return "array index must be an integer, got a bool";
+                }
+                if len(inner) > 0 {
+                    if char_at(inner, 0) == '"' {
+                        return "array index must be an integer, got a string";
+                    }
+                }
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return "";
+}
+
+fn all_digits(text: string): bool {
+    if len(text) == 0 {
+        return false;
+    }
+    let i: i64 = 0;
+    let n = len(text);
+    while i < n {
+        let ch = char_at(text, i);
+        if ch < '0' || ch > '9' {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Number of comma separated items inside the brackets of a list literal body.
+fn count_list_items(inner: string): i64 {
+    let text = trim_line(inner);
+    if len(text) == 0 {
+        return 0;
+    }
+    let items: i64 = 1;
+    let i: i64 = 0;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == ',' {
+            items = items + 1;
+        }
+        i = i + 1;
+    }
+    return items;
+}
+
+// `let nums: [i32; 4] = [1, 2, 3]` declares four slots and supplies three. The
+// fourth stayed uninitialised and the program printed whatever was there.
+fn check_array_lengths(tree: string): string {
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "Type [") {
+            let semi = find_char_in(line, 0, ';');
+            if semi < len(line) {
+                let close = find_char_in(line, semi + 1, ']');
+                if close < len(line) {
+                    let count_text = trim_line(substring(line, semi + 1, close - semi - 1));
+                    if all_digits(count_text) {
+                        let next = imp_line_at(tree, imp_next_line(tree, i));
+                        if imp_starts(next, "Expr [") {
+                            let lit_open = find_char_in(next, 0, '[');
+                            let lit_close = find_char_in(next, lit_open + 1, ']');
+                            let body = trim_line(substring(next, lit_open + 1, lit_close - lit_open - 1));
+                            let supplied = count_list_items(body);
+                            let declared = str_to_i64(count_text);
+                            if supplied != declared {
+                                return "array of length " + count_text + " initialised with "
+                                    + digits_of(supplied) + " element(s)";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return "";
+}
+
+// "Point|2" per line, one line per declared struct.
+fn struct_field_counts(tree: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "Struct ") {
+            let name = trim_line(substring(line, 7, len(line) - 7));
+            let count: i64 = 0;
+            let j = imp_next_line(tree, i);
+            let more = true;
+            while more && j < n {
+                let child = imp_line_at(tree, j);
+                if imp_starts(child, "Field ") {
+                    count = count + 1;
+                    j = imp_next_line(tree, j);
+                } else {
+                    more = false;
+                }
+            }
+            if name != "" {
+                out = out + name + "|" + digits_of(count) + "\n";
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return out;
+}
+
+fn struct_count_lookup(table: string, name: string): i64 {
+    let needle = name + "|";
+    let i: i64 = 0;
+    let n = len(table);
+    while i < n {
+        let line = imp_line_at(table, i);
+        if imp_starts(line, needle) {
+            let digits = substring(line, len(needle), len(line) - len(needle));
+            if all_digits(digits) {
+                return str_to_i64(digits);
+            }
+            return -1;
+        }
+        i = imp_next_line(table, i);
+    }
+    return -1;
+}
+
+// The identifier just before `stop`, e.g. "Expr Point { x : 1 }" with stop at
+// the brace yields "Point". Whitespace between the name and the brace has to be
+// stepped over first, otherwise the scan stops right away and finds nothing.
+fn word_before(text: string, stop: i64): string {
+    // Step back over the whitespace that separates the name from `stop`.
+    let start = stop;
+    while start > 0 {
+        if char_at(text, start - 1) == ' ' || char_at(text, start - 1) == '\t' {
+            start = start - 1;
+        } else {
+            break;
+        }
+    }
+    let first = start;
+    while first > 0 {
+        if imp_is_name_char(char_at(text, first - 1)) {
+            first = first - 1;
+        } else {
+            break;
+        }
+    }
+    if first == start {
+        return "";
+    }
+    return substring(text, first, start - first);
+}
+
+fn count_char_from(text: string, from: i64, target: char): i64 {
+    let hits: i64 = 0;
+    let i = from;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == target {
+            hits = hits + 1;
+        }
+        i = i + 1;
+    }
+    return hits;
+}
+
+// `Point { x: 10 }` where Point declares x and y. The missing field was left
+// holding whatever the alloca contained.
+fn check_struct_literals(tree: string): string {
+    let counts = struct_field_counts(tree);
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        let brace = find_char_in(line, 0, '{');
+        if brace < len(line) {
+            let name = word_before(line, brace);
+            if len(name) > 0 {
+                let declared = struct_count_lookup(counts, name);
+                if declared >= 0 {
+                    let supplied = count_char_from(line, brace, ':');
+                    if supplied != declared {
+                        return "struct '" + name + "' literal supplies "
+                            + digits_of(supplied) + " of " + digits_of(declared) + " field(s)";
+                    }
+                }
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return "";
+}
+
+// Runs every static rule and returns the first violation, or "".
+fn check_static_rules(tree: string): string {
+    let error = check_const_assignments(tree);
+    if error != "" {
+        return error;
+    }
+    error = check_index_types(tree);
+    if error != "" {
+        return error;
+    }
+    error = check_array_lengths(tree);
+    if error != "" {
+        return error;
+    }
+    return check_struct_literals(tree);
+}
+
+// ---- import resolution -----------------------------------------------------
+//
+// A user program's `import` lines used to be ignored: the driver parsed only
+// the file it was handed, so a call to `math.abs_i64` was mangled into
+// `math__abs_i64` while nothing ever emitted that definition. clang then
+// rejected the module with "use of undefined value '@math__abs_i64'".
+//
+// Each imported module is now loaded, parsed and emitted as its own
+// `Module <alias>` section - the same shape `combine_modules` already used for
+// self-hosting - so the definition is mangled the same way the call is.
+
+fn imp_starts(text: string, prefix: string): bool {
+    let p = len(prefix);
+    if len(text) < p {
+        return false;
+    }
+    let i: i64 = 0;
+    while i < p {
+        if char_at(text, i) != char_at(prefix, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn imp_next_line(text: string, index: i64): i64 {
+    let n = len(text);
+    if index >= n {
+        return n;
+    }
+    let e = find_char_in(text, index, '\n');
+    if e >= n {
+        return n;
+    }
+    return e + 1;
+}
+
+fn imp_line_at(text: string, index: i64): string {
+    let n = len(text);
+    if index >= n {
+        return "";
+    }
+    let e = find_char_in(text, index, '\n');
+    return trim_line(substring(text, index, e - index));
+}
+
+// "core.math" -> "<root>/core/math.miko"
+fn imp_dotted_to_path(root: string, name: string): string {
+    let out = root;
+    if len(name) > 0 {
+        out = out + "/";
+    }
+    let i: i64 = 0;
+    let n = len(name);
+    while i < n {
+        let ch = char_at(name, i);
+        if ch == '.' {
+            out = out + "/";
+        } else {
+            out = out + substring(name, i, 1);
+        }
+        i = i + 1;
+    }
+    return out + ".miko";
+}
+
+fn imp_stdlib_root(): string {
+    if file_exists("stdlib/core/math.miko") {
+        return "stdlib";
+    }
+    return "../stdlib";
+}
+
+fn imp_alias_of(dotted: string): string {
+    let dot = find_char_in(dotted, 0, '.');
+    if dot < len(dotted) {
+        return substring(dotted, 0, dot);
+    }
+    return dotted;
+}
+
+fn imp_resolve(dotted: string): string {
+    let direct = imp_dotted_to_path(imp_stdlib_root(), dotted);
+    if file_exists(direct) {
+        return direct;
+    }
+    let dot = find_char_in(dotted, 0, '.');
+    if dot < len(dotted) {
+        let pkg = substring(dotted, 0, dot);
+        let rest = substring(dotted, dot + 1, len(dotted) - dot - 1);
+        let in_src = imp_dotted_to_path("packages/" + pkg + "/src", rest);
+        if file_exists(in_src) {
+            return in_src;
+        }
+        let at_root = imp_dotted_to_path("packages/" + pkg, rest);
+        if file_exists(at_root) {
+            return at_root;
+        }
+    }
+    return direct;
+}
+
+fn imp_loaded(list: string, name: string): bool {
+    let i: i64 = 0;
+    let n = len(list);
+    while i < n {
+        let e = find_char_in(list, i, '\n');
+        if substring(list, i, e - i) == name {
+            return true;
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
+// Returns the concatenated `Module <alias>` sections for everything the tree
+// imports. `seen` is the set of aliases already emitted.
+fn imp_gather(tree: string, seen: string): string {
+    let out = "";
+    let marks = seen;
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "ImportPath ") {
+            let dotted = trim_line(substring(line, 11, len(line) - 11));
+            let alias = imp_alias_of(dotted);
+            if !imp_loaded(marks, alias) {
+                marks = marks + alias + "\n";
+                let path = imp_resolve(dotted);
+                if file_exists(path) {
+                    let sub = parser.parse_program(lexer.lex(read_file(path)));
+                    out = out + "Module " + alias + "\n" + sub;
+                } else {
+                    eprint("miko: cannot find module '" + dotted + "'");
+                }
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return out;
+}
+
+// Single-file mode: `miko <input.miko> <output-prefix>` emits <prefix>.ll and
+// links <prefix>.exe. `--emit-ir` stops at the IR.
+fn compile_file(source_path: string, output_prefix: string, want_exe: bool): i32 {
+    let source = read_file(source_path);
+    let stream = lexer.lex(source);
+    let tree = parser.parse_program(stream);
+    // Emit the parse tree next to the IR, the way --self does. Without it a
+    // failure to resolve an import is invisible: the tree is the only place the
+    // ImportPath lines the driver searches for can be inspected.
+    write_file(output_prefix + ".ast", tree);
+    let checked = sema.check_program(tree);
+    write_file(output_prefix + ".sema", checked);
+    let error = check_static_rules(tree);
+    if error != "" {
+        eprint("error: " + error);
+        return 1;
+    }
+    let imported = imp_gather(tree, "");
+    let ir = codegen_ll.generate_ir(imported + "Module " + "program" + "\n" + tree);
+    write_file(output_prefix + ".ll", ir);
+    print("wrote " + output_prefix + ".ll");
+    if want_exe {
+        let status = link_executable(output_prefix);
+        if status != 0 {
+            eprint("miko: linking failed with exit status " + digits_of(status));
+            eprint("miko: the .ll was written; check miko.toolchain for the clang paths");
+            return 1;
+        }
+        print("wrote " + output_prefix + ".exe");
+    }
+    return 0;
+}
+
+fn compile_self_to(prefix: string) {
+    let tree = combine_modules();
+    write_file(prefix + ".ast", tree);
+    let checked = sema.check_program(tree);
+    write_file(prefix + ".sema", checked);
+    let ir = codegen_ll.generate_ir(tree);
+    write_file(prefix + ".ll", ir);
+    print("wrote " + prefix + ".ll");
+}
+
+fn compile_self() {
+    compile_self_to("out/whole_program");
+}
+
+fn usage() {
+    print("miko - a miko compiler written in miko");
+    print("");
+    print("usage:");
+    print("  miko --version              print the version");
+    print("  miko --help                 print this text");
+    print("  miko --self [prefix]        compile the whole compiler to <prefix>.ll");
+    print("  miko <src.miko> <prefix>    compile one program to <prefix>.exe");
+    print("  miko                        same as --self with prefix out/whole_program");
+    print("");
+    print("compiling a program is a single step: <prefix>.ll is emitted and linked");
+    print("against runtime/miko_runtime.c into <prefix>.exe.");
+    print("");
+    print("add --emit-ir to stop after the IR and skip linking:");
+    print("  miko --emit-ir <src.miko> <prefix>");
+    print("");
+    print("linking needs clang with the C runtime search paths. Those are read from");
+    print("miko.toolchain (written at build time); without it plain clang is used.");
+    print("");
+    print("run from the repository root: modules resolve as compiler/<name>.miko");
+}
+
+fn version() {
+    print("miko 0.2.0 (miko-implemented, LLVM IR backend)");
+}
+
+fn main(): i32 {
+    if arg_count() >= 1 {
+        let mode = arg_at(0);
+        if mode == "--version" {
+            version();
+            return 0;
+        }
+        if mode == "--help" {
+            usage();
+            return 0;
+        }
+        if mode == "--self" {
+            if arg_count() >= 2 {
+                compile_self_to(arg_at(1));
+                return 0;
+            }
+            compile_self();
+            return 0;
+        }
+        if mode == "--emit-ir" {
+            if arg_count() >= 3 {
+                return compile_file(arg_at(1), arg_at(2), false);
+            }
+            if arg_count() == 2 {
+                return compile_file(arg_at(0), arg_at(1), false);
+            }
+            eprint("miko: --emit-ir needs <src.miko> <prefix>");
+            return 1;
+        }
+    }
+    if arg_count() >= 3 {
+        return compile_file(arg_at(1), arg_at(2), true);
+    }
+    if arg_count() == 2 {
+        return compile_file(arg_at(0), arg_at(1), true);
+    }
+    compile_self();
+    return 0;
+}

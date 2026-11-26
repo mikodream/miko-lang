@@ -1,0 +1,7 @@
+fn main() {
+    print("name?");
+    let name = input();
+    let greeting = "hello " + name;
+    print(greeting);
+    print(len(name));
+}

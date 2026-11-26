@@ -1,0 +1,40 @@
+// append_str builds a string in place. Its observable result must equal `+`, so
+// the compiled backends and the interpreter have to agree on every line here.
+//
+// The loop is the point of the builtin: with `s = s + piece` this is quadratic,
+// with append_str it is linear. The expected file records the result, not the
+// speed, because a diff test can only pin meaning.
+fn main() {
+    let s = "";
+    let i: i64 = 0;
+    while i < 5 {
+        s = append_str(s, "ab");
+        i = i + 1;
+    }
+    print(s);
+    print(len(s));
+
+    // Appending to a literal must copy: the literal's capacity equals its
+    // length, so there is no spare room to write into.
+    let from_literal = append_str("left", "-right");
+    print(from_literal);
+    print(len(from_literal));
+
+    // Appending the empty string is a no-op, including on an empty receiver.
+    let empty = append_str("", "");
+    print(len(empty));
+    print(empty == "");
+
+    // A built string still compares and searches like any other string.
+    let built = "";
+    built = append_str(built, "hello, ");
+    built = append_str(built, "world");
+    print(built == "hello, world");
+    print(str_index_of(built, "world"));
+    print(str_contains(built, "lo, w"));
+    print(char_at(built, 7));
+    print(substring(built, 7, 5));
+
+    // The result of one append can be fed straight into the next call.
+    print(len(append_str(append_str("a", "b"), "c")));
+}

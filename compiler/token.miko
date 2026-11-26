@@ -1,0 +1,76 @@
+// token.miko - the stage1 token stream wire format.
+//
+// Each token occupies exactly one physical line of the stream:
+//
+//     Kind|LEN|text\n
+//
+// LEN is the byte length of `text`, which makes the format self-delimiting:
+// a token's text may contain any byte that can appear in a legal literal
+// (including '|', quotes, braces) without corrupting the stream, because the
+// reader never looks for a closing delimiter - it consumes LEN bytes.
+//
+// A raw newline can never appear in `text`: encode_text rewrites the three
+// whitespace control characters that a multi-line string literal can carry
+// into their two-character escape spelling, so the "one token per line"
+// invariant holds for every program the language accepts.
+//
+// Keeping the text in escaped spelling (rather than decoding it back to raw
+// control characters) is what lets every later stage stay line-oriented: the
+// AST dump, the sema pass and both codegen backends can keep splitting the
+// program on '\n'. For the C and LLVM backends the escaped spelling is also
+// exactly what a string literal needs, so no stage has to re-escape.
+
+fn number_to_text(value: i64): string {
+    if value == 0 {
+        return "0";
+    }
+    let digits = "";
+    let v = value;
+    while v > 0 {
+        let d = v % 10;
+        digits = substring("0123456789", d, 1) + digits;
+        v = v / 10;
+    }
+    return digits;
+}
+
+// Rewrites raw control characters into their escape spelling so a token never
+// spans more than one stream line.
+fn encode_text(text: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(text);
+    while i < n {
+        let ch = char_at(text, i);
+        if ch == '\n' {
+            out = out + "\\n";
+        } else {
+            if ch == '\r' {
+                out = out + "\\r";
+            } else {
+                if ch == '\t' {
+                    out = out + "\\t";
+                } else {
+                    out = out + substring(text, i, 1);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn append_token(stream: string, kind: string, text: string): string {
+    // append_str, not stream + ...: the stream grows to megabytes, so rebuilding
+    // it for every token made lexing quadratic. On a 94 KB source that was 47 of
+    // the compiler's 55 seconds; the token stream is now appended in place.
+    let encoded = encode_text(text);
+    let piece = kind + "|" + number_to_text(len(encoded)) + "|" + encoded + "\n";
+    return append_str(stream, piece);
+}
+
+pub fn append_char_token(stream: string, kind: string, value: char): string {
+    // Only reached for characters no grammar rule accepts; the payload carries
+    // no meaning past "this byte was rejected", so the rendering is fixed.
+    return append_token(stream, kind, "<char>");
+}

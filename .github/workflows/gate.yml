@@ -1,0 +1,86 @@
+name: gate
+
+# Two harnesses decide whether a change is acceptable:
+#
+#   tools/difftest.ps1   compiles every case in tests/diff/ with all three engines
+#                        (C++ interpreter, C++ LLVM backend, self-hosted backend)
+#                        and requires identical output; every
+#                        examples/*_error.miko must be rejected. One engine
+#                        disagreeing fails the build.
+#   tools/bootstrap.ps1  compiles the self-hosted compiler with itself twice and
+#                        requires both generations to emit identical IR and to
+#                        compile every case correctly.
+#
+# Together they catch the failure mode this project keeps producing: a backend
+# that compiles a program happily and gives the wrong answer.
+#
+# The build directory is build-vs-llvm on purpose: tools/difftest.ps1 looks for
+# build-vs-llvm\Release\miko.exe by default, so no path has to be threaded
+# through the command line.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM and MinGW
+        run: |
+          choco install llvm --yes --no-progress
+          choco install mingw --yes --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Report toolchain
+        run: |
+          clang --version
+          gcc --version
+          cmake --version
+
+      - name: Configure
+        run: cmake -S . -B build-vs-llvm -G "Visual Studio 17 2022" -A x64
+
+      - name: Build the C++ compiler
+        run: cmake --build build-vs-llvm --config Release --target miko
+
+      # difftest exercises a third engine, the self-hosted compiler, so it has to
+      # exist first. Building it from source rather than trusting dist/miko.exe
+      # keeps the check honest: a stale committed binary would let a regression
+      # in the self-hosted backend pass unnoticed.
+      - name: Build the self-hosted compiler
+        shell: pwsh
+        run: |
+          Get-Process | Where-Object { $_.ProcessName -match 'miko' } | ForEach-Object { try { $_.Kill() } catch {} }
+          & build-vs-llvm\Release\miko.exe compiler\main_ll.miko --compile --emit-ir -o out\self.ll
+          if ($LASTEXITCODE -ne 0) { throw "self-hosted IR emission failed" }
+          cmd /c "dist\miko-link.bat out\self.ll out\miko_self.exe"
+          if (-not (Test-Path out\miko_self.exe)) { throw "self-hosted link failed" }
+          Copy-Item out\miko_self.exe dist\miko.exe -Force
+
+      - name: Differential test across all three engines
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools\difftest.ps1 -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "difftest failed: $LASTEXITCODE case(s) disagreed" }
+
+      - name: Bootstrap the self-hosted compiler twice
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools\bootstrap.ps1 -RepoRoot . -Generations 2
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap failed: generations diverged" }
+
+      - name: Keep the artefacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-artefacts
+          path: |
+            out/*.ast
+            out/*.sema
+            out/*.ll
+          retention-days: 7

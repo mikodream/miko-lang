@@ -1,0 +1,13 @@
+// system builtins: file_exists / eprint / exit / file roundtrip.
+fn main() {
+    write_file("out/sys_io_data.txt", "file-ok");
+    print(read_file("out/sys_io_data.txt"));
+    print(file_exists("out/sys_io_data.txt"));
+    print(file_exists("out/definitely_missing_file.txt"));
+
+    let code = 1;
+    if code == 1 {
+        eprint("this goes to stderr");
+    }
+    print("done");
+}

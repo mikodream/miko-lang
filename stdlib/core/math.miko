@@ -1,0 +1,130 @@
+// math.miko - numeric helpers for i32 / i64 / f64.
+//
+// Trig / transcendental functions are not provided yet; sqrt / floor / ceil /
+// round are stage0 builtins (sqrt_f64, floor_f64, ceil_f64, round_f64).
+
+pub fn max_i32(a: i32, b: i32): i32 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+pub fn min_i32(a: i32, b: i32): i32 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn abs_i32(value: i32): i32 {
+    if value < 0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn clamp_i32(value: i32, low: i32, high: i32): i32 {
+    if value < low {
+        return low;
+    }
+    if value > high {
+        return high;
+    }
+    return value;
+}
+
+pub fn max_i64(a: i64, b: i64): i64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+pub fn min_i64(a: i64, b: i64): i64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn abs_i64(value: i64): i64 {
+    if value < 0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn clamp_i64(value: i64, low: i64, high: i64): i64 {
+    if value < low {
+        return low;
+    }
+    if value > high {
+        return high;
+    }
+    return value;
+}
+
+pub fn abs_f64(value: f64): f64 {
+    if value < 0.0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn max_f64(a: f64, b: f64): f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+pub fn min_f64(a: f64, b: f64): f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn gcd_i64(a: i64, b: i64): i64 {
+    let x = abs_i64(a);
+    let y = abs_i64(b);
+    while y != 0 {
+        let rest = x % y;
+        x = y;
+        y = rest;
+    }
+    return x;
+}
+
+pub fn lcm_i64(a: i64, b: i64): i64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    return abs_i64(a) / gcd_i64(a, b) * abs_i64(b);
+}
+
+pub fn pow_i64(base: i64, exponent: i64): i64 {
+    if exponent < 0 {
+        return 0;
+    }
+    let result: i64 = 1;
+    let b = base;
+    let e = exponent;
+    while e > 0 {
+        if e % 2 == 1 {
+            result = result * b;
+        }
+        b = b * b;
+        e = e / 2;
+    }
+    return result;
+}
+
+pub fn is_even_i64(value: i64): bool {
+    return value % 2 == 0;
+}
+
+pub fn is_odd_i64(value: i64): bool {
+    return value % 2 != 0;
+}

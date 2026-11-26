@@ -1,0 +1,164 @@
+// collections.miko - map types built on vec<T>.
+//
+// Vecs have reference semantics (a copy of a struct shares the same vec
+// storage), so map_set / int_map_set / map_remove can mutate a map passed by
+// value and the caller observes the change.
+
+// StringMap: string -> string
+struct StringMap {
+    keys: vec<string>,
+    values: vec<string>,
+}
+
+// IntMap: string -> i64
+struct IntMap {
+    keys: vec<string>,
+    values: vec<i64>,
+}
+
+pub fn map_new(): StringMap {
+    let m = StringMap { keys: vec_new(), values: vec_new() };
+    return m;
+}
+
+pub fn int_map_new(): IntMap {
+    let m = IntMap { keys: vec_new(), values: vec_new() };
+    return m;
+}
+
+pub fn map_len(m: StringMap): i64 {
+    return len(m.keys);
+}
+
+pub fn int_map_len(m: IntMap): i64 {
+    return len(m.keys);
+}
+
+// Internal: index of key, or -1 when absent.
+fn map_find(m: StringMap, key: string): i64 {
+    let count = len(m.keys);
+    let i: i64 = 0;
+    while i < count {
+        if m.keys[i] == key {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn int_map_find(m: IntMap, key: string): i64 {
+    let count = len(m.keys);
+    let i: i64 = 0;
+    while i < count {
+        if m.keys[i] == key {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn map_has(m: StringMap, key: string): bool {
+    return map_find(m, key) >= 0;
+}
+
+pub fn int_map_has(m: IntMap, key: string): bool {
+    return int_map_find(m, key) >= 0;
+}
+
+// Returns "" when the key is absent; combine with map_has when that matters.
+pub fn map_get(m: StringMap, key: string): string {
+    let index = map_find(m, key);
+    if index < 0 {
+        return "";
+    }
+    return m.values[index];
+}
+
+// Returns 0 when the key is absent; combine with int_map_has when that matters.
+pub fn int_map_get(m: IntMap, key: string): i64 {
+    let index = int_map_find(m, key);
+    if index < 0 {
+        return 0;
+    }
+    return m.values[index];
+}
+
+pub fn map_get_or(m: StringMap, key: string, fallback: string): string {
+    let index = map_find(m, key);
+    if index < 0 {
+        return fallback;
+    }
+    return m.values[index];
+}
+
+pub fn int_map_get_or(m: IntMap, key: string, fallback: i64): i64 {
+    let index = int_map_find(m, key);
+    if index < 0 {
+        return fallback;
+    }
+    return m.values[index];
+}
+
+pub fn map_set(m: StringMap, key: string, value: string) {
+    let index = map_find(m, key);
+    if index >= 0 {
+        vec_set(m.values, index, value);
+        return;
+    }
+    vec_push(m.keys, key);
+    vec_push(m.values, value);
+}
+
+pub fn int_map_set(m: IntMap, key: string, value: i64) {
+    let index = int_map_find(m, key);
+    if index >= 0 {
+        vec_set(m.values, index, value);
+        return;
+    }
+    vec_push(m.keys, key);
+    vec_push(m.values, value);
+}
+
+pub fn map_remove(m: StringMap, key: string): bool {
+    let index = map_find(m, key);
+    if index < 0 {
+        return false;
+    }
+    let count = len(m.keys);
+    let i = index;
+    while i < count - 1 {
+        vec_set(m.keys, i, m.keys[i + 1]);
+        vec_set(m.values, i, m.values[i + 1]);
+        i = i + 1;
+    }
+    vec_pop(m.keys);
+    vec_pop(m.values);
+    return true;
+}
+
+pub fn int_map_remove(m: IntMap, key: string): bool {
+    let index = int_map_find(m, key);
+    if index < 0 {
+        return false;
+    }
+    let count = len(m.keys);
+    let i = index;
+    while i < count - 1 {
+        vec_set(m.keys, i, m.keys[i + 1]);
+        vec_set(m.values, i, m.values[i + 1]);
+        i = i + 1;
+    }
+    vec_pop(m.keys);
+    vec_pop(m.values);
+    return true;
+}
+
+pub fn map_keys(m: StringMap): vec<string> {
+    return m.keys;
+}
+
+pub fn int_map_keys(m: IntMap): vec<string> {
+    return m.keys;
+}

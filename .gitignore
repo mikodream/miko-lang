@@ -1,0 +1,82 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+release/
+# Assembled release package, staged before being archived
+stage/
+Testing/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+
+# `dist/` holds the two link scripts and the generated toolchain pointer, all of
+# which belong in the repository. The binaries and bootstrapping logs that pile up
+# beside them do not, so the directory is not ignored wholesale - only its output.
+dist/*.exe
+dist/*.exe.bak
+dist/*.ll
+dist/*.ast
+dist/*.sema
+dist/*.log
+dist/miko_gen*.exe
+
+# The compiler reads this to find the platform's link script. It is generated per
+# machine (see BUILD.md) because it names a .bat on Windows and a .sh elsewhere,
+# so a committed copy would be wrong for half the users.
+miko.toolchain
+
+# CLion / JetBrains
+.idea/
+*.iml
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+
+# Agent and editor scratch directories - not part of the language
+.agents/
+.ccpanes/
+.claude/
+.uploads/
+
+# Windows binaries and debug files
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# Native build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.d
+
+# LLVM / compiler output
+*.ll
+*.bc
+*.s
+*.asm
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,33 @@
+// stdlib/core/string: trim / split / join / replace / case conversion.
+import core.string as string;
+
+fn main() {
+    print(string.trim("  hello miko  "));
+    print(string.trim_start("  hello"));
+    print(string.trim_end("hello  "));
+
+    print(string.upper("miko"));
+    print(string.lower("MiKo"));
+
+    let parts = string.split("a,b,c", ",");
+    print(len(parts));
+    print(parts[1]);
+    print(string.join(parts, "-"));
+
+    print(string.replace("miko miko", "ko", "KO"));
+    print(string.starts_with("mikolang", "miko"));
+    print(string.ends_with("mikolang", "lang"));
+    print(string.contains("mikolang", "ko"));
+    print(string.index_of("mikolang", "lang"));
+
+    print(string.repeat("ab", 3));
+    print(string.reverse("miko"));
+    print(string.pad_start("7", 3, "0"));
+    print(string.pad_end("7", 3, "."));
+
+    print(string.is_digit_char(char_at("5", 0)));
+    print(string.is_alpha_char(char_at("5", 0)));
+
+    let joined = string.split("x=y", "=");
+    print(string.join(joined, "!"));
+}

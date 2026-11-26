@@ -1,0 +1,9 @@
+fn main() {
+    let nums: [i64; 4] = [10, 20, 30, 40];
+    nums[1] = 99;
+    nums[3] = nums[0] + nums[2];
+
+    print(nums[0]);
+    print(nums[1]);
+    print(nums[3]);
+}

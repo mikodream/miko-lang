@@ -1,0 +1,345 @@
+name: release
+
+# Every push to main produces a tag and a release with native binaries for each
+# supported platform. The tag carries the build number so that two releases can
+# never collide on the same name, while the version still comes from
+# CMakeLists.txt - one place to bump.
+#
+# Why native builds instead of cross-compiling: the compiler is bootstrapped in
+# two stages, and stage 0 is a C++ program linked against LLVM. Cross-building
+# that for four platforms means four LLVM installs plus four sysroots, and it
+# still would not prove the result runs. Each job here builds on the machine the
+# binary is for, so a broken binary fails its own job instead of a user's machine.
+#
+# The released compiler is stage 1, the self-hosted one. It emits portable LLVM IR
+# with no target triple, so the same source produces the right code everywhere;
+# the platform only enters at link time, through the link script in the package.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One release at a time. A second push while a release is building waits rather
+# than racing for the same tag number.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: decide the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version from CMakeLists.txt
+        id: read
+        run: |
+          set -euo pipefail
+          version=$(grep -oP 'MIKO_VERSION="\K[^"]+' CMakeLists.txt | head -n1)
+          if [ -z "$version" ]; then
+            echo "could not read MIKO_VERSION from CMakeLists.txt" >&2
+            exit 1
+          fi
+          tag="v${version}-${{ github.run_number }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "releasing $version as $tag"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the others: a release missing only
+      # the arm64 Mac is still worth shipping, and the failure is visible in the
+      # run summary either way.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            arch: x64
+            target: linux-x64
+            archive: miko-${{ needs.version.outputs.version }}-linux-x64.tar.gz
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            arch: arm64
+            target: linux-arm64
+            archive: miko-${{ needs.version.outputs.version }}-linux-arm64.tar.gz
+          - name: macos-x64
+            os: macos-15-intel
+            arch: x64
+            target: macos-x64
+            archive: miko-${{ needs.version.outputs.version }}-macos-x64.tar.gz
+          - name: macos-arm64
+            os: macos-14
+            arch: arm64
+            target: macos-arm64
+            archive: miko-${{ needs.version.outputs.version }}-macos-arm64.tar.gz
+          - name: windows-x64
+            os: windows-latest
+            arch: x64
+            target: windows-x64
+            archive: miko-${{ needs.version.outputs.version }}-windows-x64.zip
+          - name: windows-arm64
+            os: windows-11-arm
+            arch: arm64
+            target: windows-arm64
+            archive: miko-${{ needs.version.outputs.version }}-windows-arm64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- LLVM ------------------------------------------------------------
+      # Stage 0 is a C++ program that links against LLVM's C++ API, so the
+      # development package with LLVMConfig.cmake is required, not just clang.
+
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm llvm-dev clang libclang-dev gcc
+          echo "LLVM_DIR=$(llvm-config --cmakedir)" >> "$GITHUB_ENV"
+
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          prefix="$(brew --prefix llvm)"
+          echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+          # Homebrew's LLVM is keg-only: clang and llvm-config are not on PATH by
+          # default, and the link script calls bare `clang`.
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm --yes --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          # The self-hosted stage builds a .exe, so it needs a linker and headers
+          # that a bare clang install cannot find on Windows. MinGW provides both.
+          choco install mingw --yes --no-progress
+          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Report the toolchain
+        shell: bash
+        run: |
+          cmake --version
+          clang --version || true
+          echo "LLVM_DIR=${LLVM_DIR:-unset}"
+
+      # ---- stage 0: the C++ compiler ---------------------------------------
+
+      - name: Configure and build stage 0 (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMIKO_ENABLE_LLVM=ON \
+            -DLLVM_DIR="$LLVM_DIR"
+          cmake --build build --target miko
+
+      # The Visual Studio generator is required on Windows: the LLVM chocolatey
+      # package is built with MSVC and its import libraries do not match MinGW.
+      # The architecture arrives through the environment rather than as an inline
+      # ${{ }} expression, which PowerShell would try to read as a variable.
+      - name: Configure and build stage 0 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MIKO_ARCH: ${{ matrix.arch }}
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A $env:MIKO_ARCH -DMIKO_ENABLE_LLVM=ON
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build --config Release --target miko
+          if ($LASTEXITCODE -ne 0) { throw "stage 0 build failed" }
+
+      # ---- stage 1: the self-hosted compiler -------------------------------
+      # This is what ships. Building it here rather than trusting a committed
+      # binary is the only way the release proves the compiler can compile itself
+      # on this platform.
+
+      - name: Build stage 1 (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          stage0="$PWD/build/miko"
+          # The compiler looks for miko.toolchain in the working directory first,
+          # so writing it here decides how its output gets linked. The POSIX entry
+          # needs the ./ prefix: system() resolves the command through the shell,
+          # which does not search the current directory without it.
+          chmod +x dist/miko-link.sh
+          printf './dist/miko-link.sh\n' > miko.toolchain
+          mkdir -p stage1
+          "$stage0" compiler/main_ll.miko --compile --emit-ir -o stage1/miko.ll
+          ./dist/miko-link.sh stage1/miko.ll stage1/miko
+          ./stage1/miko --version
+
+      - name: Build stage 1 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage0 = "build\Release\miko.exe"
+          if (-not (Test-Path $stage0)) { throw "stage 0 binary missing: $stage0" }
+          New-Item -ItemType Directory -Force -Path stage1 | Out-Null
+          "dist\miko-link.bat" | Out-File -Encoding ascii -NoNewline miko.toolchain
+          & $stage0 compiler\main_ll.miko --compile --emit-ir -o stage1\miko.ll
+          if ($LASTEXITCODE -ne 0) { throw "stage 1 IR emission failed" }
+          cmd /c "dist\miko-link.bat stage1\miko.ll stage1\miko.exe"
+          if (-not (Test-Path stage1\miko.exe)) { throw "stage 1 link failed" }
+          & stage1\miko.exe --version
+
+      # ---- prove the shipped compiler works --------------------------------
+      # A release that cannot run its own test suite is not a release. The
+      # differential harness needs PowerShell, which every GitHub runner has.
+
+      - name: Run the differential suite against the shipped compiler
+        shell: pwsh
+        run: |
+          # The harness takes explicit paths rather than guessing, because a build
+          # directory differs per platform and a wrong guess would silently test
+          # the wrong compiler.
+          $stage0 = if ($env:RUNNER_OS -eq "Windows") { "build\Release\miko.exe" } else { "build/miko" }
+          $stage1 = if ($env:RUNNER_OS -eq "Windows") { "stage1\miko.exe" } else { "stage1/miko" }
+          pwsh -NoProfile -File tools/difftest.ps1 -RepoRoot . -CppCompiler $stage0 -SelfCompiler $stage1
+          if ($LASTEXITCODE -ne 0) { throw "difftest failed: $LASTEXITCODE case(s) disagreed" }
+
+      # ---- assemble the package --------------------------------------------
+      # The layout is flat on purpose. miko_str/read_file aside, the compiler
+      # resolves two things by relative path: runtime/miko_runtime.c for linking
+      # and stdlib/core/math.miko for imports. Both have to sit beside the binary,
+      # so the archive root is the directory the user works in.
+
+      - name: Assemble the package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          root="stage/miko"
+          mkdir -p "$root/runtime" "$root/stdlib" "$root/compiler"
+          cp stage1/miko "$root/miko"
+          chmod +x "$root/miko"
+          cp dist/miko-link.sh "$root/miko-link.sh"
+          chmod +x "$root/miko-link.sh"
+          printf './miko-link.sh\n' > "$root/miko.toolchain"
+          cp runtime/miko_runtime.c "$root/runtime/"
+          cp -r stdlib/core "$root/stdlib/"
+          cp compiler/*.miko "$root/compiler/"
+          cp README.md BUILD.md TUTORIAL.md BOOTSTRAP.md ROADMAP.md "$root/"
+          cp -r tests "$root/"
+          tar -czf "${{ matrix.archive }}" -C stage miko
+          ls -l "${{ matrix.archive }}"
+
+      - name: Assemble the package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MIKO_ARCHIVE: ${{ matrix.archive }}
+        run: |
+          $root = "stage\miko"
+          Remove-Item -Recurse -Force stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$root\runtime","$root\stdlib","$root\compiler" | Out-Null
+          Copy-Item stage1\miko.exe "$root\miko.exe"
+          Copy-Item dist\miko-link.bat "$root\miko-link.bat"
+          "miko-link.bat" | Out-File -Encoding ascii -NoNewline "$root\miko.toolchain"
+          Copy-Item runtime\miko_runtime.c "$root\runtime\"
+          Copy-Item -Recurse stdlib\core "$root\stdlib\core"
+          Copy-Item compiler\*.miko "$root\compiler\"
+          Copy-Item README.md,BUILD.md,TUTORIAL.md,BOOTSTRAP.md,ROADMAP.md "$root\"
+          Copy-Item -Recurse tests "$root\tests"
+          # Compress the containing directory, not its contents: the archive then
+          # has a single miko/ root, which is what tar produces on the other
+          # platforms. Compressing "$root\*" instead sprayed the files into the
+          # user's working directory on extraction.
+          Compress-Archive -Path $root -DestinationPath $env:MIKO_ARCHIVE -Force
+          Get-Item $env:MIKO_ARCHIVE | ForEach-Object { Write-Host ($_.Name + " " + $_.Length + " bytes") }
+
+      # ---- prove the package is self-contained -----------------------------
+      # Unpack it somewhere else and compile a program with nothing but what is
+      # inside, from the package root. This is the check that would have caught
+      # shipping a binary whose runtime/ was left behind.
+
+      - name: Smoke test the package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tar -xzf "${{ matrix.archive }}" -C "$work"
+          cd "$work/miko"
+          printf 'fn main() {\n    print("package ok");\n}\n' > smoke.miko
+          ./miko smoke.miko smoke
+          ./smoke
+
+      - name: Smoke test the package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MIKO_ARCHIVE: ${{ matrix.archive }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "pkgtest"
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+          Expand-Archive -Path $env:MIKO_ARCHIVE -DestinationPath $work
+          Push-Location (Join-Path $work "miko")
+          try {
+            'fn main() {' + "`n" + '    print("package ok");' + "`n" + '}' | Out-File -Encoding ascii smoke.miko
+            & .\miko.exe smoke.miko smoke
+            if ($LASTEXITCODE -ne 0) { throw "package could not compile a program" }
+            & .\smoke.exe
+            if ($LASTEXITCODE -ne 0) { throw "package produced a binary that failed" }
+          } finally { Pop-Location }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: tag and release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List what is being published
+        run: ls -l artifacts
+
+      # The tag is created here rather than by a separate step so that a tag never
+      # exists without a release behind it.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: miko ${{ needs.version.outputs.version }} (build ${{ github.run_number }})
+          target_commitish: ${{ github.sha }}
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            miko ${{ needs.version.outputs.version }}, built from ${{ github.sha }}.
+
+            Each archive contains the self-hosted compiler plus everything it needs
+            at run time: the link script, `runtime/miko_runtime.c`, the standard
+            library and the compiler's own sources (used by `--self`).
+
+            Unpack an archive and work from the directory it creates:
+
+            ```
+            tar -xzf miko-${{ needs.version.outputs.version }}-linux-x64.tar.gz
+            cd miko
+            ./miko --version
+            ./miko program.miko program
+            ./program
+            ```
+
+            The compiler emits LLVM IR and links it with `clang`, which must be on
+            `PATH`. Set `CC` to use another C compiler.

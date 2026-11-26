@@ -1,0 +1,612 @@
+import "ast.miko" as ast;
+
+struct Cursor {
+    index: i64;
+    next: i64;
+    kind: string;
+    text: string;
+}
+
+struct ParseResult {
+    next: i64;
+    text: string;
+}
+
+fn make_parse_result(next: i64, text: string): ParseResult {
+    return ParseResult { next: next, text: text };
+}
+
+fn find_char(text: string, start: i64, target: char): i64 {
+    let i = start;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == target {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn parse_dec(text: string): i64 {
+    let value: i64 = 0;
+    let i: i64 = 0;
+    let n = len(text);
+    while i < n {
+        let ch = char_at(text, i);
+        if ch >= '0' && ch <= '9' {
+            value = value * 10 + (ch - '0');
+        }
+        i = i + 1;
+    }
+    return value;
+}
+
+// Wire format: Kind|LEN|text\n (see token.miko). LEN is authoritative, so the
+// text may contain the '|' separator freely.
+fn read_cursor(stream: string, start: i64): Cursor {
+    let n = len(stream);
+    if start >= n {
+        return Cursor {
+            index: start,
+            next: start,
+            kind: "EndOfFile",
+            text: ""
+        };
+    }
+
+    let kind_end = find_char(stream, start, '|');
+    let len_end = find_char(stream, kind_end + 1, '|');
+    let kind = substring(stream, start, kind_end - start);
+    let text_len = parse_dec(substring(stream, kind_end + 1, len_end - kind_end - 1));
+    let text = substring(stream, len_end + 1, text_len);
+
+    let next = len_end + 1 + text_len;
+    if next < n && char_at(stream, next) == '\n' {
+        next = next + 1;
+    }
+
+    return Cursor {
+        index: start,
+        next: next,
+        kind: kind,
+        text: text
+    };
+}
+
+fn expect_kind(stream: string, index: i64, kind: string): Cursor {
+    let cursor: Cursor = read_cursor(stream, index);
+    if cursor.kind != kind {
+        print("parse error: expected " + kind + ", got " + cursor.kind);
+    }
+    return cursor;
+}
+
+fn is_expr_end(kind: string, end1: string, end2: string, end3: string): bool {
+    return kind == end1 || kind == end2 || kind == end3;
+}
+
+fn is_binary_op(kind: string): bool {
+    return kind == "Plus" || kind == "Minus" || kind == "Star" || kind == "Slash" || kind == "Percent"
+        || kind == "EqualEqual" || kind == "BangEqual" || kind == "Less" || kind == "LessEqual"
+        || kind == "Greater" || kind == "GreaterEqual" || kind == "AndAnd" || kind == "OrOr";
+}
+
+fn empty_cursor(index: i64): Cursor {
+    return Cursor {
+        index: index,
+        next: index,
+        kind: "EndOfFile",
+        text: ""
+    };
+}
+
+fn call_open_cursor(stream: string, index: i64): Cursor {
+    let first: Cursor = read_cursor(stream, index);
+    let second: Cursor = read_cursor(stream, first.next);
+    if first.kind == "Identifier" && second.kind == "LeftParen" {
+        return second;
+    }
+
+    let third: Cursor = read_cursor(stream, second.next);
+    let fourth: Cursor = read_cursor(stream, third.next);
+    if first.kind == "Identifier" && second.kind == "Dot" && third.kind == "Identifier" && fourth.kind == "LeftParen" {
+        return fourth;
+    }
+
+    return empty_cursor(index);
+}
+
+fn call_callee_text(stream: string, index: i64): string {
+    let first: Cursor = read_cursor(stream, index);
+    let second: Cursor = read_cursor(stream, first.next);
+    if first.kind == "Identifier" && second.kind == "LeftParen" {
+        return first.text;
+    }
+
+    let third: Cursor = read_cursor(stream, second.next);
+    let fourth: Cursor = read_cursor(stream, third.next);
+    if first.kind == "Identifier" && second.kind == "Dot" && third.kind == "Identifier" && fourth.kind == "LeftParen" {
+        return first.text + "." + third.text;
+    }
+
+    return "";
+}
+
+fn top_level_binary_op(stream: string, index: i64, end1: string, end2: string, end3: string): string {
+    let cursor: Cursor = read_cursor(stream, index);
+    let depth = 0;
+    let first_token = true;
+
+    while cursor.kind != "EndOfFile" {
+        if depth == 0 && is_expr_end(cursor.kind, end1, end2, end3) {
+            return "";
+        }
+
+        if depth == 0 && !first_token && is_binary_op(cursor.kind) {
+            return cursor.text;
+        }
+
+        first_token = false;
+        if cursor.kind == "LeftParen" || cursor.kind == "LeftBracket" || cursor.kind == "LeftBrace" {
+            depth = depth + 1;
+        }
+        if cursor.kind == "RightParen" || cursor.kind == "RightBracket" || cursor.kind == "RightBrace" {
+            depth = depth - 1;
+        }
+        cursor = read_cursor(stream, cursor.next);
+    }
+
+    return "";
+}
+
+fn find_top_level_kind(stream: string, index: i64, end1: string, end2: string, end3: string, wanted: string): Cursor {
+    let cursor: Cursor = read_cursor(stream, index);
+    let depth = 0;
+
+    while cursor.kind != "EndOfFile" {
+        if depth == 0 && is_expr_end(cursor.kind, end1, end2, end3) {
+            return empty_cursor(cursor.index);
+        }
+        if depth == 0 && cursor.kind == wanted {
+            return cursor;
+        }
+
+        if cursor.kind == "LeftParen" || cursor.kind == "LeftBracket" || cursor.kind == "LeftBrace" {
+            depth = depth + 1;
+        }
+        if cursor.kind == "RightParen" || cursor.kind == "RightBracket" || cursor.kind == "RightBrace" {
+            depth = depth - 1;
+        }
+        cursor = read_cursor(stream, cursor.next);
+    }
+
+    return empty_cursor(cursor.index);
+}
+
+fn token_label(cursor: Cursor): string {
+    if cursor.kind == "Identifier" {
+        return cursor.text;
+    }
+    if cursor.kind == "IntegerLiteral" || cursor.kind == "FloatLiteral" || cursor.kind == "StringLiteral" || cursor.kind == "CharLiteral" {
+        return cursor.text;
+    }
+    if cursor.kind == "KwTrue" || cursor.kind == "KwFalse" {
+        return cursor.text;
+    }
+    return cursor.text;
+}
+
+fn collect_expr(stream: string, index: i64, end1: string, end2: string, end3: string): ParseResult {
+    let cursor: Cursor = read_cursor(stream, index);
+    let out = "";
+    let depth = 0;
+    let first = true;
+
+    while cursor.kind != "EndOfFile" {
+        if depth == 0 && is_expr_end(cursor.kind, end1, end2, end3) {
+            return ParseResult { next: cursor.index, text: out };
+        }
+
+        if !first {
+            out = append_str(out, " ");
+        }
+        first = false;
+        out = append_str(out, token_label(cursor));
+
+        if cursor.kind == "LeftParen" || cursor.kind == "LeftBracket" || cursor.kind == "LeftBrace" {
+            depth = depth + 1;
+        }
+        if cursor.kind == "RightParen" || cursor.kind == "RightBracket" || cursor.kind == "RightBrace" {
+            depth = depth - 1;
+        }
+        cursor = read_cursor(stream, cursor.next);
+    }
+
+    return ParseResult { next: cursor.index, text: out };
+}
+
+fn expr_line(indent: i64, prefix: string, text: string): string {
+    if indent == 1 {
+        return ast.line1(prefix + text);
+    }
+    if indent == 2 {
+        return ast.line2(prefix + text);
+    }
+    if indent == 3 {
+        return ast.line3(prefix + text);
+    }
+    return ast.line4(prefix + text);
+}
+
+fn dump_expr_at(stream: string, index: i64, indent: i64, end1: string, end2: string, end3: string): ParseResult {
+    let expr: ParseResult = collect_expr(stream, index, end1, end2, end3);
+    let first: Cursor = read_cursor(stream, index);
+    let second: Cursor = read_cursor(stream, first.next);
+    let third: Cursor = read_cursor(stream, second.next);
+    let op = top_level_binary_op(stream, index, end1, end2, end3);
+    let extra = "";
+    if op != "" {
+        extra = expr_line(indent + 1, "ExprOp ", op);
+    }
+
+    let prefix = "Expr ";
+    let call_open: Cursor = call_open_cursor(stream, index);
+    if call_open.kind == "LeftParen" {
+        prefix = "Call ";
+        let scan: Cursor = read_cursor(stream, call_open.next);
+        let depth = 1;
+        while scan.kind != "EndOfFile" && depth > 0 {
+            if scan.kind == "LeftParen" {
+                depth = depth + 1;
+            }
+            if scan.kind == "RightParen" {
+                depth = depth - 1;
+            }
+            if depth > 0 {
+                scan = read_cursor(stream, scan.next);
+            }
+        }
+        let op_after_call: Cursor = read_cursor(stream, scan.next);
+        if is_binary_op(op_after_call.kind) {
+            return make_parse_result(expr.next, expr_line(indent, "Expr ", expr.text) + extra);
+        }
+        let callee = call_callee_text(stream, index);
+        if callee != "" {
+            extra = extra + expr_line(indent + 1, "Callee ", callee);
+        }
+    }
+    if is_binary_op(second.kind) {
+        let fourth: Cursor = read_cursor(stream, third.next);
+        if !is_expr_end(fourth.kind, end1, end2, end3) {
+            return make_parse_result(expr.next, expr_line(indent, "Expr ", expr.text) + extra);
+        }
+        return make_parse_result(expr.next, expr_line(indent, "Binary ", second.text) + expr_line(indent + 1, "Left ", first.text) + expr_line(indent + 1, "Right ", third.text) + extra);
+    }
+
+    return make_parse_result(expr.next, expr_line(indent, prefix, expr.text) + extra);
+}
+
+fn parse_type_until(stream: string, index: i64, end_kind: string): ParseResult {
+    return collect_expr(stream, index, end_kind, "EndOfFile", "EndOfFile");
+}
+
+
+fn parse_let_or_const_stmt(stream: string, index: i64, label: string): ParseResult {
+    let kw: Cursor = read_cursor(stream, index);
+    let name: Cursor = expect_kind(stream, kw.next, "Identifier");
+    let cursor: Cursor = read_cursor(stream, name.next);
+    let out = ast.line2(label + " " + name.text);
+
+    if cursor.kind == "Colon" {
+        let type_result: ParseResult = parse_type_until(stream, cursor.next, "Equal");
+        out = append_str(out, ast.line3("Type " + type_result.text));
+        cursor = read_cursor(stream, type_result.next);
+    }
+
+    if cursor.kind == "Equal" {
+        let value: ParseResult = dump_expr_at(stream, cursor.next, 3, "Semicolon", "EndOfFile", "EndOfFile");
+        out = append_str(out, value.text);
+        let semi: Cursor = expect_kind(stream, value.next, "Semicolon");
+        return ParseResult { next: semi.next, text: out };
+    }
+
+    let semi2: Cursor = expect_kind(stream, cursor.index, "Semicolon");
+    return ParseResult { next: semi2.next, text: out };
+}
+
+fn parse_return_stmt(stream: string, index: i64): ParseResult {
+    let kw: Cursor = read_cursor(stream, index);
+    let value: ParseResult = dump_expr_at(stream, kw.next, 3, "Semicolon", "EndOfFile", "EndOfFile");
+    let semi: Cursor = expect_kind(stream, value.next, "Semicolon");
+    return ParseResult { next: semi.next, text: ast.line2("Return") + value.text };
+}
+
+fn parse_if_stmt(stream: string, index: i64): ParseResult {
+    let kw: Cursor = read_cursor(stream, index);
+    let condition: ParseResult = dump_expr_at(stream, kw.next, 3, "LeftBrace", "EndOfFile", "EndOfFile");
+    let lbrace: Cursor = expect_kind(stream, condition.next, "LeftBrace");
+    let then_block: ParseResult = parse_block(stream, lbrace.index);
+    let out = ast.line2("If") + ast.line3("Condition") + condition.text + ast.line3("Then") + then_block.text;
+    let next: Cursor = read_cursor(stream, then_block.next);
+    if next.kind == "KwElse" {
+        let maybe_brace: Cursor = read_cursor(stream, next.next);
+        if maybe_brace.kind == "LeftBrace" {
+            let else_block: ParseResult = parse_block(stream, maybe_brace.index);
+            return ParseResult { next: else_block.next, text: out + ast.line3("Else") + else_block.text + ast.line2("EndIf") };
+        }
+        if maybe_brace.kind == "KwIf" {
+            let else_if: ParseResult = parse_if_stmt(stream, maybe_brace.index);
+            return ParseResult { next: else_if.next, text: out + ast.line3("Else") + else_if.text + ast.line2("EndIf") };
+        }
+    }
+    let end_marker: string = ast.line2("EndIf");
+    let finished: string = out + end_marker;
+    return ParseResult { next: then_block.next, text: finished };
+}
+
+fn parse_while_stmt(stream: string, index: i64): ParseResult {
+    let kw: Cursor = read_cursor(stream, index);
+    let condition: ParseResult = dump_expr_at(stream, kw.next, 3, "LeftBrace", "EndOfFile", "EndOfFile");
+    let lbrace: Cursor = expect_kind(stream, condition.next, "LeftBrace");
+    let body: ParseResult = parse_block(stream, lbrace.index);
+    return ParseResult { next: body.next, text: ast.line2("While") + ast.line3("Condition") + condition.text + ast.line3("Body") + body.text + ast.line2("EndWhile") };
+}
+
+fn parse_for_stmt(stream: string, index: i64): ParseResult {
+    let kw: Cursor = read_cursor(stream, index);
+    let init: ParseResult = collect_expr(stream, kw.next, "Semicolon", "EndOfFile", "EndOfFile");
+    let semi1: Cursor = expect_kind(stream, init.next, "Semicolon");
+    let condition: ParseResult = collect_expr(stream, semi1.next, "Semicolon", "EndOfFile", "EndOfFile");
+    let semi2: Cursor = expect_kind(stream, condition.next, "Semicolon");
+    let step: ParseResult = collect_expr(stream, semi2.next, "LeftBrace", "EndOfFile", "EndOfFile");
+    let lbrace: Cursor = expect_kind(stream, step.next, "LeftBrace");
+    let body: ParseResult = parse_block(stream, lbrace.index);
+    let header_text = init.text + "; " + condition.text + "; " + step.text;
+    return ParseResult { next: body.next, text: ast.line2("For") + ast.line3("Header " + header_text) + ast.line3("ForInit " + init.text) + ast.line3("ForCondition " + condition.text) + ast.line3("ForStep " + step.text) + ast.line3("Body") + body.text + ast.line2("EndFor") };
+}
+
+fn parse_simple_stmt(stream: string, index: i64): ParseResult {
+    let expr: ParseResult = dump_expr_at(stream, index, 2, "Semicolon", "EndOfFile", "EndOfFile");
+    let semi: Cursor = expect_kind(stream, expr.next, "Semicolon");
+    let assign: Cursor = find_top_level_kind(stream, index, "Semicolon", "EndOfFile", "EndOfFile", "Equal");
+    if assign.kind == "Equal" {
+        let lhs: ParseResult = collect_expr(stream, index, "Equal", "EndOfFile", "EndOfFile");
+        return ParseResult { next: semi.next, text: ast.line2("ExprStmt") + ast.line2("Assign " + lhs.text) + expr.text };
+    }
+    return ParseResult { next: semi.next, text: ast.line2("ExprStmt") + expr.text };
+}
+
+fn parse_stmt(stream: string, index: i64): ParseResult {
+    let cursor: Cursor = read_cursor(stream, index);
+    if cursor.kind == "KwLet" {
+        return parse_let_or_const_stmt(stream, index, "Let");
+    }
+    if cursor.kind == "KwConst" {
+        return parse_let_or_const_stmt(stream, index, "Const");
+    }
+    if cursor.kind == "KwReturn" {
+        return parse_return_stmt(stream, index);
+    }
+    if cursor.kind == "KwIf" {
+        return parse_if_stmt(stream, index);
+    }
+    if cursor.kind == "KwWhile" {
+        return parse_while_stmt(stream, index);
+    }
+    if cursor.kind == "KwFor" {
+        return parse_for_stmt(stream, index);
+    }
+    if cursor.kind == "KwBreak" || cursor.kind == "KwContinue" {
+        let semi: Cursor = expect_kind(stream, cursor.next, "Semicolon");
+        return ParseResult { next: semi.next, text: ast.line2(cursor.text) };
+    }
+    return parse_simple_stmt(stream, index);
+}
+
+fn parse_block(stream: string, index: i64): ParseResult {
+    let lbrace: Cursor = expect_kind(stream, index, "LeftBrace");
+    let cursor: Cursor = read_cursor(stream, lbrace.next);
+    let out = "";
+    while cursor.kind != "RightBrace" && cursor.kind != "EndOfFile" {
+        let stmt: ParseResult = parse_stmt(stream, cursor.index);
+        out = append_str(out, stmt.text);
+        cursor = read_cursor(stream, stmt.next);
+    }
+    let rbrace: Cursor = expect_kind(stream, cursor.index, "RightBrace");
+    return ParseResult { next: rbrace.next, text: out };
+}
+
+fn parse_params(stream: string, index: i64): ParseResult {
+    let cursor: Cursor = read_cursor(stream, index);
+    let out = "";
+    while cursor.kind != "RightParen" && cursor.kind != "EndOfFile" {
+        if cursor.kind == "Identifier" {
+            let name = cursor.text;
+            let next: Cursor = read_cursor(stream, cursor.next);
+            if next.kind == "Colon" {
+                let ty: ParseResult = collect_expr(stream, next.next, "Comma", "RightParen", "EndOfFile");
+                out = append_str(out, ast.line2("Param " + name + ": " + ty.text));
+                cursor = read_cursor(stream, ty.next);
+                if cursor.kind == "Comma" {
+                    cursor = read_cursor(stream, cursor.next);
+                }
+                continue;
+            }
+        }
+        cursor = read_cursor(stream, cursor.next);
+    }
+    return ParseResult { next: cursor.index, text: out };
+}
+
+fn parse_function(stream: string, index: i64, is_pub: bool): ParseResult {
+    let fn_kw: Cursor = expect_kind(stream, index, "KwFn");
+    let name: Cursor = expect_kind(stream, fn_kw.next, "Identifier");
+    let lparen: Cursor = expect_kind(stream, name.next, "LeftParen");
+    let params: ParseResult = parse_params(stream, lparen.next);
+    let rparen: Cursor = expect_kind(stream, params.next, "RightParen");
+    let cursor: Cursor = read_cursor(stream, rparen.next);
+    let out = ast.line1("Function " + name.text) + params.text;
+
+    if cursor.kind == "Colon" {
+        let ty: ParseResult = collect_expr(stream, cursor.next, "LeftBrace", "EndOfFile", "EndOfFile");
+        let lbrace: Cursor = expect_kind(stream, ty.next, "LeftBrace");
+        let body: ParseResult = parse_block(stream, lbrace.index);
+        if is_pub {
+            return ParseResult { next: body.next, text: ast.line1("Pub") + out + ast.line2("ReturnType " + ty.text) + body.text };
+        }
+        return ParseResult { next: body.next, text: out + ast.line2("ReturnType " + ty.text) + body.text };
+    }
+
+    let lbrace2: Cursor = expect_kind(stream, cursor.index, "LeftBrace");
+    let body2: ParseResult = parse_block(stream, lbrace2.index);
+    if is_pub {
+        return ParseResult { next: body2.next, text: ast.line1("Pub") + out + body2.text };
+    }
+    return ParseResult { next: body2.next, text: out + body2.text };
+}
+
+fn parse_struct_decl(stream: string, index: i64): ParseResult {
+    let kw: Cursor = expect_kind(stream, index, "KwStruct");
+    let name: Cursor = expect_kind(stream, kw.next, "Identifier");
+    let lbrace: Cursor = expect_kind(stream, name.next, "LeftBrace");
+    let cursor: Cursor = read_cursor(stream, lbrace.next);
+    let out = ast.line1("Struct " + name.text);
+    while cursor.kind != "RightBrace" && cursor.kind != "EndOfFile" {
+        let field_name: Cursor = expect_kind(stream, cursor.index, "Identifier");
+        let colon: Cursor = expect_kind(stream, field_name.next, "Colon");
+        // Struct fields are terminated by ',' or ';' (both spellings are legal,
+        // and a trailing separator before '}' is accepted).
+        let ty: ParseResult = collect_expr(stream, colon.next, "Semicolon", "Comma", "EndOfFile");
+        out = append_str(out, ast.line2("Field " + field_name.text + ": " + ty.text));
+        let after: Cursor = read_cursor(stream, ty.next);
+        if after.kind == "Semicolon" || after.kind == "Comma" {
+            cursor = read_cursor(stream, after.next);
+        } else {
+            cursor = after;
+        }
+    }
+    let rbrace: Cursor = expect_kind(stream, cursor.index, "RightBrace");
+    return ParseResult { next: rbrace.next, text: out };
+}
+
+fn parse_enum_decl(stream: string, index: i64): ParseResult {
+    let kw: Cursor = expect_kind(stream, index, "KwEnum");
+    let name: Cursor = expect_kind(stream, kw.next, "Identifier");
+    let lbrace: Cursor = expect_kind(stream, name.next, "LeftBrace");
+    let cursor: Cursor = read_cursor(stream, lbrace.next);
+    let out = ast.line1("Enum " + name.text);
+    while cursor.kind != "RightBrace" && cursor.kind != "EndOfFile" {
+        if cursor.kind == "Identifier" {
+            out = append_str(out, ast.line2("Member " + cursor.text));
+            cursor = read_cursor(stream, cursor.next);
+            if cursor.kind == "Comma" {
+                cursor = read_cursor(stream, cursor.next);
+            }
+            continue;
+        }
+        cursor = read_cursor(stream, cursor.next);
+    }
+    let rbrace: Cursor = expect_kind(stream, cursor.index, "RightBrace");
+    return ParseResult { next: rbrace.next, text: out };
+}
+
+fn parse_import_decl(stream: string, index: i64): ParseResult {
+    let kw: Cursor = expect_kind(stream, index, "KwImport");
+    let spec: ParseResult = collect_expr(stream, kw.next, "Semicolon", "EndOfFile", "EndOfFile");
+    let semi: Cursor = expect_kind(stream, spec.next, "Semicolon");
+    let out = ast.line1("Import " + spec.text);
+    let path: Cursor = read_cursor(stream, kw.next);
+    if path.kind == "StringLiteral" {
+        out = append_str(out, ast.line2("ImportPath " + path.text));
+        let maybe_as: Cursor = read_cursor(stream, path.next);
+        if maybe_as.kind == "KwAs" {
+            let alias: Cursor = expect_kind(stream, maybe_as.next, "Identifier");
+            out = append_str(out, ast.line2("ImportAlias " + alias.text));
+        }
+    }
+    // `import core.math as math;` carries a dotted module path, not a string
+    // literal. Rebuild "core.math" from the identifier and dot tokens: without
+    // this branch the tree held no ImportPath for the dotted form at all, so
+    // the driver had nothing to resolve and every cross-module call was left
+    // undefined at link time.
+    if path.kind == "Identifier" {
+        let dotted = "";
+        let cur: Cursor = path;
+        let scanning = true;
+        while scanning {
+            if cur.kind == "Identifier" {
+                dotted = dotted + cur.text;
+                cur = read_cursor(stream, cur.next);
+            } else {
+                if cur.kind == "Dot" {
+                    dotted = dotted + ".";
+                    cur = read_cursor(stream, cur.next);
+                } else {
+                    scanning = false;
+                }
+            }
+        }
+        out = append_str(out, ast.line2("ImportPath " + dotted));
+        if cur.kind == "KwAs" {
+            let aliased: Cursor = expect_kind(stream, cur.next, "Identifier");
+            out = append_str(out, ast.line2("ImportAlias " + aliased.text));
+        }
+    }
+    return ParseResult { next: semi.next, text: out };
+}
+
+pub fn parse_program(stream: string): string {
+    let cursor: Cursor = read_cursor(stream, 0);
+    let out = ast.line0("Program");
+    while cursor.kind != "EndOfFile" {
+        if cursor.kind == "KwImport" {
+            let item: ParseResult = parse_import_decl(stream, cursor.index);
+            out = append_str(out, item.text);
+            cursor = read_cursor(stream, item.next);
+            continue;
+        }
+        if cursor.kind == "KwStruct" {
+            let item2: ParseResult = parse_struct_decl(stream, cursor.index);
+            out = append_str(out, item2.text);
+            cursor = read_cursor(stream, item2.next);
+            continue;
+        }
+        if cursor.kind == "KwEnum" {
+            let item_enum: ParseResult = parse_enum_decl(stream, cursor.index);
+            out = append_str(out, item_enum.text);
+            cursor = read_cursor(stream, item_enum.next);
+            continue;
+        }
+        if cursor.kind == "KwPub" {
+            let next: Cursor = read_cursor(stream, cursor.next);
+            if next.kind == "KwFn" {
+                let item3: ParseResult = parse_function(stream, next.index, true);
+                out = append_str(out, item3.text);
+                cursor = read_cursor(stream, item3.next);
+                continue;
+            }
+            if next.kind == "KwStruct" {
+                let item_struct: ParseResult = parse_struct_decl(stream, next.index);
+                out = append_str(out, ast.line1("StructVisibility pub") + item_struct.text);
+                cursor = read_cursor(stream, item_struct.next);
+                continue;
+            }
+            if next.kind == "KwEnum" {
+                let item_enum2: ParseResult = parse_enum_decl(stream, next.index);
+                out = append_str(out, ast.line1("EnumVisibility pub") + item_enum2.text);
+                cursor = read_cursor(stream, item_enum2.next);
+                continue;
+            }
+        }
+        if cursor.kind == "KwFn" {
+            let item4: ParseResult = parse_function(stream, cursor.index, false);
+            out = append_str(out, item4.text);
+            cursor = read_cursor(stream, item4.next);
+            continue;
+        }
+        print("parse error: unexpected top-level token " + cursor.kind);
+        cursor = read_cursor(stream, cursor.next);
+    }
+    return out;
+}

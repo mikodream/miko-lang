@@ -1,0 +1,11 @@
+import core.math as math;
+import core.string;
+
+fn main() {
+    print(math.max_i32(10, 3));
+    print(math.min_i32(10, 3));
+    print(math.abs_i32(-7));
+    print(math.clamp_i32(42, 0, 9));
+    print(string.string_len("miko"));
+    print(string.string_concat("hello ", "miko"));
+}

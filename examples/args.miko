@@ -1,0 +1,11 @@
+fn main() {
+    print(arg_count());
+    if arg_count() >= 2 {
+        let first = arg_at(0);
+        let second = arg_at(1);
+        let joined = first + ":" + second;
+        print(joined);
+    } else {
+        print("missing");
+    }
+}

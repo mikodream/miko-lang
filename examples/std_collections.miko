@@ -1,0 +1,33 @@
+// stdlib/core/collections: StringMap / IntMap.
+import core.collections as collections;
+
+fn main() {
+    let scores = collections.map_new();
+    print(collections.map_len(scores));
+    collections.map_set(scores, "ada", "100");
+    collections.map_set(scores, "bob", "90");
+    print(collections.map_len(scores));
+    print(collections.map_get(scores, "ada"));
+    print(collections.map_has(scores, "bob"));
+    print(collections.map_has(scores, "eve"));
+    collections.map_set(scores, "ada", "95");
+    print(collections.map_get(scores, "ada"));
+
+    let removed = collections.map_remove(scores, "bob");
+    print(removed);
+    print(collections.map_has(scores, "bob"));
+    print(collections.map_len(scores));
+    print(collections.map_get_or(scores, "bob", "missing"));
+
+    let counters = collections.int_map_new();
+    collections.int_map_set(counters, "hits", 3);
+    collections.int_map_set(counters, "hits", 4);
+    collections.int_map_set(counters, "misses", 1);
+    print(collections.int_map_get(counters, "hits"));
+    print(collections.int_map_get_or(counters, "n/a", -1));
+    print(collections.int_map_len(counters));
+
+    let keys = collections.int_map_keys(counters);
+    print(len(keys));
+    print(keys[0]);
+}

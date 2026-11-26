@@ -1,0 +1,109 @@
+// build_compiler.miko - a miko program that compiles the miko compiler.
+//
+// This is the short answer to "can I write a miko file that compiles the
+// compiler": yes. Everything below is ordinary miko code calling the compiler's
+// own modules, which are themselves miko. There is no special build hook - the
+// driver just reads source, lexes, parses, checks, and emits LLVM IR.
+//
+// Run it with the stage0 interpreter:
+//
+//   miko compiler/build_compiler.miko --run
+//
+// It writes out/compiler_from_miko.ll, which clang turns into an executable:
+//
+//   clang out/compiler_from_miko.ll runtime/miko_runtime.c -o out/compiler.exe
+//
+// Why the modules are concatenated: the IR backend emits one LLVM module for
+// the whole program so that every cross-module call resolves by signature.
+// Splitting per file would force it to guess return types across module
+// boundaries, and a wrong guess is not a link error - it is a silently wrong
+// program. `Module <name>` lines keep each module's symbols apart.
+import "lexer.miko" as lexer;
+import "parser.miko" as parser;
+import "sema.miko" as sema;
+import "codegen_ll.miko" as codegen_ll;
+
+// The compiler's own modules, in dependency order. `token` and `ast` carry the
+// wire format and the tree type; `lexer` produces the token stream; `parser`
+// builds the tree; `sema` resolves names and types; `codegen_ll` emits IR.
+fn compiler_modules(): string {
+    let names = "token
+ast
+symbols
+type
+lexer
+parser
+sema
+codegen_ll
+main_ll
+";
+    return names;
+}
+
+fn module_at(list: string, index: i64): string {
+    let i: i64 = 0;
+    let k: i64 = 0;
+    let n = len(list);
+    while i < n {
+        let line_end = i;
+        while line_end < n && char_at(list, line_end) != '\n' {
+            line_end = line_end + 1;
+        }
+        if k == index {
+            return substring(list, i, line_end - i);
+        }
+        k = k + 1;
+        i = line_end + 1;
+    }
+    return "";
+}
+
+fn module_count(list: string): i64 {
+    let count: i64 = 0;
+    let i: i64 = 0;
+    let n = len(list);
+    while i < n {
+        if char_at(list, i) == '\n' {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// Read every module and stitch their trees into one program.
+fn whole_program(): string {
+    let list = compiler_modules();
+    let out = "";
+    let k: i64 = 0;
+    let total = module_count(list);
+    while k < total {
+        let name = module_at(list, k);
+        if name != "" {
+            let source = read_file("compiler/" + name + ".miko");
+            let stream = lexer.lex(source);
+            let tree = parser.parse_program(stream);
+            out = out + "Module " + name + "\n" + tree;
+            print("parsed " + name);
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+fn main(): i32 {
+    let prefix = "out/compiler_from_miko";
+    print("assembling the compiler from its miko modules");
+
+    let tree = whole_program();
+    write_file(prefix + ".ast", tree);
+
+    let checked = sema.check_program(tree);
+    write_file(prefix + ".sema", checked);
+    print("semantic analysis done");
+
+    let ir = codegen_ll.generate_ir(tree);
+    write_file(prefix + ".ll", ir);
+    print("wrote " + prefix + ".ll");
+    return 0;
+}

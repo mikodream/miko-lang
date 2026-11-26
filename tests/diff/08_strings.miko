@@ -1,0 +1,7 @@
+fn main() {
+    let s = "miko" + "lang";
+    print(s);
+    print(len(s));
+    print(char_at(s, 0));
+    print(substring(s, 4, 4));
+}

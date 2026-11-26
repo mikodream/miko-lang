@@ -1,0 +1,3725 @@
+// LLVM IR text backend: turns the parser's indented text tree into .ll source
+// for clang. The program arrives as text, so this module re-reads that text line
+// by line rather than walking an AST.
+//
+// State is threaded through every helper as an immutable GenState record: each
+// helper returns an updated copy instead of mutating, which is why so many
+// signatures return GenState / NameResult / EmitResult / TokResult.
+
+struct GenState {
+    out: string,
+    globals: string,
+    temp: i64,
+    label: i64,
+    syms: string,
+    funcs: string,
+    enums: string,
+    loops: string,
+    ifs: string,
+    terminated: bool,
+    structs: string,
+    module: string,
+    allocas: string,
+    fn_start: i64,
+}
+
+struct TokResult {
+    state: GenState,
+    pos: i64,
+    value: string,
+    ty: string,
+}
+
+struct NameResult {
+    state: GenState,
+    name: string,
+}
+
+struct EmitResult {
+    state: GenState,
+    value: string,
+    ty: string,
+}
+
+struct LineResult {
+    state: GenState,
+    next: i64,
+    value: string,
+    ty: string,
+}
+
+struct Place {
+    state: GenState,
+    pos: i64,
+    slot: string,
+    ty: string,
+}
+
+struct SplitArgs {
+    groups: string,
+    rparen: i64,
+}
+
+struct StrConst {
+    body: string,
+    size: i64,
+}
+
+// ---------------------------------------------------------------- text helpers
+
+fn find_char(text: string, start: i64, target: char): i64 {
+    let i = start;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == target {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn find_char_rev(text: string, start: i64, target: char): i64 {
+    let i = start;
+    while i >= 0 {
+        if char_at(text, i) == target {
+            return i;
+        }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+fn starts_with_at(text: string, start: i64, prefix: string): bool {
+    let n = len(text);
+    let m = len(prefix);
+    if start + m > n {
+        return false;
+    }
+    return substring(text, start, m) == prefix;
+}
+
+fn contains_text(text: string, needle: string): bool {
+    let n = len(text);
+    let m = len(needle);
+    let i: i64 = 0;
+    while i + m <= n {
+        if substring(text, i, m) == needle {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn trim_indent(line: string): string {
+    let i: i64 = 0;
+    let n = len(line);
+    while i < n && char_at(line, i) == ' ' {
+        i = i + 1;
+    }
+    return substring(line, i, n - i);
+}
+
+fn trim_spaces(text: string): string {
+    let start: i64 = 0;
+    let finish = len(text);
+    while start < finish && char_at(text, start) == ' ' {
+        start = start + 1;
+    }
+    while finish > start && char_at(text, finish - 1) == ' ' {
+        finish = finish - 1;
+    }
+    return substring(text, start, finish - start);
+}
+
+// One tree line, de-indented; "" past the end.
+fn line_at(tree: string, index: i64): string {
+    let n = len(tree);
+    if index >= n {
+        return "";
+    }
+    let line_end = find_char(tree, index, '\n');
+    return trim_indent(substring(tree, index, line_end - index));
+}
+
+// Byte offset of the next line, or len(tree) at the end.
+fn next_line_index(tree: string, index: i64): i64 {
+    let n = len(tree);
+    if index >= n {
+        return n;
+    }
+    let line_end = find_char(tree, index, '\n');
+    if line_end >= n {
+        return n;
+    }
+    return line_end + 1;
+}
+
+// ------------------------------------------------------------- number helpers
+
+fn number_to_text(value: i64): string {
+    if value == 0 {
+        return "0";
+    }
+    let digits = "";
+    let v = value;
+    while v > 0 {
+        let d = v % 10;
+        digits = substring("0123456789", d, 1) + digits;
+        v = v / 10;
+    }
+    return digits;
+}
+
+fn hex_digit(value: i64): string {
+    return substring("0123456789ABCDEF", value, 1);
+}
+
+// Parses an integer literal the way the lexer accepts it: optional sign, an
+// optional radix prefix, and '_' separators anywhere in the digits.
+fn text_to_number(text: string): i64 {
+    let n = len(text);
+    if n == 0 {
+        return 0;
+    }
+    let negative = false;
+    let start: i64 = 0;
+    if char_at(text, 0) == '-' {
+        negative = true;
+        start = 1;
+    }
+    let base: i64 = 10;
+    if start + 1 < n && char_at(text, start) == '0' {
+        let marker = char_at(text, start + 1);
+        if marker == 'x' || marker == 'X' {
+            base = 16;
+            start = start + 2;
+        }
+        if marker == 'b' || marker == 'B' {
+            base = 2;
+            start = start + 2;
+        }
+        if marker == 'o' || marker == 'O' {
+            base = 8;
+            start = start + 2;
+        }
+    }
+    let value: i64 = 0;
+    let i = start;
+    while i < n {
+        let c = char_at(text, i);
+        if c != '_' {
+            let digit: i64 = 0;
+            if c >= '0' && c <= '9' {
+                digit = c - '0';
+            } else {
+                let upper = c - 'a';
+                if c >= 'a' && c <= 'f' {
+                    digit = upper + 10;
+                }
+                let big = c - 'A';
+                if c >= 'A' && c <= 'F' {
+                    digit = big + 10;
+                }
+            }
+            value = value * base + digit;
+        }
+        i = i + 1;
+    }
+    if negative {
+        return 0 - value;
+    }
+    return value;
+}
+
+// A literal with a fractional part or an exponent is a float. The lexer already
+// tags these as FloatLiteral tokens but hands the text through unchanged, and
+// the integer decoder stops at the '.', so the distinction has to be made here.
+fn is_num_body_char(ch: char): bool {
+    if ch >= '0' && ch <= '9' {
+        return true;
+    }
+    return ch == '_';
+}
+
+// Radix literals may carry hex letters; decimal ones must not, or the 'e' of an
+// exponent would be swallowed by the digit loop and `1e-5` would tokenize as
+// `1e` followed by `-5`.
+fn is_radix_body_char(ch: char): bool {
+    if is_num_body_char(ch) {
+        return true;
+    }
+    if ch >= 'a' && ch <= 'f' {
+        return true;
+    }
+    if ch >= 'A' && ch <= 'F' {
+        return true;
+    }
+    return false;
+}
+
+fn is_float_literal(tok: string): bool {
+    let n = len(tok);
+    let i: i64 = 0;
+    while i < n {
+        let c = char_at(tok, i);
+        if c == '.' || c == 'e' || c == 'E' {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// LLVM wants a double constant that looks like a float: '1.5', '1.5e3', never
+// '15'. Underscore separators are legal in miko but not in IR, so they go away
+// here, and a bare exponent literal gets a '.0' so the type stays unambiguous.
+fn float_literal_text(tok: string): string {
+    let out = "";
+    let n = len(tok);
+    let saw_dot = false;
+    let i: i64 = 0;
+    while i < n {
+        let c = char_at(tok, i);
+        if c == '_' {
+            i = i + 1;
+        } else {
+            if c == '.' {
+                saw_dot = true;
+            }
+            out = append_str(out, substring(tok, i, 1));
+            i = i + 1;
+        }
+    }
+    if saw_dot {
+        return out;
+    }
+    let e = find_char(out, 0, 'e');
+    if e < len(out) {
+        return substring(out, 0, e) + ".0" + substring(out, e, len(out) - e);
+    }
+    let big_e = find_char(out, 0, 'E');
+    if big_e < len(out) {
+        return substring(out, 0, big_e) + ".0" + substring(out, big_e, len(out) - big_e);
+    }
+    return out + ".0";
+}
+
+fn pad_spaces(count: i64): string {
+    let out = "";
+    let i: i64 = 0;
+    while i < count {
+        out = append_str(out, " ");
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ir_type_for(ty: string): string {
+    if ty == "f64" || ty == "double" {
+        return "double";
+    }
+    if ty == "f32" || ty == "float" {
+        return "float";
+    }
+    if ty == "i32" || ty == "i64" || ty == "long long" {
+        return "i64";
+    }
+    if ty == "bool" {
+        return "i1";
+    }
+    if ty == "string" {
+        return "ptr";
+    }
+    if ty == "char" {
+        return "i32";
+    }
+    if ty == "void" {
+        return "void";
+    }
+    return "i64";
+}
+
+// -------------------------------------------------------------- emit helpers
+
+fn st_emit(state: GenState, line: string): GenState {
+    if state.terminated {
+        return state;
+    }
+    return GenState {
+        out: append_str(state.out, "    " + line + "\n"),
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+// Raw lines are not indented, not skipped, and end CRLF: function headers only.
+fn st_emit_raw(state: GenState, line: string): GenState {
+    if state.terminated {
+        return state;
+    }
+    return GenState {
+        out: append_str(state.out, line + "\r\n"),
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+// Last non-empty line of the emitted text, with trailing newlines and the CR of
+// a CRLF header stripped.
+fn last_output_line(out: string): string {
+    let n = len(out);
+    if n == 0 {
+        return "";
+    }
+    let end = n;
+    while end > 0 && char_at(out, end - 1) == '\n' {
+        end = end - 1;
+    }
+    while end > 0 && char_at(out, end - 1) == '\r' {
+        end = end - 1;
+    }
+    let start = end;
+    while start > 0 && char_at(out, start - 1) != '\n' {
+        start = start - 1;
+    }
+    return substring(out, start, end - start);
+}
+
+fn st_label(state: GenState, name: string): GenState {
+    let previous = last_output_line(state.out);
+    if previous == name + ":" {
+        return state;
+    }
+    let opens_function = false;
+    let n = len(previous);
+    if n > 0 && char_at(previous, n - 1) == '{' {
+        opens_function = true;
+    }
+    let out = state.out;
+    if !state.terminated && !opens_function {
+        out = append_str(out, "    br label %" + name + "\n");
+    }
+    out = append_str(out, name + ":\n");
+    return GenState {
+        out: out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: false,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+// Emits a terminator. Unlike st_emit this writes even when the block is already
+// closed, because the closing instruction of a block is the one that has to
+// arrive, and it marks the block closed for everything that follows.
+fn st_terminate(state: GenState, line: string): GenState {
+    return GenState {
+        out: append_str(state.out, "    " + line + "\n"),
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: true,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+fn st_new_temp(state: GenState): NameResult {
+    let name = "%t" + number_to_text(state.temp);
+    let next = GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp + 1,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+    return NameResult { state: next, name: name };
+}
+
+fn st_new_label(state: GenState, prefix: string): NameResult {
+    let name = prefix + number_to_text(state.label);
+    let next = GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label + 1,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+    return NameResult { state: next, name: name };
+}
+
+// Adds a module-level declaration. The temp counter is bumped here because
+// intern_string names its constant from state.temp before calling this.
+fn st_add_global(state: GenState, decl: string): GenState {
+    return GenState {
+        out: state.out,
+        globals: state.globals + decl + "\n",
+        temp: state.temp + 1,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+// Symbol entries: "name:irtype:slot" per line.
+//
+// This table is per function and split into block layers, so a `let` inside a
+// block shadows the outer binding of the same name only until that block ends,
+// matching the interpreter and the C++ backend:
+//
+//   fn pick(op: string): string {
+//       let v = "outer";
+//       if op == "/" { let v = "inner"; return v; }
+//       return v;                       // outer again, not the inner slot
+//   }
+//
+// Earlier revisions kept one flat table where an inner `let` replaced the outer
+// entry outright, so the code after the block read the inner slot - a silent
+// miscompile that produced a working binary with the wrong answer.
+// Repro: tests/known-limitations/block_scoped_shadowing.miko
+// Symbols live in one flat string of "name:irtype:slot" lines, split into
+// layers by a marker line. A block appends a marker on entry and throws away
+// everything after the last marker on exit, so a `let` inside a block stops
+// being visible when the block closes and an outer binding of the same name
+// comes back. Lookup takes the LAST match, which is the innermost binding.
+//
+// The marker cannot collide with a symbol line: every line starts with a name,
+// and no name starts with '~'.
+fn sym_block_marker(): string {
+    return "~BLOCK\n";
+}
+fn sym_layer_start(syms: string): i64 {
+    let marker = sym_block_marker();
+    let mlen = len(marker);
+    let n = len(syms);
+    let i: i64 = 0;
+    let found: i64 = 0;
+    while i + mlen <= n {
+        if substring(syms, i, mlen) == marker {
+            found = i + mlen;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn st_push_block(state: GenState): GenState {
+    return GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms + sym_block_marker(),
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+// Drops every symbol declared in the block that just ended. Only one layer is
+// removed per call, matching the one marker pushed when that block opened.
+fn st_pop_block(state: GenState): GenState {
+    let marker = sym_block_marker();
+    let mlen = len(marker);
+    let n = len(state.syms);
+    let i: i64 = 0;
+    let cut: i64 = 0;
+    let found = false;
+    while i + mlen <= n {
+        if substring(state.syms, i, mlen) == marker {
+            cut = i;
+            found = true;
+        }
+        i = i + 1;
+    }
+    let restored = state.syms;
+    if found {
+        restored = substring(state.syms, 0, cut);
+    }
+    return GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: restored,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+fn st_put_sym(state: GenState, name: string, ty: string, slot: string): GenState {
+    let needle = name + ":";
+    let layer = sym_layer_start(state.syms);
+    let out = substring(state.syms, 0, layer);
+    let i = layer;
+    let n = len(state.syms);
+    let replaced = false;
+    while i < n {
+        let line_end = find_char(state.syms, i, '\n');
+        let line = substring(state.syms, i, line_end - i);
+        // A redeclaration in the same layer overwrites; anything in an outer
+        // layer is shadowed by appending to this one.
+        if starts_with_at(line, 0, needle) {
+            out = append_str(out, name + ":" + ty + ":" + slot + "\n");
+            replaced = true;
+        } else {
+            out = append_str(out, line + "\n");
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    if !replaced {
+        out = append_str(out, name + ":" + ty + ":" + slot + "\n");
+    }
+    return GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: out,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+// Looks one exact key up and returns "irtype:slot", or "" when absent.
+fn st_find_key(syms: string, key: string): string {
+    let needle = key + ":";
+    let i: i64 = 0;
+    let n = len(syms);
+    while i < n {
+        let line_end = find_char(syms, i, '\n');
+        let line = substring(syms, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            let second = find_char(line, 0, ':');
+            let third = find_char(line, second + 1, ':');
+            let ty = substring(line, second + 1, third - second - 1);
+            let slot = substring(line, third + 1, len(line) - third - 1);
+            return ty + ":" + slot;
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return "";
+}
+
+// Returns "irtype:slot" or "".
+//
+// The LAST matching line wins, because later layers are inner blocks. Before
+// the table was layered, an inner `let` replaced the outer entry outright and
+// kept that slot after its block closed, silently rebinding every later use.
+fn st_find_sym(state: GenState, name: string): string {
+    let needle = name + ":";
+    let syms = state.syms;
+    let i: i64 = 0;
+    let n = len(syms);
+    let hit = "";
+    while i < n {
+        let line_end = find_char(syms, i, '\n');
+        let line = substring(syms, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            let second = find_char(line, 0, ':');
+            let third = find_char(line, second + 1, ':');
+            let ty = substring(line, second + 1, third - second - 1);
+            let slot = substring(line, third + 1, len(line) - third - 1);
+            hit = ty + ":" + slot;
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return hit;
+}
+
+// Loop stack entries: "breakLabel condLabel continueLabel stepText" per line
+// (top = last); stepText is "-" for while loops.
+fn st_push_loop(state: GenState, break_label: string, cond_label: string, continue_label: string, step_text: string): GenState {
+    let pushed: GenState = st_push_block(state);
+    return GenState {
+        out: pushed.out,
+        globals: pushed.globals,
+        temp: pushed.temp,
+        label: pushed.label,
+        syms: pushed.syms,
+        funcs: pushed.funcs,
+        enums: pushed.enums,
+        loops: state.loops + break_label + " " + cond_label + " " + continue_label + " " + step_text + "\n",
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+fn st_pop_stack(state: GenState, which: i64): GenState {
+    // Closing a block also discards the symbols it declared.
+    let popped: GenState = st_pop_block(state);
+    let stack = popped.loops;
+    if which == 1 {
+        stack = popped.ifs;
+    }
+    let n = len(stack);
+    // the stack always ends with '\n'; find the newline BEFORE the top entry
+    let last = find_char_rev(stack, n - 2, '\n');
+    let trimmed = "";
+    if last >= 0 {
+        trimmed = substring(stack, 0, last + 1);
+    }
+    if which == 1 {
+        return GenState {
+            out: state.out,
+            globals: state.globals,
+            temp: state.temp,
+            label: state.label,
+            syms: popped.syms,
+            funcs: state.funcs,
+            enums: state.enums,
+            loops: popped.loops,
+            ifs: trimmed,
+            terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+        };
+    }
+    return GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: popped.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: trimmed,
+        ifs: popped.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+fn st_top_stack(state: GenState, which: i64): string {
+    let stack = state.loops;
+    if which == 1 {
+        stack = state.ifs;
+    }
+    let n = len(stack);
+    if n == 0 {
+        return "";
+    }
+    // the stack ends with '\n'; the top entry sits between the previous
+    // newline (or the start) and that final newline
+    let last = find_char_rev(stack, n - 2, '\n');
+    let start = last + 1;
+    return substring(stack, start, n - 1 - start);
+}
+
+// If stack entries: "endLabel elseLabel" per line (top = last).
+fn st_push_if(state: GenState, end_label: string, else_label: string): GenState {
+    let pushed: GenState = st_push_block(state);
+    return GenState {
+        out: pushed.out,
+        globals: pushed.globals,
+        temp: pushed.temp,
+        label: pushed.label,
+        syms: pushed.syms,
+        funcs: pushed.funcs,
+        enums: pushed.enums,
+        loops: pushed.loops,
+        ifs: pushed.ifs + end_label + " " + else_label + "\n",
+        terminated: pushed.terminated,
+        structs: pushed.structs,
+        module: pushed.module,
+        allocas: pushed.allocas,
+        fn_start: pushed.fn_start
+    };
+}
+
+// ---- pre-collected tables --------------------------------------------------
+
+// ---- whole-program name mangling -------------------------------------------
+//
+// The LLVM backend compiles the whole program as a single module, so every
+// definition needs a program-unique name: module-private helpers in different
+// modules may share a name (`find_char` exists in several). Definitions are
+// emitted as `module__name`; a call spelled `alias.fn(...)` resolves to
+// `alias__fn`, and a bare `fn(...)` resolves to the enclosing module.
+// `main` keeps its name as the entry point.
+fn mangle_pair(module: string, name: string): string {
+    if name == "main" {
+        return "main";
+    }
+    let dot = find_char(name, 0, '.');
+    if dot < len(name) {
+        let alias = substring(name, 0, dot);
+        let fn_name = substring(name, dot + 1, len(name) - dot - 1);
+        return alias + "__" + fn_name;
+    }
+    if module == "" {
+        return name;
+    }
+    return module + "__" + name;
+}
+
+fn mangle_name(state: GenState, name: string): string {
+    return mangle_pair(state.module, name);
+}
+
+fn collect_funcs(tree: string, structs: string): string {
+    let out = "";
+    let current = "";
+    let module = "";
+    let params = "";
+    let ret = "void";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let line = trim_indent(substring(tree, i, line_end - i));
+        if starts_with_at(line, 0, "Module ") {
+            module = substring(line, 7, len(line) - 7);
+        } else {
+            if starts_with_at(line, 0, "Function ") {
+                if current != "" {
+                    out = append_str(out, current + ":" + ret + ":" + params + "\n");
+                }
+                current = mangle_pair(module, substring(line, 9, len(line) - 9));
+                params = "";
+                ret = "void";
+            } else {
+            if starts_with_at(line, 0, "Param ") && current != "" {
+                let colon = find_char(line, 0, ':');
+                let ty = trim_spaces(substring(line, colon + 2, len(line) - colon - 2));
+                if params != "" {
+                    params = params + ",";
+                }
+                params = params + ir_type_for_table(structs, ty);
+            } else {
+                if starts_with_at(line, 0, "ReturnType ") && current != "" {
+                    ret = ir_type_for_table(structs, substring(line, 11, len(line) - 11));
+                }
+            }
+            }
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    if current != "" {
+        out = append_str(out, current + ":" + ret + ":" + params + "\n");
+    }
+    return out;
+}
+
+fn funcs_lookup(funcs: string, name: string): string {
+    let needle = name + ":";
+    let i: i64 = 0;
+    let n = len(funcs);
+    while i < n {
+        let line_end = find_char(funcs, i, '\n');
+        let line = substring(funcs, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            return line;
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return "";
+}
+
+// Looks up a function by its *bare* name across the whole program, returning
+// the full signature line (`mangled:ret:params`) of the definition. Module
+// aliases are not required to match the module's file name (`import
+// "type.miko" as types;` calls `types.type_unknown`, defined as
+// `type__type_unknown`), so a qualified call resolves by bare name here rather
+// than by mangling the alias.
+fn funcs_lookup_bare(funcs: string, bare: string): string {
+    let suffix = "__" + bare;
+    let exact = bare + ":";
+    let i: i64 = 0;
+    let n = len(funcs);
+    while i < n {
+        let line_end = find_char(funcs, i, '\n');
+        let line = substring(funcs, i, line_end - i);
+        if starts_with_at(line, 0, exact) {
+            return line;
+        }
+        let colon = find_char(line, 0, ':');
+        if colon < len(line) {
+            let name = substring(line, 0, colon);
+            let m = len(name);
+            let s = len(suffix);
+            if m >= s && substring(name, m - s, s) == suffix {
+                return line;
+            }
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return "";
+}
+
+fn signature_name(entry: string): string {
+    let colon = find_char(entry, 0, ':');
+    if colon >= len(entry) {
+        return entry;
+    }
+    return substring(entry, 0, colon);
+}
+fn enum_member_index(enums: string, name: string, member: string): i64 {
+    let needle = name + ":";
+    let i: i64 = 0;
+    let n = len(enums);
+    while i < n {
+        let line_end = find_char(enums, i, '\n');
+        let line = substring(enums, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            let colon = find_char(line, 0, ':');
+            let members = substring(line, colon + 1, len(line) - colon - 1);
+            let idx: i64 = 0;
+            let cursor: i64 = 0;
+            let m = len(members);
+            while cursor <= m {
+                let comma = find_char(members, cursor, ',');
+                let member_name = substring(members, cursor, comma - cursor);
+                if member_name == member {
+                    return idx;
+                }
+                idx = idx + 1;
+                if comma >= m {
+                    cursor = m + 1;
+                } else {
+                    cursor = comma + 1;
+                }
+            }
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return -1;
+}
+
+fn enum_is_name(enums: string, ty: string): bool {
+    let needle = ty + ":";
+    let i: i64 = 0;
+    let n = len(enums);
+    while i < n {
+        let line_end = find_char(enums, i, '\n');
+        let line = substring(enums, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            return true;
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return false;
+}
+
+fn collect_enums(tree: string): string {
+    let out = "";
+    let current = "";
+    let members = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let line = trim_indent(substring(tree, i, line_end - i));
+        if starts_with_at(line, 0, "Enum ") {
+            if current != "" {
+                out = append_str(out, current + ":" + members + "\n");
+            }
+            current = substring(line, 5, len(line) - 5);
+            members = "";
+        } else {
+            if starts_with_at(line, 0, "Member ") && current != "" {
+                if members != "" {
+                    members = members + ",";
+                }
+                members = members + substring(line, 7, len(line) - 7);
+            }
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    if current != "" {
+        out = append_str(out, current + ":" + members + "\n");
+    }
+    return out;
+}
+
+// ---- struct layout table ---------------------------------------------------
+//
+// One line per struct declaration:
+//
+//     Name|field1:type1|field2:type2|...
+//
+// Fields keep their source order (that order defines the LLVM struct layout)
+// and their source type names. `structs` travels in GenState because every
+// phase that resolves a field - type mapping, field access, struct literal
+// construction - needs the layout of whatever struct is in play.
+
+fn strip_all_spaces(text: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(text);
+    while i < n {
+        let ch = char_at(text, i);
+        if ch != ' ' {
+            out = append_str(out, substring(text, i, 1));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn collect_structs(tree: string): string {
+    let out = "";
+    let current = "";
+    let fields = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let line = trim_indent(substring(tree, i, line_end - i));
+        if starts_with_at(line, 0, "Struct ") {
+            if current != "" {
+                out = append_str(out, current + "|" + fields + "\n");
+            }
+            current = substring(line, 7, len(line) - 7);
+            fields = "";
+        } else {
+            if starts_with_at(line, 0, "Field ") && current != "" {
+                let colon = find_char(line, 0, ':');
+                let fname = trim_spaces(substring(line, 6, colon - 6));
+                let fty = strip_all_spaces(substring(line, colon + 1, len(line) - colon - 1));
+                if fields != "" {
+                    fields = fields + "|";
+                }
+                fields = fields + fname + ":" + fty;
+            }
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    if current != "" {
+        out = append_str(out, current + "|" + fields + "\n");
+    }
+    return out;
+}
+
+fn struct_fields_text(table: string, name: string): string {
+    let needle = name + "|";
+    let i: i64 = 0;
+    let n = len(table);
+    while i < n {
+        let line_end = find_char(table, i, '\n');
+        let line = substring(table, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            return substring(line, len(needle), len(line) - len(needle));
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return "";
+}
+
+fn struct_is_name(table: string, ty: string): bool {
+    let needle = ty + "|";
+    let i: i64 = 0;
+    let n = len(table);
+    while i < n {
+        let line_end = find_char(table, i, '\n');
+        let line = substring(table, i, line_end - i);
+        if starts_with_at(line, 0, needle) {
+            return true;
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return false;
+}
+
+// Raw source type of field `field` in struct `name`, or "" when absent.
+fn struct_field_type(table: string, name: string, field: string): string {
+    let fields = struct_fields_text(table, name);
+    let i: i64 = 0;
+    let n = len(fields);
+    while i < n {
+        let bar = find_char(fields, i, '|');
+        let entry = substring(fields, i, bar - i);
+        let colon = find_char(entry, 0, ':');
+        if colon < len(entry) {
+            let fname = substring(entry, 0, colon);
+            if fname == field {
+                return substring(entry, colon + 1, len(entry) - colon - 1);
+            }
+        }
+        if bar >= n {
+            i = n;
+        } else {
+            i = bar + 1;
+        }
+    }
+    return "";
+}
+
+fn struct_field_index(table: string, name: string, field: string): i64 {
+    let fields = struct_fields_text(table, name);
+    let i: i64 = 0;
+    let n = len(fields);
+    let idx: i64 = 0;
+    while i < n {
+        let bar = find_char(fields, i, '|');
+        let entry = substring(fields, i, bar - i);
+        let colon = find_char(entry, 0, ':');
+        if colon < len(entry) {
+            let fname = substring(entry, 0, colon);
+            if fname == field {
+                return idx;
+            }
+        }
+        idx = idx + 1;
+        if bar >= n {
+            i = n;
+        } else {
+            i = bar + 1;
+        }
+    }
+    return -1;
+}
+
+// Field count of a struct (used to emit its LLVM type).
+fn struct_field_count(table: string, name: string): i64 {
+    let fields = struct_fields_text(table, name);
+    if fields == "" {
+        return 0;
+    }
+    let i: i64 = 0;
+    let n = len(fields);
+    let count: i64 = 1;
+    while i < n {
+        if char_at(fields, i) == '|' {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ---- fixed arrays ----------------------------------------------------------
+//
+// A fixed array is spelled in the symbol table as the LLVM type itself, e.g.
+// `[3 x i64]`. Keeping the spelling identical to what the IR needs means the
+// symbol table entry can be pasted straight into `alloca` and `getelementptr`
+// without a second mapping table.
+//
+// These two helpers read that spelling back apart.
+fn is_array_type(ty: string): bool {
+    if len(ty) < 2 {
+        return false;
+    }
+    return char_at(ty, 0) == '[';
+}
+
+// Element type of `[N x T]`, or "" when `ty` is not an array.
+fn array_elem_type(ty: string): string {
+    if !is_array_type(ty) {
+        return "";
+    }
+    let sep: i64 = -1;
+    let i: i64 = 0;
+    let n = len(ty);
+    while i + 2 < n {
+        if char_at(ty, i) == ' ' && char_at(ty, i + 1) == 'x' && char_at(ty, i + 2) == ' ' {
+            sep = i;
+            i = n;
+        } else {
+            i = i + 1;
+        }
+    }
+    if sep < 0 {
+        return "";
+    }
+    let start = sep + 3;
+    let rest = substring(ty, start, n - start);
+    if len(rest) > 0 {
+        if char_at(rest, len(rest) - 1) == ']' {
+            return substring(rest, 0, len(rest) - 1);
+        }
+    }
+    return rest;
+}
+
+// Element count of `[N x T]`, or 0 when `ty` is not an array.
+fn array_count(ty: string): i64 {
+    if !is_array_type(ty) {
+        return 0;
+    }
+    let close = find_char(ty, 1, ' ');
+    if close < 1 {
+        return 0;
+    }
+    let digits = substring(ty, 1, close - 1);
+    return text_to_number(digits);
+}
+
+// Every declared struct becomes a named LLVM type, so structs can refer to
+// each other in any declaration order.
+fn struct_type_decls(table: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(table);
+    while i < n {
+        let line_end = find_char(table, i, '\n');
+        let line = substring(table, i, line_end - i);
+        if len(line) > 0 {
+            let bar = find_char(line, 0, '|');
+            let name = substring(line, 0, bar);
+            let fields = "";
+            let cursor = bar + 1;
+            while cursor <= len(line) {
+                let next_bar = find_char(line, cursor, '|');
+                let entry = substring(line, cursor, next_bar - cursor);
+                let colon = find_char(entry, 0, ':');
+                if colon < len(entry) {
+                    let fty = substring(entry, colon + 1, len(entry) - colon - 1);
+                    if fields != "" {
+                        fields = fields + ", ";
+                    }
+                    fields = fields + ir_type_for_table(table, fty);
+                }
+                if next_bar >= len(line) {
+                    cursor = len(line) + 1;
+                } else {
+                    cursor = next_bar + 1;
+                }
+            }
+            out = append_str(out, "%struct." + name + " = type { " + fields + " }\n");
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return out;
+}
+
+// ir_type_for extended with struct names. Builtin types keep their existing
+// mapping, so nothing changes for programs that declare no structs.
+fn ir_type_for_table(table: string, ty: string): string {
+    if struct_is_name(table, ty) {
+        return "%struct." + ty;
+    }
+    return ir_type_for(ty);
+}
+
+fn rewrite_enum_types(tree: string, enums: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let raw = substring(tree, i, line_end - i);
+        let line = trim_indent(raw);
+        let indent = len(raw) - len(line);
+        let replacement = "";
+        if starts_with_at(line, 0, "Type ") {
+            let ty = substring(line, 5, len(line) - 5);
+            if enum_is_name(enums, ty) {
+                replacement = pad_spaces(indent) + "Type i64";
+            }
+        } else {
+            if starts_with_at(line, 0, "Param ") {
+                let colon = find_char(line, 0, ':');
+                let ty2 = trim_spaces(substring(line, colon + 2, len(line) - colon - 2));
+                if enum_is_name(enums, ty2) {
+                    replacement = pad_spaces(indent) + "Param " + substring(line, 6, colon - 6) + ": i64";
+                }
+            } else {
+                if starts_with_at(line, 0, "ReturnType ") {
+                    let ty3 = substring(line, 11, len(line) - 11);
+                    if enum_is_name(enums, ty3) {
+                        replacement = pad_spaces(indent) + "ReturnType i64";
+                    }
+                }
+            }
+        }
+        if replacement != "" {
+            out = append_str(out, replacement + "\n");
+        } else {
+            out = append_str(out, raw + "\n");
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return out;
+}
+
+// ---- string constants ------------------------------------------------------
+
+fn hex_value(ch: char): i64 {
+    if ch >= '0' {
+        if ch <= '9' {
+            return ch - 48;
+        }
+    }
+    if ch >= 'a' {
+        if ch <= 'f' {
+            return ch - 87;
+        }
+    }
+    if ch >= 'A' {
+        if ch <= 'F' {
+            return ch - 55;
+        }
+    }
+    return -1;
+}
+
+fn unescape_code(esc: char): i64 {
+    if esc == 'n' {
+        return 10;
+    }
+    if esc == 'r' {
+        return 13;
+    }
+    if esc == 't' {
+        return 9;
+    }
+    if esc == 'a' {
+        return 7;
+    }
+    if esc == 'b' {
+        return 8;
+    }
+    if esc == 'f' {
+        return 12;
+    }
+    if esc == 'v' {
+        return 11;
+    }
+    if esc == '"' {
+        return 34;
+    }
+    if esc == '\\' {
+        return 92;
+    }
+    if esc == '\'' {
+        return 39;
+    }
+    if esc == '0' {
+        return 0;
+    }
+    return esc;
+}
+
+fn ir_string_bytes(literal: string): StrConst {
+    // Full printable ASCII 32..126; 34 (") and 92 (\) are never selected but
+    // keep the table indexing correct (escaped in this source literal).
+    let table = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let body = "";
+    let size: i64 = 0;
+    let n = len(literal);
+    let i: i64 = 1;
+    let end = n - 1;
+    while i < end {
+        let ch = char_at(literal, i);
+        let b: i64 = 0;
+        if ch == '\\' && i + 1 < end {
+            // \xNN consumes two hex digits. Treating '\x' as an unknown escape
+            // and emitting its 'x' left the digits behind as literal text, so
+            // "A\x42C" became the five characters Ax42C instead of "ABC".
+            if char_at(literal, i + 1) == 'x' && i + 3 < end {
+                let hi = hex_value(char_at(literal, i + 2));
+                let lo = hex_value(char_at(literal, i + 3));
+                if hi >= 0 && lo >= 0 {
+                    b = hi * 16 + lo;
+                    i = i + 4;
+                } else {
+                    b = unescape_code(char_at(literal, i + 1));
+                    i = i + 2;
+                }
+            } else {
+                b = unescape_code(char_at(literal, i + 1));
+                i = i + 2;
+            }
+        } else {
+            b = ch;
+            i = i + 1;
+        }
+        if b >= 32 && b <= 126 && b != 34 && b != 92 {
+            body = append_str(body, substring(table, b - 32, 1));
+        } else {
+            body = append_str(body, "\\" + hex_digit(b / 16) + hex_digit(b % 16));
+        }
+        size = size + 1;
+    }
+    return StrConst { body: body, size: size };
+}
+
+// The 8 length bytes that precede the text of every string literal, written as
+// LLVM c"..." escapes. Little endian, matching the size_t load the runtime does
+// (see MikoStringHeader in runtime/miko_runtime.c). Targets here are all little
+// endian; a big endian port would need the byte order reversed.
+fn u64_le_escapes(value: i64): string {
+    let out = "";
+    let v = value;
+    let k: i64 = 0;
+    while k < 8 {
+        let byte = v % 256;
+        out = append_str(out, "\\" + hex_digit_at(byte / 16) + hex_digit_at(byte % 16));
+        v = v / 256;
+        k = k + 1;
+    }
+    return out;
+}
+
+fn hex_digit_at(value: i64): string {
+    return substring("0123456789ABCDEF", value, 1);
+}
+
+// String literal, emitted with the same header the runtime allocator writes: a
+// length word then a capacity word. Capacity equals length for a literal, which
+// is what tells miko_str_append it must copy rather than write into read-only
+// memory. The value handed back points past the header, so a miko string stays a
+// plain `char*` for printf and friends while len() is a header read instead of a
+// strlen walk.
+fn intern_string(state: GenState, literal: string): NameResult {
+    let bytes: StrConst = ir_string_bytes(literal);
+    let header = 16;
+    let total = header + bytes.size + 1;
+    let name = "@.str." + number_to_text(state.temp);
+    let decl = name + " = private unnamed_addr constant [" + number_to_text(total) + " x i8] c\""
+        + u64_le_escapes(bytes.size) + u64_le_escapes(bytes.size) + bytes.body + "\\00\", align 8";
+    let s = st_add_global(state, decl);
+    let t: NameResult = st_new_temp(s);
+    let s2: GenState = st_emit(t.state, t.name + " = getelementptr inbounds ["
+        + number_to_text(total) + " x i8], ptr " + name + ", i64 0, i64 " + number_to_text(header));
+    return NameResult { state: s2, name: t.name };
+}
+
+fn char_literal_code(literal: string): i64 {
+    if len(literal) < 3 {
+        return 0;
+    }
+    if char_at(literal, 1) == '\\' {
+        if char_at(literal, 2) == 'x' && len(literal) >= 6 {
+            let hi = hex_value(char_at(literal, 3));
+            let lo = hex_value(char_at(literal, 4));
+            if hi >= 0 && lo >= 0 {
+                return hi * 16 + lo;
+            }
+        }
+        return unescape_code(char_at(literal, 2));
+    }
+    return char_at(literal, 1);
+}
+
+// ---- tokenizer ---------------------------------------------------------------
+
+fn is_special_char(ch: char): bool {
+    let specials = "()[\\]{}<>=!&|+*/%:,.-";
+    let n = len(specials);
+    let i: i64 = 0;
+    while i < n {
+        if char_at(specials, i) == ch {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn tokenize_flat(text: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(text);
+    while i < n {
+        let ch = char_at(text, i);
+        if ch == ' ' {
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            let start = i;
+            i = i + 1;
+            while i < n && char_at(text, i) != ch {
+                if char_at(text, i) == '\\' && i + 1 < n {
+                    i = i + 1;
+                }
+                i = i + 1;
+            }
+            if i < n {
+                i = i + 1;
+            }
+            out = append_str(out, substring(text, start, i - start) + "\n");
+            continue;
+        }
+        let two = "";
+        if i + 2 <= n {
+            two = substring(text, i, 2);
+        }
+        if two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "::" {
+            out = append_str(out, two + "\n");
+            i = i + 2;
+            continue;
+        }
+        if is_special_char(ch) {
+            out = append_str(out, substring(text, i, 1) + "\n");
+            i = i + 1;
+            continue;
+        }
+        // Numeric literals need their own scan: '.' and '-' are special
+        // characters (field access, subtraction), so without this `1.5` was
+        // split into `1`, `.`, `5` and the fractional part was dropped.
+        // '_' separators and the 0x / 0b / 0o prefixes stay inside the token,
+        // matching the lexer, or `1_000_000` would split at the underscore.
+        if ch >= '0' && ch <= '9' {
+            let num_start = i;
+            i = i + 1;
+            if ch == '0' && i < n {
+                let marker = char_at(text, i);
+                if marker == 'x' || marker == 'X' || marker == 'b' || marker == 'B' || marker == 'o' || marker == 'O' {
+                    i = i + 1;
+                    while i < n && is_radix_body_char(char_at(text, i)) {
+                        i = i + 1;
+                    }
+                    out = append_str(out, substring(text, num_start, i - num_start) + "\n");
+                    continue;
+                }
+            }
+            while i < n && is_num_body_char(char_at(text, i)) {
+                i = i + 1;
+            }
+            if i < n && char_at(text, i) == '.' {
+                if i + 1 < n && char_at(text, i + 1) >= '0' && char_at(text, i + 1) <= '9' {
+                    i = i + 1;
+                    while i < n && is_num_body_char(char_at(text, i)) {
+                        i = i + 1;
+                    }
+                }
+            }
+            if i < n && (char_at(text, i) == 'e' || char_at(text, i) == 'E') {
+                let probe = i + 1;
+                if probe < n && (char_at(text, probe) == '+' || char_at(text, probe) == '-') {
+                    probe = probe + 1;
+                }
+                if probe < n && char_at(text, probe) >= '0' && char_at(text, probe) <= '9' {
+                    i = probe;
+                    while i < n && is_num_body_char(char_at(text, i)) {
+                        i = i + 1;
+                    }
+                }
+            }
+            out = append_str(out, substring(text, num_start, i - num_start) + "\n");
+            continue;
+        }
+        let start = i;
+        while i < n {
+            let c2 = char_at(text, i);
+            if c2 == ' ' || c2 == '"' || c2 == '\'' {
+                break;
+            }
+            if is_special_char(c2) {
+                break;
+            }
+            i = i + 1;
+        }
+        if i == start {
+            i = i + 1;
+            continue;
+        }
+        out = append_str(out, substring(text, start, i - start) + "\n");
+    }
+    return out;
+}
+
+fn tok_peek(toks: string, pos: i64): string {
+    let n = len(toks);
+    if pos >= n {
+        return "";
+    }
+    let line_end = find_char(toks, pos, '\n');
+    return substring(toks, pos, line_end - pos);
+}
+
+fn tok_next(toks: string, pos: i64): i64 {
+    let n = len(toks);
+    if pos >= n {
+        return n;
+    }
+    let line_end = find_char(toks, pos, '\n');
+    if line_end >= n {
+        return n;
+    }
+    return line_end + 1;
+}
+
+fn is_identifier(tok: string): bool {
+    if tok == "" {
+        return false;
+    }
+    let first = char_at(tok, 0);
+    return (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_';
+}
+
+fn is_builtin_name(name: string): bool {
+    return name == "print" || name == "len" || name == "input" || name == "arg_count"
+        || name == "arg_at" || name == "char_at" || name == "substring" || name == "read_file"
+        || name == "write_file" || name == "exit" || name == "eprint"
+        || name == "run_command" || name == "file_exists" || name == "mono_ms"
+        || name == "clock_ms" || name == "seed_i64" || name == "rand_i64"
+        || name == "to_string_i64" || name == "to_string_bool" || name == "to_string_char"
+        || name == "str_to_i64" || name == "str_index_of" || name == "str_contains"
+        || name == "to_string_f64" || name == "str_to_f64" || name == "f64_to_i64"
+        || name == "sqrt_f64" || name == "floor_f64" || name == "ceil_f64" || name == "round_f64"
+        || name == "append_str";
+}
+
+fn is_add_op(tok: string): bool {
+    return tok == "+" || tok == "-";
+}
+
+fn is_mul_op(tok: string): bool {
+    return tok == "*" || tok == "/" || tok == "%";
+}
+
+fn is_rel_op(tok: string): bool {
+    return tok == "<" || tok == "<=" || tok == ">" || tok == ">=";
+}
+
+fn is_eq_op(tok: string): bool {
+    return tok == "==" || tok == "!=";
+}
+
+// ---- coercions and binary emission ------------------------------------------
+
+fn coerce_i64(state: GenState, value: string, ty: string): TokResult {
+    if ty == "i64" || ty == "" {
+        return TokResult { state: state, pos: 0, value: value, ty: "i64" };
+    }
+    if ty == "i32" {
+        let t: NameResult = st_new_temp(state);
+        let s: GenState = st_emit(t.state, t.name + " = zext i32 " + value + " to i64");
+        return TokResult { state: s, pos: 0, value: t.name, ty: "i64" };
+    }
+    if ty == "i1" {
+        let t: NameResult = st_new_temp(state);
+        let s: GenState = st_emit(t.state, t.name + " = zext i1 " + value + " to i64");
+        return TokResult { state: s, pos: 0, value: t.name, ty: "i64" };
+    }
+    return TokResult { state: state, pos: 0, value: value, ty: ty };
+}
+
+fn coerce_value(state: GenState, value: string, from_ty: string, to_ty: string): TokResult {
+    // No declared target type (an unresolved callee): keep the value as-is
+    // rather than tagging it with an empty type, which would emit a malformed
+    // `call ... ( %t)` operand list.
+    if to_ty == "" {
+        return TokResult { state: state, pos: 0, value: value, ty: from_ty };
+    }
+    if from_ty == to_ty || to_ty == "" || from_ty == "" {
+        return TokResult { state: state, pos: 0, value: value, ty: to_ty };
+    }
+    if is_float_ty(to_ty) {
+        if is_float_ty(from_ty) {
+            return TokResult { state: state, pos: 0, value: value, ty: "f64" };
+        }
+        if from_ty == "i64" || from_ty == "i32" || from_ty == "i1" {
+            let t: NameResult = st_new_temp(state);
+            let s: GenState = st_emit(t.state, t.name + " = sitofp " + from_ty + " " + value + " to double");
+            return TokResult { state: s, pos: 0, value: t.name, ty: "f64" };
+        }
+    }
+    if to_ty == "i64" {
+        return coerce_i64(state, value, from_ty);
+    }
+    if to_ty == "i1" {
+        if from_ty == "i64" || from_ty == "i32" {
+            let t: NameResult = st_new_temp(state);
+            let s: GenState = st_emit(t.state, t.name + " = icmp ne " + from_ty + " " + value + ", 0");
+            return TokResult { state: s, pos: 0, value: t.name, ty: "i1" };
+        }
+    }
+    if to_ty == "i32" {
+        if from_ty == "i64" {
+            let t: NameResult = st_new_temp(state);
+            let s: GenState = st_emit(t.state, t.name + " = trunc i64 " + value + " to i32");
+            return TokResult { state: s, pos: 0, value: t.name, ty: "i32" };
+        }
+        // A bool (i1) widened to i32 must actually be widened. Returning it
+        // unchanged produced IR like `call void @miko_print_bool(i32 %t0)` where
+        // %t0 was still an i1, which clang rejected - that is why
+        // `print(1 == 2)` and `let b = 1 < 2` failed to compile.
+        if from_ty == "i1" {
+            let t: NameResult = st_new_temp(state);
+            let s: GenState = st_emit(t.state, t.name + " = zext i1 " + value + " to i32");
+            return TokResult { state: s, pos: 0, value: t.name, ty: "i32" };
+        }
+    }
+    return TokResult { state: state, pos: 0, value: value, ty: from_ty };
+}
+
+fn comparison_pred(op: string): string {
+    if op == "==" {
+        return "eq";
+    }
+    if op == "!=" {
+        return "ne";
+    }
+    if op == "<" {
+        return "slt";
+    }
+    if op == "<=" {
+        return "sle";
+    }
+    if op == ">" {
+        return "sgt";
+    }
+    return "sge";
+}
+
+// The float predicates differ from the integer ones: `slt` is a signed-integer
+// comparison and does not exist for `fcmp`. The ordered variants are the ones
+// that match integer semantics for ordinary values (a NaN compares false).
+// Type names reach this backend in two spellings: the source type ("f64") for
+// literals and expression results, and the mapped IR type ("double") for
+// anything read out of the symbol table, which stores ir_type_for() output.
+// Every float decision has to accept both or a loaded variable silently falls
+// back to the integer path.
+fn is_float_ty(ty: string): bool {
+    return ty == "f64" || ty == "double";
+}
+
+fn float_comparison_pred(op: string): string {
+    if op == "==" {
+        return "oeq";
+    }
+    if op == "!=" {
+        return "une";
+    }
+    if op == "<" {
+        return "olt";
+    }
+    if op == "<=" {
+        return "ole";
+    }
+    if op == ">" {
+        return "ogt";
+    }
+    return "oge";
+}
+
+// The miko-visible names carry a type suffix (sqrt_f64) that the libm symbols
+// do not, so the suffix is dropped before the call is emitted.
+fn float_math_name(builtin: string): string {
+    if builtin == "sqrt_f64" {
+        return "sqrt";
+    }
+    if builtin == "floor_f64" {
+        return "floor";
+    }
+    if builtin == "ceil_f64" {
+        return "ceil";
+    }
+    return "round";
+}
+
+// Emits `if (!condition) { eprint(message); exit(1); }` as real control flow.
+// Returns the state positioned in the fall-through block, so the caller keeps
+// emitting into a valid insertion point. Diagnostics go to stderr: writing them
+// to stdout would mix a fatal error into the program's own output.
+fn emit_runtime_check(state: GenState, condition: string, message: string): GenState {
+    let ok: NameResult = st_new_label(state, "check.ok");
+    let fail: NameResult = st_new_label(ok.state, "check.fail");
+    // A conditional branch is a terminator, so it goes through st_terminate:
+    // st_emit leaves `terminated` false, and st_label then appended a second,
+    // unconditional `br label %check.fail` in front of it, which silently
+    // turned every division into an unconditional abort.
+    let s0: GenState = st_terminate(ok.state, "br i1 " + condition + ", label %" + ok.name + ", label %" + fail.name);
+    let s1: GenState = st_label(s0, fail.name);
+    let text: NameResult = intern_string(s1, "\"" + message + "\\n\"");
+    let s2: GenState = st_emit(text.state, "call void @miko_eprint_str(ptr " + text.name + ")");
+    let s3: GenState = st_terminate(s2, "call void @exit(i32 1)");
+    let s4: GenState = st_terminate(s3, "unreachable");
+    return st_label(s4, ok.name);
+}
+
+fn emit_binop(state: GenState, op: string, left: TokResult, right: TokResult): EmitResult {
+    if op == "+" && (left.ty == "ptr" || right.ty == "ptr") {
+        let lc: TokResult = coerce_value(state, left.value, left.ty, "ptr");
+        let rc: TokResult = coerce_value(lc.state, right.value, right.ty, "ptr");
+        let t: NameResult = st_new_temp(rc.state);
+        let s: GenState = st_emit(t.state, t.name + " = call ptr @miko_str_concat(ptr " + lc.value + ", ptr " + rc.value + ")");
+        return EmitResult { state: s, value: t.name, ty: "ptr" };
+    }
+    if op == "&&" || op == "||" {
+        let lc: TokResult = coerce_value(state, left.value, left.ty, "i1");
+        let rc: TokResult = coerce_value(lc.state, right.value, right.ty, "i1");
+        let t: NameResult = st_new_temp(rc.state);
+        let logic_op = "or";
+        if op == "&&" {
+            logic_op = "and";
+        }
+        let s: GenState = st_emit(t.state, t.name + " = " + logic_op + " i1 " + lc.value + ", " + rc.value);
+        return EmitResult { state: s, value: t.name, ty: "i1" };
+    }
+    // Float arithmetic. A mixed int/float expression promotes the integer side,
+    // so `x * 2` works when x is an f64. Division needs no zero guard: IEEE
+    // inf/nan is the defined result, unlike integer sdiv.
+    if is_float_ty(left.ty) || is_float_ty(right.ty) {
+        let lf: TokResult = coerce_value(state, left.value, left.ty, "f64");
+        let rf: TokResult = coerce_value(lf.state, right.value, right.ty, "f64");
+        if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+            let t: NameResult = st_new_temp(rf.state);
+            let s: GenState = st_emit(t.state, t.name + " = fcmp " + float_comparison_pred(op) + " double " + lf.value + ", " + rf.value);
+            return EmitResult { state: s, value: t.name, ty: "i1" };
+        }
+        let fop = "fadd";
+        if op == "-" {
+            fop = "fsub";
+        }
+        if op == "*" {
+            fop = "fmul";
+        }
+        if op == "/" {
+            fop = "fdiv";
+        }
+        let t2: NameResult = st_new_temp(rf.state);
+        let s2: GenState = st_emit(t2.state, t2.name + " = " + fop + " double " + lf.value + ", " + rf.value);
+        return EmitResult { state: s2, value: t2.name, ty: "f64" };
+    }
+    if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if left.ty == "ptr" && right.ty == "ptr" {
+            let t: NameResult = st_new_temp(state);
+            let cmp: GenState = st_emit(t.state, t.name + " = call i32 @miko_str_cmp(ptr " + left.value + ", ptr " + right.value + ")");
+            let t2: NameResult = st_new_temp(cmp);
+            let s: GenState = st_emit(t2.state, t2.name + " = icmp " + comparison_pred(op) + " i32 " + t.name + ", 0");
+            return EmitResult { state: s, value: t2.name, ty: "i1" };
+        }
+        if left.ty == right.ty && (left.ty == "i64" || left.ty == "i32" || left.ty == "i1") {
+            let t: NameResult = st_new_temp(state);
+            let s: GenState = st_emit(t.state, t.name + " = icmp " + comparison_pred(op) + " " + left.ty + " " + left.value + ", " + right.value);
+            return EmitResult { state: s, value: t.name, ty: "i1" };
+        }
+        let lc: TokResult = coerce_i64(state, left.value, left.ty);
+        let rc: TokResult = coerce_i64(lc.state, right.value, right.ty);
+        let t: NameResult = st_new_temp(rc.state);
+        let s: GenState = st_emit(t.state, t.name + " = icmp " + comparison_pred(op) + " i64 " + lc.value + ", " + rc.value);
+        return EmitResult { state: s, value: t.name, ty: "i1" };
+    }
+    let lc: TokResult = coerce_i64(state, left.value, left.ty);
+    let rc: TokResult = coerce_i64(lc.state, right.value, right.ty);
+    let opcode = "add";
+    if op == "-" {
+        opcode = "sub";
+    }
+    if op == "*" {
+        opcode = "mul";
+    }
+    if op == "/" || op == "%" {
+        // Guard the divisor. Without this the emitted sdiv traps at run time
+        // and the process dies with a hardware exception instead of reporting
+        // which operation failed.
+        let chk: NameResult = st_new_temp(rc.state);
+        let s1: GenState = st_emit(chk.state, chk.name + " = icmp ne i64 " + rc.value + ", 0");
+        let s2: GenState = emit_runtime_check(s1, chk.name, "division by zero");
+        let div_op = "sdiv";
+        if op == "%" {
+            div_op = "srem";
+        }
+        let t2: NameResult = st_new_temp(s2);
+        let s3: GenState = st_emit(t2.state, t2.name + " = " + div_op + " i64 " + lc.value + ", " + rc.value);
+        return EmitResult { state: s3, value: t2.name, ty: "i64" };
+    }
+    let t: NameResult = st_new_temp(rc.state);
+    let s: GenState = st_emit(t.state, t.name + " = " + opcode + " i64 " + lc.value + ", " + rc.value);
+    return EmitResult { state: s, value: t.name, ty: "i64" };
+}
+
+// ---- call helpers ----------------------------------------------------------
+
+fn count_lines(text: string): i64 {
+    let n = len(text);
+    if n == 0 {
+        return 0;
+    }
+    let count: i64 = 0;
+    let i: i64 = 0;
+    while i < n {
+        if char_at(text, i) == '\n' {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn group_at(groups: string, index: i64): string {
+    let i: i64 = 0;
+    let cursor: i64 = 0;
+    let n = len(groups);
+    while cursor < n {
+        let line_end = find_char(groups, cursor, '\n');
+        if i == index {
+            return substring(groups, cursor, line_end - cursor);
+        }
+        i = i + 1;
+        cursor = line_end + 1;
+    }
+    return "";
+}
+
+fn split_call_args(toks: string, pos: i64): SplitArgs {
+    let groups = "";
+    let current = "";
+    let depth: i64 = 0;
+    let p = pos;
+    let rparen = pos;
+    let guard: i64 = 0;
+    while guard < 1000000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, p);
+        if tok == "" {
+            break;
+        }
+        if tok == ")" && depth == 0 {
+            rparen = p;
+            if current != "" {
+                groups = groups + current + "\n";
+            }
+            break;
+        }
+        if tok == "(" || tok == "[" || tok == "{" {
+            depth = depth + 1;
+        }
+        if tok == ")" || tok == "]" || tok == "}" {
+            depth = depth - 1;
+        }
+        if tok == "," && depth == 0 {
+            groups = groups + current + "\n";
+            current = "";
+            p = tok_next(toks, p);
+            continue;
+        }
+        if current != "" {
+            current = current + " ";
+        }
+        current = current + tok;
+        p = tok_next(toks, p);
+    }
+    return SplitArgs { groups: groups, rparen: rparen };
+}
+
+fn param_ty_at(param_tys: string, k: i64): string {
+    let j: i64 = 0;
+    let cursor: i64 = 0;
+    let m = len(param_tys);
+    while cursor <= m {
+        let comma = find_char(param_tys, cursor, ',');
+        if j == k {
+            return substring(param_tys, cursor, comma - cursor);
+        }
+        j = j + 1;
+        if comma >= m {
+            cursor = m + 1;
+        } else {
+            cursor = comma + 1;
+        }
+    }
+    return "i64";
+}
+
+// Lowers a builtin call; the continuation position is supplied by the caller.
+fn lower_builtin_call(state: GenState, callee: string, arg_groups: string): TokResult {
+    let first_toks = tokenize_flat(group_at(arg_groups, 0));
+    let first: TokResult = parse_or(state, first_toks, 0);
+    let second_toks = tokenize_flat(group_at(arg_groups, 1));
+    let second: TokResult = parse_or(first.state, second_toks, 0);
+    let third_toks = tokenize_flat(group_at(arg_groups, 2));
+    let third: TokResult = parse_or(second.state, third_toks, 0);
+    if callee == "print" {
+        if first.ty == "ptr" {
+            let s2: GenState = st_emit(first.state, "call void @miko_print_str(ptr " + first.value + ")");
+            return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+        }
+        if is_float_ty(first.ty) {
+            let s2: GenState = st_emit(first.state, "call void @miko_print_f64(double " + first.value + ")");
+            return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+        }
+        if first.ty == "i1" {
+            let z: TokResult = coerce_value(first.state, first.value, "i1", "i32");
+            let s2: GenState = st_emit(z.state, "call void @miko_print_bool(i32 " + z.value + ")");
+            return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+        }
+        if first.ty == "i32" {
+            let s2: GenState = st_emit(first.state, "call void @miko_print_char(i32 " + first.value + ")");
+            return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+        }
+        let wide: TokResult = coerce_i64(first.state, first.value, first.ty);
+        let s2: GenState = st_emit(wide.state, "call void @miko_print_i64(i64 " + wide.value + ")");
+        return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+    }
+    if callee == "mono_ms" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_mono_ms()");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "file_exists" {
+        // bool is i1 in this backend; the runtime returns a C int, so the result
+        // is compared against zero rather than truncated.
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i32 @miko_file_exists(ptr " + first.value + ")");
+        let c: NameResult = st_new_temp(s2);
+        let s3: GenState = st_emit(c.state, c.name + " = icmp ne i32 " + t.name + ", 0");
+        return TokResult { state: s3, pos: 0, value: c.name, ty: "i1" };
+    }
+    if callee == "run_command" {
+        // Runs a shell command, returning its exit status. Used by the driver to
+        // link the IR it just wrote, so `miko prog.miko out\p` yields an
+        // executable. Mirrors the interpreter's builtin of the same name.
+        let widened: TokResult = coerce_i64(first.state, first.value, first.ty);
+        let t: NameResult = st_new_temp(widened.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i32 @miko_run_command(ptr " + widened.value + ")");
+        let w: NameResult = st_new_temp(s2);
+        let s3: GenState = st_emit(w.state, w.name + " = sext i32 " + t.name + " to i64");
+        return TokResult { state: s3, pos: 0, value: w.name, ty: "i64" };
+    }
+    if callee == "len" {
+        // `len` on a fixed array is a compile-time constant; on a string it is
+        // strlen. On anything else - a vec, most importantly - the backend has
+        // no lowering, and emitting strlen against a non-pointer produces IR
+        // that only fails later, inside clang, with a message that points at
+        // the generated .ll instead of at the source line responsible.
+        if is_array_type(first.ty) {
+            let n = array_count(first.ty);
+            let n_ty = array_elem_type(first.ty);
+            if n_ty != "" {
+                let t: NameResult = st_new_temp(first.state);
+                return TokResult { state: t.state, pos: 0, value: number_to_text(n), ty: "i64" };
+            }
+        }
+        if first.ty != "ptr" {
+            eprint("codegen_ll: `len` applied to a value of type '" + first.ty + "', which this backend cannot lower");
+            eprint("codegen_ll: vec<T> is not supported by the LLVM IR backend (no runtime support yet)");
+            exit(1);
+        }
+        let t: NameResult = st_new_temp(first.state);
+        // The length lives in the header the runtime writes, so this is a load
+        // rather than a walk over the bytes. Every string that reaches here came
+        // from the runtime allocator or from intern_string, both of which write
+        // that header.
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_str_len(ptr " + first.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "append_str" {
+        // s = append_str(s, piece): appends into the existing buffer instead of
+        // rebuilding the whole string the way s + piece does. Building the
+        // compiler's own output with + cost 70 seconds on a 94 KB input.
+        let t: NameResult = st_new_temp(second.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_str_append(ptr "
+            + first.value + ", ptr " + second.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "char_at" {
+        // A byte value in 0..255. Not `char`: MSVC and gcc are free to make plain
+        // `char` signed, and a UTF-8 continuation byte would then come back as a
+        // negative number - which corrupts anything that indexes with it, such
+        // as the hex digits used when escaping string literals.
+        let idx: TokResult = coerce_i64(second.state, second.value, second.ty);
+        let t: NameResult = st_new_temp(idx.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i32 @miko_char_at(ptr " + first.value + ", i64 " + idx.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i32" };
+    }
+    if callee == "substring" {
+        let st2: TokResult = coerce_i64(second.state, second.value, second.ty);
+        let ln: TokResult = coerce_i64(third.state, third.value, third.ty);
+        let t: NameResult = st_new_temp(ln.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_substring(ptr " + first.value + ", i64 " + st2.value + ", i64 " + ln.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "input" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_input()");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "arg_count" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_arg_count()");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "arg_at" {
+        let idx: TokResult = coerce_i64(first.state, first.value, first.ty);
+        let t: NameResult = st_new_temp(idx.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_arg_at(i64 " + idx.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "read_file" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_read_file(ptr " + first.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "write_file" {
+        let s2: GenState = st_emit(second.state, "call void @miko_write_file(ptr " + first.value + ", ptr " + second.value + ")");
+        return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+    }
+    if callee == "exit" {
+        let code: TokResult = coerce_value(first.state, first.value, first.ty, "i32");
+        let s2: GenState = st_emit(code.state, "call void @exit(i32 " + code.value + ")");
+        return TokResult { state: st_terminate(s2, "unreachable"), pos: 0, value: "0", ty: "void" };
+    }
+    if callee == "eprint" {
+        if first.ty == "ptr" {
+            let s2: GenState = st_emit(first.state, "call void @miko_eprint_str(ptr " + first.value + ")");
+            return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+        }
+        let wide: TokResult = coerce_i64(first.state, first.value, first.ty);
+        let s2: GenState = st_emit(wide.state, "call void @miko_eprint_i64(i64 " + wide.value + ")");
+        return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+    }
+    if callee == "clock_ms" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_clock_ms()");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "seed_i64" {
+        let seed: TokResult = coerce_i64(first.state, first.value, first.ty);
+        let s2: GenState = st_emit(seed.state, "call void @miko_seed_i64(i64 " + seed.value + ")");
+        return TokResult { state: s2, pos: 0, value: "0", ty: "void" };
+    }
+    if callee == "rand_i64" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_rand_i64()");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "to_string_i64" {
+        let wide: TokResult = coerce_i64(first.state, first.value, first.ty);
+        let t: NameResult = st_new_temp(wide.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_to_string_i64(i64 " + wide.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "to_string_bool" {
+        let flag: TokResult = coerce_value(first.state, first.value, first.ty, "i32");
+        let t: NameResult = st_new_temp(flag.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_to_string_bool(i32 " + flag.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "to_string_char" {
+        let code: TokResult = coerce_value(first.state, first.value, first.ty, "i32");
+        let t: NameResult = st_new_temp(code.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_to_string_char(i32 " + code.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "str_to_i64" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_str_to_i64(ptr " + first.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "str_index_of" {
+        let t: NameResult = st_new_temp(second.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i64 @miko_str_index_of(ptr " + first.value + ", ptr " + second.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "str_contains" {
+        // The runtime answers with a C int, so the i1 this backend uses for bool
+        // is produced by comparing against zero instead of truncating.
+        let t: NameResult = st_new_temp(second.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call i32 @miko_str_contains(ptr " + first.value + ", ptr " + second.value + ")");
+        let c: NameResult = st_new_temp(s2);
+        let s3: GenState = st_emit(c.state, c.name + " = icmp ne i32 " + t.name + ", 0");
+        return TokResult { state: s3, pos: 0, value: c.name, ty: "i1" };
+    }
+    if callee == "to_string_f64" {
+        let v: TokResult = coerce_value(first.state, first.value, first.ty, "f64");
+        let t: NameResult = st_new_temp(v.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call ptr @miko_to_string_f64(double " + v.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "ptr" };
+    }
+    if callee == "str_to_f64" {
+        let t: NameResult = st_new_temp(first.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call double @miko_str_to_f64(ptr " + first.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "f64" };
+    }
+    if callee == "f64_to_i64" {
+        let v: TokResult = coerce_value(first.state, first.value, first.ty, "f64");
+        let t: NameResult = st_new_temp(v.state);
+        let s2: GenState = st_emit(t.state, t.name + " = fptosi double " + v.value + " to i64");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "i64" };
+    }
+    if callee == "sqrt_f64" || callee == "floor_f64" || callee == "ceil_f64" || callee == "round_f64" {
+        // libc/libm entry points rather than LLVM intrinsics: the IR text names
+        // them directly, so no intrinsic declarations are needed and clang picks
+        // the right implementation on every target.
+        let v: TokResult = coerce_value(first.state, first.value, first.ty, "f64");
+        let t: NameResult = st_new_temp(v.state);
+        let s2: GenState = st_emit(t.state, t.name + " = call double @" + float_math_name(callee) + "(double " + v.value + ")");
+        return TokResult { state: s2, pos: 0, value: t.name, ty: "f64" };
+    }
+    return TokResult { state: third.state, pos: 0, value: "0", ty: "i64" };
+}
+
+// ---- expression parser -----------------------------------------------------
+
+// ---- structs and places ----------------------------------------------------
+//
+// `parse_place` walks `ident(.field)*` and returns the address of the final
+// location without loading it. Field steps are constant GEPs into the named
+// LLVM struct type, so the runtime cost of a field read is one load.
+// GenState symbols store already-mapped LLVM types ("%struct.Point"), while
+// the layout table is keyed by the source name ("Point"). This recovers the
+// source name so a field lookup can be done on either spelling.
+fn struct_bare_name(ty: string): string {
+    let prefix = "%struct.";
+    if starts_with_at(ty, 0, prefix) {
+        return substring(ty, len(prefix), len(ty) - len(prefix));
+    }
+    return ty;
+}
+
+fn parse_place(state: GenState, toks: string, pos: i64): Place {
+    let tok = tok_peek(toks, pos);
+    let lookup = st_find_sym(state, tok);
+    if lookup == "" {
+        return Place { state: state, pos: pos, slot: "", ty: "" };
+    }
+    let colon = find_char(lookup, 0, ':');
+    let ty = substring(lookup, 0, colon);
+    let slot = substring(lookup, colon + 1, len(lookup) - colon - 1);
+    let cursor = tok_next(toks, pos);
+    let done = false;
+    while !done {
+        let dot = tok_peek(toks, cursor);
+        if dot == "[" && is_array_type(ty) {
+            // `name[expr]` on a fixed array: address the element with a GEP and
+            // leave `ty` as the element type, so the caller's `load` reads a
+            // scalar. The index is a runtime value, so this is not a constant
+            // GEP - the second index stays an i64 operand.
+            let idx: TokResult = parse_or(state, toks, tok_next(toks, cursor));
+            let close = idx.pos;
+            if tok_peek(toks, close) == "]" {
+                close = tok_next(toks, close);
+            }
+            let elem_ty = array_elem_type(ty);
+            let widened: TokResult = coerce_value(idx.state, idx.value, idx.ty, "i64");
+            // Bounds check. Without it `a[5]` on a 3-element array read memory
+            // past the alloca and the program printed whatever happened to be
+            // there - a silent wrong answer, which is worse than a crash.
+            let n = array_count(ty);
+            let lower: NameResult = st_new_temp(widened.state);
+            let s1: GenState = st_emit(lower.state, lower.name + " = icmp sge i64 " + widened.value + ", 0");
+            let upper: NameResult = st_new_temp(s1);
+            let s2: GenState = st_emit(upper.state, upper.name + " = icmp slt i64 " + widened.value + ", " + number_to_text(n));
+            let both: NameResult = st_new_temp(s2);
+            let s3: GenState = st_emit(both.state, both.name + " = and i1 " + lower.name + ", " + upper.name);
+            let s4: GenState = emit_runtime_check(s3, both.name, "array index out of bounds");
+            let t: NameResult = st_new_temp(s4);
+            let s: GenState = st_emit(t.state, t.name + " = getelementptr " + ty + ", ptr " + slot + ", i32 0, i64 " + widened.value);
+            state = s;
+            slot = t.name;
+            ty = elem_ty;
+            cursor = close;
+        } else {
+            if dot != "." {
+                done = true;
+            } else {
+                let field = tok_peek(toks, tok_next(toks, cursor));
+                let base = struct_bare_name(ty);
+                let idx = struct_field_index(state.structs, base, field);
+                if idx < 0 {
+                    done = true;
+                } else {
+                    let fty = ir_type_for_table(state.structs, struct_field_type(state.structs, base, field));
+                    let t: NameResult = st_new_temp(state);
+                    let s: GenState = st_emit(t.state, t.name + " = getelementptr %struct." + base + ", ptr " + slot + ", i32 0, i32 " + number_to_text(idx));
+                    state = s;
+                    slot = t.name;
+                    ty = fty;
+                    cursor = tok_next(toks, tok_next(toks, cursor));
+                }
+            }
+        }
+    }
+    return Place { state: state, pos: cursor, slot: slot, ty: ty };
+}
+
+// Index of a struct-literal field inside the leading `|`-separated list.
+fn literal_field_end(toks: string, pos: i64): i64 {
+    let depth: i64 = 0;
+    let p = pos;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, p);
+        if tok == "" {
+            return p;
+        }
+        if tok == "(" || tok == "[" || tok == "{" {
+            depth = depth + 1;
+        }
+        if tok == ")" || tok == "]" || tok == "}" {
+            if depth == 0 {
+                return p;
+            }
+            depth = depth - 1;
+        }
+        if tok == "," && depth == 0 {
+            return p;
+        }
+        p = tok_next(toks, p);
+    }
+    return p;
+}
+
+// Builds `Name { f: v, ... }` as an aggregate value: allocate a slot, store
+// every field through a constant GEP, then load the aggregate. Fields may be
+// written in any order; declaration order decides the layout.
+fn parse_struct_literal(state: GenState, toks: string, pos: i64, name: string): TokResult {
+    let slot: NameResult = st_new_temp(state);
+    let s: GenState = st_alloc(slot.state, slot.name + " = alloca %struct." + name);
+    let cursor = tok_next(toks, pos);
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, cursor);
+        if tok == "" || tok == "}" {
+            cursor = tok_next(toks, cursor);
+            guard = 100000;
+        } else {
+            let field = tok;
+            let after_field = tok_next(toks, cursor);
+            let colon = tok_peek(toks, after_field);
+            let value_start = tok_next(toks, after_field);
+            if colon == ":" {
+                value_start = tok_next(toks, after_field);
+            }
+            let value_end = literal_field_end(toks, value_start);
+            let value_toks = substring(toks, value_start, value_end - value_start);
+            let idx = struct_field_index(s.structs, name, field);
+            let fty = ir_type_for_table(s.structs, struct_field_type(s.structs, name, field));
+            let value: TokResult = parse_or(s, value_toks, 0);
+            s = value.state;
+            let coerced: TokResult = coerce_value(s, value.value, value.ty, fty);
+            s = coerced.state;
+            let gep: NameResult = st_new_temp(s);
+            s = st_emit(gep.state, gep.name + " = getelementptr %struct." + name + ", ptr " + slot.name + ", i32 0, i32 " + number_to_text(idx));
+            s = st_emit(s, "store " + fty + " " + coerced.value + ", ptr " + gep.name);
+            let next_cursor = tok_next(toks, value_end);
+            let sep = tok_peek(toks, value_end);
+            if sep == "," || sep == "}" {
+                cursor = tok_next(toks, value_end);
+            } else {
+                cursor = next_cursor;
+            }
+        }
+    }
+    let loaded: NameResult = st_new_temp(s);
+    let s2: GenState = st_emit(loaded.state, loaded.name + " = load %struct." + name + ", ptr " + slot.name);
+    return TokResult { state: s2, pos: cursor, value: loaded.name, ty: "%struct." + name };
+}
+
+fn parse_primary(state: GenState, toks: string, pos: i64): TokResult {
+    let tok = tok_peek(toks, pos);
+    if tok == "" {
+        return TokResult { state: state, pos: tok_next(toks, pos), value: "0", ty: "i64" };
+    }
+    if tok == "(" {
+        let inner: TokResult = parse_or(state, toks, tok_next(toks, pos));
+        let after = tok_peek(toks, inner.pos);
+        let close = inner.pos;
+        if after == ")" {
+            close = tok_next(toks, inner.pos);
+        }
+        return TokResult { state: inner.state, pos: close, value: inner.value, ty: inner.ty };
+    }
+    if tok == "true" || tok == "false" {
+        let value = "0";
+        if tok == "true" {
+            value = "1";
+        }
+        return TokResult { state: state, pos: tok_next(toks, pos), value: value, ty: "i1" };
+    }
+    if starts_with_at(tok, 0, "\"") {
+        let interned: NameResult = intern_string(state, tok);
+        return TokResult { state: interned.state, pos: tok_next(toks, pos), value: interned.name, ty: "ptr" };
+    }
+    if starts_with_at(tok, 0, "'") {
+        let code = char_literal_code(tok);
+        return TokResult { state: state, pos: tok_next(toks, pos), value: number_to_text(code), ty: "i32" };
+    }
+    let first = char_at(tok, 0);
+    if first >= '0' && first <= '9' {
+        // A fractional part or an exponent makes this a float; without this
+        // check the literal went through the integer decoder, which stops at
+        // the '.', so `let x: f64 = 1.5` silently became `1`.
+        if is_float_literal(tok) {
+            return TokResult { state: state, pos: tok_next(toks, pos), value: float_literal_text(tok), ty: "f64" };
+        }
+        // The literal text must be decoded, not pasted into the IR: LLVM has no
+        // notion of 0xFF, 0b1010 or 1_000_000 as an i64 operand.
+        return TokResult { state: state, pos: tok_next(toks, pos), value: number_to_text(text_to_number(tok)), ty: "i64" };
+    }
+    if is_identifier(tok) {
+        let next_tok = tok_peek(toks, tok_next(toks, pos));
+        if next_tok == "::" {
+            let member_tok = tok_peek(toks, tok_next(toks, tok_next(toks, pos)));
+            let idx = enum_member_index(state.enums, tok, member_tok);
+            let after_member = tok_next(toks, tok_next(toks, tok_next(toks, pos)));
+            return TokResult { state: state, pos: after_member, value: number_to_text(idx), ty: "i64" };
+        }
+        if next_tok == "{" && struct_is_name(state.structs, tok) {
+            return parse_struct_literal(state, toks, tok_next(toks, pos), tok);
+        }
+        let place: Place = parse_place(state, toks, pos);
+        if place.slot != "" {
+            let t: NameResult = st_new_temp(place.state);
+            let s: GenState = st_emit(t.state, t.name + " = load " + place.ty + ", ptr " + place.slot);
+            return TokResult { state: s, pos: place.pos, value: t.name, ty: place.ty };
+        }
+        return TokResult { state: state, pos: tok_next(toks, pos), value: "0", ty: "i64" };
+    }
+    return TokResult { state: state, pos: tok_next(toks, pos), value: "0", ty: "i64" };
+}
+
+fn parse_postfix(state: GenState, toks: string, pos: i64): TokResult {
+    let tok = tok_peek(toks, pos);
+    let next_tok = tok_peek(toks, tok_next(toks, pos));
+    // `alias.name(...)` - a module-qualified call. Modules are compiled to
+    // separate LLVM modules and linked, so the callee resolves by its bare
+    // name (the same convention the C backend uses).
+    if is_identifier(tok) && next_tok == "." {
+        let field = tok_peek(toks, tok_next(toks, tok_next(toks, pos)));
+        let open = tok_peek(toks, tok_next(toks, tok_next(toks, tok_next(toks, pos))));
+        if is_identifier(field) && open == "(" {
+            return parse_named_call(state, tok + "." + field, toks, tok_next(toks, tok_next(toks, tok_next(toks, tok_next(toks, pos)))));
+        }
+    }
+    if is_identifier(tok) && next_tok == "(" {
+        return parse_named_call(state, tok, toks, tok_next(toks, tok_next(toks, pos)));
+    }
+    return parse_primary(state, toks, pos);
+}
+
+// Lowers a call whose callee name is already isolated; `args_pos` points just
+// past the opening paren.
+fn parse_named_call(state: GenState, tok: string, toks: string, args_pos: i64): TokResult {
+    if true {
+        let args: SplitArgs = split_call_args(toks, args_pos);
+        let after = tok_next(toks, args.rparen);
+        if is_builtin_name(tok) {
+            let r: TokResult = lower_builtin_call(state, tok, args.groups);
+            return TokResult { state: r.state, pos: after, value: r.value, ty: r.ty };
+        }
+        // Resolve the callee to the definition that actually exists. A
+        // module-local call mangles against the enclosing module; a qualified
+        // call may use an alias that differs from the module name, so it falls
+        // back to a whole-program lookup by bare function name.
+        let target = mangle_name(state, tok);
+        let entry = funcs_lookup(state.funcs, target);
+        if entry == "" {
+            let dot = find_char(tok, 0, '.');
+            if dot < len(tok) {
+                let bare = substring(tok, dot + 1, len(tok) - dot - 1);
+                entry = funcs_lookup_bare(state.funcs, bare);
+                if entry != "" {
+                    target = signature_name(entry);
+                }
+            }
+        }
+        let ret_ty = "i64";
+        let param_tys = "";
+        if entry != "" {
+            let first = find_char(entry, 0, ':');
+            let second = find_char(entry, first + 1, ':');
+            ret_ty = substring(entry, first + 1, second - first - 1);
+            param_tys = substring(entry, second + 1, len(entry) - second - 1);
+        }
+        let s = state;
+        let call_args = "";
+        let k: i64 = 0;
+        while k < count_lines(args.groups) {
+            let group_toks = tokenize_flat(group_at(args.groups, k));
+            let arg: TokResult = parse_or(s, group_toks, 0);
+            s = arg.state;
+            let coerced: TokResult = coerce_value(s, arg.value, arg.ty, param_ty_at(param_tys, k));
+            s = coerced.state;
+            if call_args != "" {
+                call_args = call_args + ", ";
+            }
+            call_args = call_args + coerced.ty + " " + coerced.value;
+            k = k + 1;
+        }
+        if ret_ty == "void" {
+            let s2: GenState = st_emit(s, "call void @" + target + "(" + call_args + ")");
+            return TokResult { state: s2, pos: after, value: "0", ty: "void" };
+        }
+        let t: NameResult = st_new_temp(s);
+        let s2: GenState = st_emit(t.state, t.name + " = call " + ret_ty + " @" + target + "(" + call_args + ")");
+        return TokResult { state: s2, pos: after, value: t.name, ty: ret_ty };
+    }
+    return TokResult { state: state, pos: args_pos, value: "0", ty: "i64" };
+}
+
+fn parse_unary(state: GenState, toks: string, pos: i64): TokResult {
+    let tok = tok_peek(toks, pos);
+    if tok == "-" {
+        let operand: TokResult = parse_unary(state, toks, tok_next(toks, pos));
+        let wide: TokResult = coerce_i64(operand.state, operand.value, operand.ty);
+        let t: NameResult = st_new_temp(wide.state);
+        let s: GenState = st_emit(t.state, t.name + " = sub i64 0, " + wide.value);
+        return TokResult { state: s, pos: operand.pos, value: t.name, ty: "i64" };
+    }
+    if tok == "!" {
+        let operand: TokResult = parse_unary(state, toks, tok_next(toks, pos));
+        let b: TokResult = coerce_value(operand.state, operand.value, operand.ty, "i1");
+        let t: NameResult = st_new_temp(b.state);
+        let s: GenState = st_emit(t.state, t.name + " = xor i1 " + b.value + ", true");
+        return TokResult { state: s, pos: operand.pos, value: t.name, ty: "i1" };
+    }
+    return parse_postfix(state, toks, pos);
+}
+
+fn parse_mul(state: GenState, toks: string, pos: i64): TokResult {
+    let left: TokResult = parse_unary(state, toks, pos);
+    let running = left;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, running.pos);
+        if !is_mul_op(tok) {
+            break;
+        }
+        let right: TokResult = parse_unary(running.state, toks, tok_next(toks, running.pos));
+        let combined: EmitResult = emit_binop(right.state, tok, running, right);
+        running = TokResult { state: combined.state, pos: right.pos, value: combined.value, ty: combined.ty };
+    }
+    return running;
+}
+
+fn parse_add(state: GenState, toks: string, pos: i64): TokResult {
+    let left: TokResult = parse_mul(state, toks, pos);
+    let running = left;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, running.pos);
+        if !is_add_op(tok) {
+            break;
+        }
+        let right: TokResult = parse_mul(running.state, toks, tok_next(toks, running.pos));
+        let combined: EmitResult = emit_binop(right.state, tok, running, right);
+        running = TokResult { state: combined.state, pos: right.pos, value: combined.value, ty: combined.ty };
+    }
+    return running;
+}
+
+fn parse_rel(state: GenState, toks: string, pos: i64): TokResult {
+    let left: TokResult = parse_add(state, toks, pos);
+    let running = left;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, running.pos);
+        if !is_rel_op(tok) {
+            break;
+        }
+        let right: TokResult = parse_add(running.state, toks, tok_next(toks, running.pos));
+        let combined: EmitResult = emit_binop(right.state, tok, running, right);
+        running = TokResult { state: combined.state, pos: right.pos, value: combined.value, ty: combined.ty };
+    }
+    return running;
+}
+
+fn parse_eq(state: GenState, toks: string, pos: i64): TokResult {
+    let left: TokResult = parse_rel(state, toks, pos);
+    let running = left;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, running.pos);
+        if !is_eq_op(tok) {
+            break;
+        }
+        let right: TokResult = parse_rel(running.state, toks, tok_next(toks, running.pos));
+        let combined: EmitResult = emit_binop(right.state, tok, running, right);
+        running = TokResult { state: combined.state, pos: right.pos, value: combined.value, ty: combined.ty };
+    }
+    return running;
+}
+
+// `&&` and `||` short-circuit: the right operand is only evaluated when the
+// left one does not already decide the result. Folding them into `and i1` /
+// `or i1` would evaluate both sides eagerly, so a guard such as
+// `i < n && char_at(t, i) == ' '` would read past the end of the string.
+//
+// Each operator threads its result through an i1 slot instead of a phi node,
+// matching the alloca-based style used throughout this backend. The right
+// operand is parsed at its own precedence level: `&&` takes an equality
+// expression, `||` takes a full and-expression, so `a || b && c` groups as
+// `a || (b && c)`.
+fn parse_and(state: GenState, toks: string, pos: i64): TokResult {
+    let left: TokResult = parse_eq(state, toks, pos);
+    let running = left;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, running.pos);
+        if tok != "&&" {
+            break;
+        }
+        let lc: TokResult = coerce_value(running.state, running.value, running.ty, "i1");
+        let slot: NameResult = st_new_temp(lc.state);
+        let s1: GenState = st_alloc(slot.state, slot.name + " = alloca i1");
+        let s2: GenState = st_emit(s1, "store i1 " + lc.value + ", ptr " + slot.name);
+        let rhs_l: NameResult = st_new_label(s2, "land.rhs.");
+        let done_l: NameResult = st_new_label(rhs_l.state, "land.end.");
+        let s3: GenState = st_terminate(done_l.state, "br i1 " + lc.value + ", label %" + rhs_l.name + ", label %" + done_l.name);
+        let s4: GenState = st_label(s3, rhs_l.name);
+        let right: TokResult = parse_eq(s4, toks, tok_next(toks, running.pos));
+        let rc: TokResult = coerce_value(right.state, right.value, right.ty, "i1");
+        let s5: GenState = st_emit(rc.state, "store i1 " + rc.value + ", ptr " + slot.name);
+        let s6: GenState = st_terminate(s5, "br label %" + done_l.name);
+        let s7: GenState = st_label(s6, done_l.name);
+        let t: NameResult = st_new_temp(s7);
+        let s8: GenState = st_emit(t.state, t.name + " = load i1, ptr " + slot.name);
+        running = TokResult { state: s8, pos: right.pos, value: t.name, ty: "i1" };
+    }
+    return running;
+}
+fn parse_or(state: GenState, toks: string, pos: i64): TokResult {
+    let left: TokResult = parse_and(state, toks, pos);
+    let running = left;
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, running.pos);
+        if tok != "||" {
+            break;
+        }
+        let lc: TokResult = coerce_value(running.state, running.value, running.ty, "i1");
+        let slot: NameResult = st_new_temp(lc.state);
+        let s1: GenState = st_alloc(slot.state, slot.name + " = alloca i1");
+        let s2: GenState = st_emit(s1, "store i1 " + lc.value + ", ptr " + slot.name);
+        let rhs_l: NameResult = st_new_label(s2, "lor.rhs.");
+        let done_l: NameResult = st_new_label(rhs_l.state, "lor.end.");
+        let s3: GenState = st_terminate(done_l.state, "br i1 " + lc.value + ", label %" + done_l.name + ", label %" + rhs_l.name);
+        let s4: GenState = st_label(s3, rhs_l.name);
+        let right: TokResult = parse_and(s4, toks, tok_next(toks, running.pos));
+        let rc: TokResult = coerce_value(right.state, right.value, right.ty, "i1");
+        let s5: GenState = st_emit(rc.state, "store i1 " + rc.value + ", ptr " + slot.name);
+        let s6: GenState = st_terminate(s5, "br label %" + done_l.name);
+        let s7: GenState = st_label(s6, done_l.name);
+        let t: NameResult = st_new_temp(s7);
+        let s8: GenState = st_emit(t.state, t.name + " = load i1, ptr " + slot.name);
+        running = TokResult { state: s8, pos: right.pos, value: t.name, ty: "i1" };
+    }
+    return running;
+}
+
+// ---- line-based lowering -----------------------------------------------------
+
+// Position of a top-level `=` that ends an addressable left side, or -1.
+// Only forms starting with an identifier and reaching the `=` through `[...]`
+// or `.field` qualify; a plain `x = ...` is handled earlier and left alone.
+fn index_assign_pos(toks: string): i64 {
+    let depth: i64 = 0;
+    let saw_place: bool = false;
+    let p = tok_next(toks, 0);
+    let guard: i64 = 0;
+    while guard < 10000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, p);
+        if tok == "" {
+            return -1;
+        }
+        if tok == "[" {
+            depth = depth + 1;
+            saw_place = true;
+        }
+        if tok == "." {
+            saw_place = true;
+        }
+        if tok == "]" || tok == ")" || tok == "}" {
+            if depth == 0 {
+                return -1;
+            }
+            depth = depth - 1;
+        }
+        if tok == "(" {
+            depth = depth + 1;
+        }
+        if tok == "=" && depth == 0 {
+            if saw_place {
+                let after = tok_peek(toks, tok_next(toks, p));
+                if after != "=" {
+                    return p;
+                }
+            }
+            return -1;
+        }
+        p = tok_next(toks, p);
+    }
+    return -1;
+}
+
+// Store the right side into an addressable place: `arr[i] = v`, `s.f = v`.
+fn lower_place_store(state: GenState, toks: string, text: string): GenState {
+    let eq = index_assign_pos(toks);
+    if eq < 0 {
+        return state;
+    }
+    let place: Place = parse_place(state, toks, 0);
+    if place.slot == "" {
+        return place.state;
+    }
+    let rhs: TokResult = parse_or(place.state, toks, tok_next(toks, eq));
+    let coerced: TokResult = coerce_value(rhs.state, rhs.value, rhs.ty, place.ty);
+    return st_emit(coerced.state, "store " + place.ty + " " + coerced.value + ", ptr " + place.slot);
+}
+
+fn lower_line_expr(state: GenState, tree: string, index: i64): LineResult {
+    let line = line_at(tree, index);
+    if starts_with_at(line, 0, "Binary ") {
+        let op = substring(line, 7, len(line) - 7);
+        let left_line = line_at(tree, next_line_index(tree, index));
+        let right_line = line_at(tree, next_line_index(tree, next_line_index(tree, index)));
+        let left: TokResult = parse_primary(state, tokenize_flat(substring(left_line, 5, len(left_line) - 5)), 0);
+        let right: TokResult = parse_primary(left.state, tokenize_flat(substring(right_line, 6, len(right_line) - 6)), 0);
+        let combined: EmitResult = emit_binop(right.state, op, left, right);
+        return LineResult { state: combined.state, next: next_line_index(tree, next_line_index(tree, next_line_index(tree, index))), value: combined.value, ty: combined.ty };
+    }
+    let text = line;
+    if starts_with_at(line, 0, "Expr ") {
+        text = substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Call ") {
+        text = substring(line, 5, len(line) - 5);
+    }
+    // `lhs = rhs` is a statement, not an expression: route it through the
+    // statement lowering, otherwise the right-hand side is silently dropped
+    // and the assignment degenerates into a self-store.
+    let toks_stmt = tokenize_flat(text);
+    let s0 = tok_peek(toks_stmt, 0);
+    let s1 = tok_peek(toks_stmt, tok_next(toks_stmt, 0));
+    let s2 = tok_peek(toks_stmt, tok_next(toks_stmt, tok_next(toks_stmt, 0)));
+    if is_identifier(s0) && s1 == "=" && s2 != "=" {
+        let s: GenState = lower_stmt_text(state, text);
+        return LineResult { state: s, next: next_line_index(tree, index), value: "0", ty: "void" };
+    }
+    // `arr[i] = rhs` (or `s.field = rhs`): the left side is an addressable
+    // place, not a scalar. Without this branch the whole statement fell through
+    // to parse_or, which parsed the left side as a load and dropped the store -
+    // the program then ran and printed the pre-assignment value.
+    if is_identifier(s0) && index_assign_pos(toks_stmt) >= 0 {
+        let s: GenState = lower_place_store(state, toks_stmt, text);
+        return LineResult { state: s, next: next_line_index(tree, index), value: "0", ty: "void" };
+    }
+    let r: TokResult = parse_or(state, toks_stmt, 0);
+    return LineResult { state: r.state, next: next_line_index(tree, index), value: r.value, ty: r.ty };
+}
+
+// ---- fixed-array literals --------------------------------------------------
+//
+// `let nums = [10, 20, 30];` has no value-level representation in this backend:
+// aggregates are never loaded into SSA values, only addressed. So the literal is
+// lowered straight into a slot - `alloca [3 x i64]` plus one store per element -
+// and the symbol table records the array type plus that slot. Reads then go
+// through `getelementptr` in parse_place.
+//
+// Counting the elements before allocating is what lets the alloca carry the
+// right size: `alloca [<n> x <ty>]` needs n up front.
+
+// Number of top-level elements between the `[` at open_pos and its `]`.
+fn count_array_elems(toks: string, open_pos: i64): i64 {
+    let depth: i64 = 0;
+    let count: i64 = 0;
+    let seen: bool = false;
+    let p = tok_next(toks, open_pos);
+    let guard: i64 = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, p);
+        if tok == "" {
+            if seen {
+                return count + 1;
+            }
+            return 0;
+        }
+        if tok == "[" || tok == "(" || tok == "{" {
+            depth = depth + 1;
+            if depth == 1 {
+                seen = true;
+            }
+        }
+        if tok == "]" || tok == ")" || tok == "}" {
+            if depth == 0 {
+                if seen {
+                    return count + 1;
+                }
+                return 0;
+            }
+            depth = depth - 1;
+        }
+        if depth == 0 {
+            if tok == "," {
+                count = count + 1;
+            } else {
+                seen = true;
+            }
+        }
+        p = tok_next(toks, p);
+    }
+    return count;
+}
+
+// Store one element through a constant index GEP.
+fn store_array_elem(state: GenState, slot: string, arr_ty: string, elem_ty: string, index: i64, value: string, value_ty: string): GenState {
+    let coerced: TokResult = coerce_value(state, value, value_ty, elem_ty);
+    let t: NameResult = st_new_temp(coerced.state);
+    let gep = t.name + " = getelementptr " + arr_ty + ", ptr " + slot + ", i32 0, i64 " + number_to_text(index);
+    let s: GenState = st_emit(t.state, gep);
+    return st_emit(s, "store " + elem_ty + " " + coerced.value + ", ptr " + t.name);
+}
+
+// Lower `let <name> = [a, b, c];` starting at the `[`.
+fn lower_let_array(state: GenState, toks: string, name: string, open_pos: i64): GenState {
+    let n = count_array_elems(toks, open_pos);
+    let first: TokResult = parse_or(state, toks, tok_next(toks, open_pos));
+    let elem_ty = first.ty;
+    if n == 0 {
+        elem_ty = "i64";
+    }
+    let arr_ty = "[" + number_to_text(n) + " x " + elem_ty + "]";
+    let slot: NameResult = st_new_temp(first.state);
+    let s: GenState = st_alloc(slot.state, slot.name + " = alloca " + arr_ty);
+    let cursor = first.pos;
+    let k: i64 = 0;
+    let elem_value = first.value;
+    let elem_type = first.ty;
+    while k < n {
+        if k > 0 {
+            elem_value = "0";
+            elem_type = "i64";
+            if tok_peek(toks, cursor) == "," {
+                let e: TokResult = parse_or(s, toks, tok_next(toks, cursor));
+                s = e.state;
+                cursor = e.pos;
+                elem_value = e.value;
+                elem_type = e.ty;
+            }
+        }
+        s = store_array_elem(s, slot.name, arr_ty, elem_ty, k, elem_value, elem_type);
+        k = k + 1;
+    }
+    return st_put_sym(s, name, arr_ty, slot.name);
+}
+
+// Position of the token just after the `=` in a `let`/`const` statement, or -1.
+// Skips an optional `: type` annotation, whose tokens must not be mistaken for
+// the initialiser - `let i: i64 = 0` previously lowered as if the initialiser
+// were the type spelling, which silently produced 0.
+fn let_value_pos(toks: string): i64 {
+    let p = tok_next(toks, 0);
+    p = tok_next(toks, p);
+    let depth: i64 = 0;
+    let guard: i64 = 0;
+    while guard < 10000 {
+        guard = guard + 1;
+        let tok = tok_peek(toks, p);
+        if tok == "" {
+            return -1;
+        }
+        if tok == "[" || tok == "(" || tok == "{" {
+            depth = depth + 1;
+        }
+        if tok == "]" || tok == ")" || tok == "}" {
+            if depth == 0 {
+                return -1;
+            }
+            depth = depth - 1;
+        }
+        if tok == "=" && depth == 0 {
+            return tok_next(toks, p);
+        }
+        p = tok_next(toks, p);
+    }
+    return -1;
+}
+
+fn lower_stmt_text(state: GenState, text: string): GenState {
+    if text == "" {
+        return state;
+    }
+    let toks = tokenize_flat(text);
+    let tok0 = tok_peek(toks, 0);
+    let tok1 = tok_peek(toks, tok_next(toks, 0));
+    let tok2 = tok_peek(toks, tok_next(toks, tok_next(toks, 0)));
+    if tok0 == "let" || tok0 == "const" {
+        let name = tok1;
+        let vpos = let_value_pos(toks);
+        if vpos >= 0 {
+            if tok_peek(toks, vpos) == "[" {
+                return lower_let_array(state, toks, name, vpos);
+            }
+        }
+        let value: TokResult = parse_or(state, toks, tok_next(toks, tok_next(toks, tok_next(toks, 0))));
+        let slot: NameResult = st_new_temp(value.state);
+        let s: GenState = st_alloc(slot.state, slot.name + " = alloca " + value.ty);
+        let s2: GenState = st_emit(s, "store " + value.ty + " " + value.value + ", ptr " + slot.name);
+        return st_put_sym(s2, name, value.ty, slot.name);
+    }
+    if tok1 == "=" && tok2 != "=" {
+        let name = tok0;
+        let value: TokResult = parse_or(state, toks, tok_next(toks, tok_next(toks, 0)));
+        let lookup = st_find_sym(value.state, name);
+        if lookup != "" {
+            let colon = find_char(lookup, 0, ':');
+            let ty = substring(lookup, 0, colon);
+            let slot = substring(lookup, colon + 1, len(lookup) - colon - 1);
+            let coerced: TokResult = coerce_value(value.state, value.value, value.ty, ty);
+            return st_emit(coerced.state, "store " + ty + " " + coerced.value + ", ptr " + slot);
+        }
+        return value.state;
+    }
+    let r: TokResult = parse_or(state, toks, 0);
+    return r.state;
+}
+
+fn if_has_else(tree: string, if_index: i64): bool {
+    let depth: i64 = 1;
+    let i = next_line_index(tree, if_index);
+    let n = len(tree);
+    while i < n {
+        let line = line_at(tree, i);
+        if line == "If" || line == "While" || line == "For" {
+            depth = depth + 1;
+        }
+        if line == "EndIf" || line == "EndWhile" || line == "EndFor" {
+            depth = depth - 1;
+            if depth == 0 {
+                return false;
+            }
+        }
+        if depth == 1 && line == "Else" {
+            return true;
+        }
+        i = next_line_index(tree, i);
+    }
+    return false;
+}
+
+// ---- module assembly -------------------------------------------------------
+
+fn ir_runtime_decls(structs: string): string {
+    let out = "; generated by the miko stage1 LLVM IR backend\n";
+    if structs != "" {
+        out = append_str(out, struct_type_decls(structs) + "\n");
+    }
+    out = append_str(out, "declare void @miko_set_args(i32, ptr)\n");
+    out = append_str(out, "declare i64 @miko_arg_count()\n");
+    out = append_str(out, "declare ptr @miko_arg_at(i64)\n");
+    out = append_str(out, "declare void @miko_print_i64(i64)\n");
+    out = append_str(out, "declare void @miko_print_bool(i32)\n");
+    out = append_str(out, "declare void @miko_print_str(ptr)\n");
+    out = append_str(out, "declare void @miko_print_char(i32)\n");
+    out = append_str(out, "declare ptr @miko_str_concat(ptr, ptr)\n");
+    out = append_str(out, "declare ptr @miko_str_append(ptr, ptr)\n");
+    out = append_str(out, "declare i32 @miko_char_at(ptr, i64)\n");
+    out = append_str(out, "declare ptr @miko_substring(ptr, i64, i64)\n");
+    out = append_str(out, "declare ptr @miko_read_file(ptr)\n");
+    out = append_str(out, "declare void @miko_write_file(ptr, ptr)\n");
+    out = append_str(out, "declare ptr @miko_input()\n");
+    out = append_str(out, "declare i32 @miko_str_cmp(ptr, ptr)\n");
+    out = append_str(out, "declare i64 @miko_str_len(ptr)\n");
+    out = append_str(out, "declare void @exit(i32)\n");
+    out = append_str(out, "declare void @miko_eprint_str(ptr)\n");
+    out = append_str(out, "declare void @miko_eprint_i64(i64)\n");
+    out = append_str(out, "declare i32 @miko_run_command(ptr)\n");
+    out = append_str(out, "declare i32 @miko_file_exists(ptr)\n");
+    out = append_str(out, "declare i64 @miko_mono_ms()\n");
+    out = append_str(out, "declare i64 @miko_clock_ms()\n");
+    out = append_str(out, "declare void @miko_seed_i64(i64)\n");
+    out = append_str(out, "declare i64 @miko_rand_i64()\n");
+    out = append_str(out, "declare ptr @miko_to_string_i64(i64)\n");
+    out = append_str(out, "declare ptr @miko_to_string_bool(i32)\n");
+    out = append_str(out, "declare ptr @miko_to_string_char(i32)\n");
+    out = append_str(out, "declare i64 @miko_str_to_i64(ptr)\n");
+    out = append_str(out, "declare i64 @miko_str_index_of(ptr, ptr)\n");
+    out = append_str(out, "declare i32 @miko_str_contains(ptr, ptr)\n");
+    out = append_str(out, "declare void @miko_print_f64(double)\n");
+    out = append_str(out, "declare ptr @miko_to_string_f64(double)\n");
+    out = append_str(out, "declare double @miko_str_to_f64(ptr)\n");
+    out = append_str(out, "declare double @sqrt(double)\n");
+    out = append_str(out, "declare double @floor(double)\n");
+    out = append_str(out, "declare double @ceil(double)\n");
+    out = append_str(out, "declare double @round(double)\n");
+    out = append_str(out, "\n");
+    return out;
+}
+
+// Queues an alloca in the function's entry block instead of emitting it where
+// the variable is declared. LLVM allocates storage when the alloca executes,
+// so an alloca inside a loop body would grow the stack on every iteration and
+// eventually overflow it; the entry block runs exactly once per call.
+fn st_alloc(state: GenState, line: string): GenState {
+    return GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas + "    " + line + "\n",
+        fn_start: state.fn_start
+    };
+}
+
+// Emits a function header and pins the body start, so the entry-block allocas
+// collected while lowering the body can be spliced in front of it later.
+fn st_begin_function(state: GenState, name: string, ret_ty: string, params: string, is_main: bool): GenState {
+    // A function body starts with no open blocks, so the block stacks are
+    // cleared here. Symbol keys carry a depth taken from their length, and any
+    // path that ends a body without popping (a `return` inside an `if`, for
+    // one) would otherwise leak depth into the next function: its parameters
+    // would be stored at @1 while lookups start at @0 and fall through to a
+    // same-named leftover from an earlier function, with the wrong type.
+    let base: GenState = GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: "",
+        ifs: "",
+        terminated: false,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+    let s = base;
+    if is_main {
+        s = st_emit_raw(s, "define i32 @main(i32 %argc, ptr %argv) {");
+        s = st_set_fn_start(s);
+        s = st_emit(s, "call void @miko_set_args(i32 %argc, ptr %argv)");
+    } else {
+        s = st_emit_raw(s, "define " + ret_ty + " @" + name + "(" + param_names_parts(params) + ") {");
+        s = st_set_fn_start(s);
+    }
+    return s;
+}
+
+fn st_set_fn_start(state: GenState): GenState {
+    return GenState {
+        out: state.out,
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: state.syms,
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: state.loops,
+        ifs: state.ifs,
+        terminated: state.terminated,
+        structs: state.structs,
+        module: state.module,
+        allocas: "",
+        fn_start: len(state.out)
+    };
+}
+
+// Splices the queued entry-block allocas into the body right after the header.
+fn splice_allocas(body: string, allocas: string, fn_start: i64): string {
+    if allocas == "" {
+        return body;
+    }
+    let n = len(body);
+    let at = fn_start;
+    if at < 0 || at > n {
+        at = n;
+    }
+    return substring(body, 0, at) + allocas + substring(body, at, n - at);
+}
+
+fn st_close_function(state: GenState, ret_ty: string): GenState {
+    let body = state.out;
+    if !state.terminated {
+        if ret_ty == "void" {
+            body = append_str(body, "    ret void\n");
+        } else {
+            if ret_ty == "ptr" {
+                body = append_str(body, "    ret ptr null\n");
+            } else {
+                body = append_str(body, "    ret " + ret_ty + " 0\n");
+            }
+        }
+    }
+    body = splice_allocas(body, state.allocas, state.fn_start);
+    return GenState {
+        out: body + "}\n\n",
+        globals: state.globals,
+        temp: state.temp,
+        label: state.label,
+        syms: "",
+        funcs: state.funcs,
+        enums: state.enums,
+        loops: "",
+        ifs: "",
+        terminated: false,
+        structs: state.structs,
+        module: state.module,
+        allocas: state.allocas,
+        fn_start: state.fn_start
+    };
+}
+
+fn param_names_parts(params: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(params);
+    let first = true;
+    while i < n {
+        let line_end = find_char(params, i, '\n');
+        let line = substring(params, i, line_end - i);
+        if line != "" {
+            let colon = find_char(line, 0, ':');
+            let name = substring(line, 0, colon);
+            let ty = substring(line, colon + 1, len(line) - colon - 1);
+            if !first {
+                out = append_str(out, ", ");
+            }
+            first = false;
+            out = append_str(out, ty + " %" + name);
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return out;
+}
+
+fn st_open_function(state: GenState, name: string, ret_ty: string, params: string): GenState {
+    let s: GenState = st_begin_function(state, name, ret_ty, params, false);
+    let i: i64 = 0;
+    let n = len(params);
+    while i < n {
+        let line_end = find_char(params, i, '\n');
+        let line = substring(params, i, line_end - i);
+        if line != "" {
+            let colon = find_char(line, 0, ':');
+            let pname = substring(line, 0, colon);
+            let pty = substring(line, colon + 1, len(line) - colon - 1);
+            let slot = "%" + pname + ".a";
+            s = st_alloc(s, slot + " = alloca " + pty);
+            s = st_emit(s, "store " + pty + " %" + pname + ", ptr " + slot);
+            s = st_put_sym(s, pname, pty, slot);
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return s;
+}
+
+pub fn generate_ir(tree_input: string): string {
+    let enums = collect_enums(tree_input);
+    let tree = rewrite_enum_types(tree_input, enums);
+    let structs_table = collect_structs(tree);
+    let funcs = collect_funcs(tree, structs_table);
+
+    let state = GenState {
+        out: "",
+        globals: ir_runtime_decls(structs_table),
+        temp: 0,
+        label: 0,
+        syms: "",
+        funcs: funcs,
+        enums: enums,
+        loops: "",
+        ifs: "",
+        terminated: false,
+        structs: structs_table,
+        module: "",
+        allocas: "",
+        fn_start: 0
+    };
+
+    let cur_fn = "";
+    let cur_rt = "void";
+    let cur_params = "";
+    let header_open = false;
+
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = line_at(tree, i);
+
+        if starts_with_at(line, 0, "Module ") {
+            state = GenState {
+                out: state.out,
+                globals: state.globals,
+                temp: state.temp,
+                label: state.label,
+                syms: state.syms,
+                funcs: state.funcs,
+                enums: state.enums,
+                loops: state.loops,
+                ifs: state.ifs,
+                terminated: state.terminated,
+                structs: state.structs,
+                module: substring(line, 7, len(line) - 7),
+                allocas: state.allocas,
+                fn_start: state.fn_start
+            };
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if starts_with_at(line, 0, "Function ") {
+            if cur_fn != "" {
+                state = st_close_function(state, cur_rt);
+            }
+            cur_fn = mangle_name(state, substring(line, 9, len(line) - 9));
+            if cur_fn == "main" {
+                cur_rt = "i32";
+            } else {
+                cur_rt = "void";
+            }
+            cur_params = "";
+            header_open = false;
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if starts_with_at(line, 0, "Param ") {
+            let colon = find_char(line, 0, ':');
+            let pname = substring(line, 6, colon - 6);
+            let pty = ir_type_for_table(state.structs, trim_spaces(substring(line, colon + 2, len(line) - colon - 2)));
+            cur_params = cur_params + pname + ":" + pty + "\n";
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if starts_with_at(line, 0, "ReturnType ") {
+            if cur_fn != "main" {
+                cur_rt = ir_type_for_table(state.structs, substring(line, 11, len(line) - 11));
+            }
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if starts_with_at(line, 0, "Let ") || starts_with_at(line, 0, "Const ") {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            let name_at = 4;
+            if starts_with_at(line, 0, "Const ") {
+                name_at = 6;
+            }
+            let name = substring(line, name_at, len(line) - name_at);
+            let ty = "";
+            let cursor = next_line_index(tree, i);
+            let type_line = line_at(tree, cursor);
+            if starts_with_at(type_line, 0, "Type ") {
+                ty = ir_type_for_table(state.structs, substring(type_line, 5, len(type_line) - 5));
+                cursor = next_line_index(tree, cursor);
+            }
+            let value_line = line_at(tree, cursor);
+            let has_value = starts_with_at(value_line, 0, "Expr ") || starts_with_at(value_line, 0, "Call ") || starts_with_at(value_line, 0, "Binary ");
+            // A fixed-array initialiser has no scalar value: it is lowered into
+            // a slot of its own, so it must bypass the alloca/store path below.
+            let value_text_raw = value_line;
+            if starts_with_at(value_line, 0, "Expr ") {
+                value_text_raw = substring(value_line, 5, len(value_line) - 5);
+            }
+            let arr_toks = tokenize_flat(value_text_raw);
+            if has_value && tok_peek(arr_toks, 0) == "[" {
+                state = lower_let_array(state, arr_toks, name, 0);
+                i = next_line_index(tree, cursor);
+                continue;
+            }
+            let final_ty = ty;
+            if ty == "" && !has_value {
+                final_ty = "i64";
+            }
+            let value: LineResult = lower_line_expr(state, tree, cursor);
+            let slot: NameResult = st_new_temp(value.state);
+            let value_text = value.value;
+            if ty != "" {
+                let coerced: TokResult = coerce_value(slot.state, value.value, value.ty, ty);
+                value_text = coerced.value;
+                state = coerced.state;
+            } else {
+                final_ty = value.ty;
+                state = slot.state;
+            }
+            if !has_value {
+                final_ty = "i64";
+                value_text = "0";
+            }
+            let s1: GenState = st_alloc(state, slot.name + " = alloca " + final_ty);
+            let s2: GenState = st_emit(s1, "store " + final_ty + " " + value_text + ", ptr " + slot.name);
+            state = st_put_sym(s2, name, final_ty, slot.name);
+            if has_value {
+                i = value.next;
+            } else {
+                i = next_line_index(tree, i);
+            }
+            continue;
+        }
+
+        if starts_with_at(line, 0, "Assign ") {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            // The assignment itself is carried by the child `Expr lhs = rhs`
+            // line, which lower_line_expr routes through lower_stmt_text. This
+            // line only opens the function body, so the statement is lowered
+            // exactly once.
+            let child_i = next_line_index(tree, i);
+            let value: LineResult = lower_line_expr(state, tree, child_i);
+            state = value.state;
+            i = next_line_index(tree, child_i);
+            continue;
+        }
+
+        if line == "Return" {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            let j = next_line_index(tree, i);
+            let value_line = line_at(tree, j);
+            let has_value = starts_with_at(value_line, 0, "Expr ") || starts_with_at(value_line, 0, "Call ") || starts_with_at(value_line, 0, "Binary ");
+            if has_value {
+                let value: LineResult = lower_line_expr(state, tree, j);
+                let coerced: TokResult = coerce_value(value.state, value.value, value.ty, cur_rt);
+                if !coerced.state.terminated {
+                    state = st_terminate(coerced.state, "ret " + cur_rt + " " + coerced.value);
+                } else {
+                    state = coerced.state;
+                }
+                i = value.next;
+            } else {
+                if !state.terminated {
+                    if cur_rt == "void" {
+                        state = st_terminate(state, "ret void");
+                    } else {
+                        state = st_terminate(state, "ret " + cur_rt + " 0");
+                    }
+                }
+                i = j;
+            }
+            continue;
+        }
+
+        if line == "If" {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            let has_else = if_has_else(tree, i);
+            let cond_index = next_line_index(tree, next_line_index(tree, i));
+            let cond: LineResult = lower_line_expr(state, tree, cond_index);
+            let then_l: NameResult = st_new_label(cond.state, "if.then.");
+            let else_l: NameResult = st_new_label(then_l.state, "if.else.");
+            let end_l: NameResult = st_new_label(else_l.state, "if.end.");
+            // The three fresh labels consumed three ids; keep them so sibling
+            // and nested blocks get fresh names instead of reusing if.then.0.
+            state = end_l.state;
+            let false_label = end_l.name;
+            if has_else {
+                false_label = else_l.name;
+            }
+            state = st_terminate(state, "br i1 " + cond.value + ", label %" + then_l.name + ", label %" + false_label);
+            state = st_label(state, then_l.name);
+            state = st_push_if(state, end_l.name, else_l.name);
+            i = cond.next;
+            continue;
+        }
+
+        if line == "Else" {
+            let top = st_top_stack(state, 1);
+            let space = find_char(top, 0, ' ');
+            let end_label = substring(top, 0, space);
+            let else_label = substring(top, space + 1, len(top) - space - 1);
+            if !state.terminated {
+                state = st_terminate(state, "br label %" + end_label);
+            }
+            state = st_label(state, else_label);
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if line == "EndIf" {
+            let top = st_top_stack(state, 1);
+            let space = find_char(top, 0, ' ');
+            let end_label = substring(top, 0, space);
+            state = st_label(state, end_label);
+            state = st_pop_stack(state, 1);
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if line == "While" {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            let cond_l: NameResult = st_new_label(state, "while.cond.");
+            let body_l: NameResult = st_new_label(cond_l.state, "while.body.");
+            let end_l: NameResult = st_new_label(body_l.state, "while.end.");
+            state = end_l.state;
+            if !state.terminated {
+                state = st_terminate(state, "br label %" + cond_l.name);
+            }
+            state = st_label(state, cond_l.name);
+            let cond_index = next_line_index(tree, next_line_index(tree, i));
+            let cond: LineResult = lower_line_expr(state, tree, cond_index);
+            // The condition's own instructions live in cond.state; dropping
+            // them would branch on a value that was never defined.
+            state = cond.state;
+            if !state.terminated {
+                state = st_terminate(state, "br i1 " + cond.value + ", label %" + body_l.name + ", label %" + end_l.name);
+            }
+            state = st_label(state, body_l.name);
+            state = st_push_loop(state, end_l.name, cond_l.name, cond_l.name, "-");
+            i = cond.next;
+            continue;
+        }
+
+        if line == "EndWhile" {
+            let top = st_top_stack(state, 0);
+            let space1 = find_char(top, 0, ' ');
+            let space2 = find_char(top, space1 + 1, ' ');
+            let break_label = substring(top, 0, space1);
+            let cond_label = substring(top, space1 + 1, space2 - space1 - 1);
+            if !state.terminated {
+                state = st_terminate(state, "br label %" + cond_label);
+            }
+            state = st_label(state, break_label);
+            state = st_pop_stack(state, 0);
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if line == "For" {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            // The dump nests the header fields as five lines below "For":
+            //   For / Header / ForInit / ForCondition / ForStep / Body / <stmts> / EndFor
+            // `i` is a BYTE index into the tree, so the fields must be reached by
+            // walking line by line. Adding small byte offsets stayed inside the
+            // "For" line itself, every starts_with check failed, cond_text came
+            // out empty and the loop was emitted with a constant true condition
+            // - an infinite loop.
+            let init_ptr = next_line_index(tree, next_line_index(tree, i));
+            let cond_ptr = next_line_index(tree, init_ptr);
+            let step_ptr = next_line_index(tree, cond_ptr);
+            let body_ptr = next_line_index(tree, step_ptr);
+            let init_line = line_at(tree, init_ptr);
+            let cond_line = line_at(tree, cond_ptr);
+            let step_line = line_at(tree, step_ptr);
+            let init_text = "";
+            let cond_text = "";
+            let step_text = "";
+            if starts_with_at(init_line, 0, "ForInit ") {
+                init_text = substring(init_line, 8, len(init_line) - 8);
+            }
+            if starts_with_at(cond_line, 0, "ForCondition ") {
+                cond_text = substring(cond_line, 13, len(cond_line) - 13);
+            }
+            if starts_with_at(step_line, 0, "ForStep ") {
+                step_text = substring(step_line, 8, len(step_line) - 8);
+            }
+            state = lower_stmt_text(state, init_text);
+            let cond_l: NameResult = st_new_label(state, "for.cond.");
+            let body_l: NameResult = st_new_label(cond_l.state, "for.body.");
+            let step_l: NameResult = st_new_label(body_l.state, "for.step.");
+            let end_l: NameResult = st_new_label(step_l.state, "for.end.");
+            state = end_l.state;
+            if !state.terminated {
+                state = st_terminate(state, "br label %" + cond_l.name);
+            }
+            state = st_label(state, cond_l.name);
+            let cond_value = "1";
+            let cond_ty = "i1";
+            if cond_text != "" {
+                let r: TokResult = parse_or(state, tokenize_flat(cond_text), 0);
+                let coerced: TokResult = coerce_value(r.state, r.value, r.ty, "i1");
+                cond_value = coerced.value;
+                cond_ty = coerced.ty;
+                state = coerced.state;
+            }
+            if !state.terminated {
+                state = st_terminate(state, "br i1 " + cond_value + ", label %" + body_l.name + ", label %" + end_l.name);
+            }
+            state = st_label(state, body_l.name);
+            state = st_push_loop(state, end_l.name, cond_l.name, step_l.name, step_text);
+            i = next_line_index(tree, body_ptr);
+            continue;
+        }
+
+        if line == "EndFor" {
+            let top = st_top_stack(state, 0);
+            let space1 = find_char(top, 0, ' ');
+            let space2 = find_char(top, space1 + 1, ' ');
+            let space3 = find_char(top, space2 + 1, ' ');
+            let break_label = substring(top, 0, space1);
+            let cond_label = substring(top, space1 + 1, space2 - space1 - 1);
+            let continue_label = substring(top, space2 + 1, space3 - space2 - 1);
+            let step_text = substring(top, space3 + 1, len(top) - space3 - 1);
+            if !state.terminated {
+                state = st_terminate(state, "br label %" + continue_label);
+            }
+            state = st_label(state, continue_label);
+            if step_text != "-" {
+                state = lower_stmt_text(state, step_text);
+            }
+            if !state.terminated {
+                state = st_terminate(state, "br label %" + cond_label);
+            }
+            state = st_label(state, break_label);
+            state = st_pop_stack(state, 0);
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if line == "break" || line == "continue" {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            let top = st_top_stack(state, 0);
+            let space1 = find_char(top, 0, ' ');
+            let space2 = find_char(top, space1 + 1, ' ');
+            let space3 = find_char(top, space2 + 1, ' ');
+            let break_label = substring(top, 0, space1);
+            let continue_label = substring(top, space2 + 1, space3 - space2 - 1);
+            let target = break_label;
+            if line == "continue" {
+                target = continue_label;
+            }
+            if !state.terminated && target != "" {
+                state = st_terminate(state, "br label %" + target);
+            }
+            i = next_line_index(tree, i);
+            continue;
+        }
+
+        if starts_with_at(line, 0, "Expr ") || starts_with_at(line, 0, "Call ") || starts_with_at(line, 0, "Binary ") {
+            if !header_open {
+                if cur_fn == "main" {
+                    state = st_begin_function(state, "main", "i32", "", true);
+                    cur_rt = "i32";
+                } else {
+                    state = st_open_function(state, cur_fn, cur_rt, cur_params);
+                }
+                header_open = true;
+            }
+            let value: LineResult = lower_line_expr(state, tree, i);
+            state = value.state;
+            i = value.next;
+            continue;
+        }
+
+        i = next_line_index(tree, i);
+    }
+
+    let final_state = state;
+    if cur_fn != "" {
+        // The function header is emitted lazily, when the first statement that
+        // needs a body is lowered. A function whose body is empty never hits
+        // that path, so closing it emitted `ret` and `}` with no `define` line
+        // in front - clang then rejected the file with "expected top-level
+        // entity". `fn main() { }` was enough to trigger it.
+        if !header_open {
+            if cur_fn == "main" {
+                final_state = st_begin_function(final_state, "main", "i32", "", true);
+            } else {
+                final_state = st_open_function(final_state, cur_fn, cur_rt, cur_params);
+            }
+        }
+        final_state = st_close_function(final_state, cur_rt);
+    }
+
+    return final_state.globals + "\n" + final_state.out;
+}

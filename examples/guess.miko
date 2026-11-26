@@ -1,0 +1,70 @@
+fn parse_int(s: string): i64 {
+    let n = len(s);
+    let i: i64 = 0;
+    while i < n && char_at(s, i) == ' ' {
+        i = i + 1;
+    }
+    let sign: i64 = 1;
+    if i < n && char_at(s, i) == '-' {
+        sign = -1;
+        i = i + 1;
+    }
+    let value: i64 = 0;
+    while i < n && char_at(s, i) >= '0' && char_at(s, i) <= '9' {
+        let digit = char_at(s, i) - '0';
+        value = value * 10 + digit;
+        i = i + 1;
+    }
+    return sign * value;
+}
+
+fn to_str(n: i64): string {
+    if n == 0 {
+        return "0";
+    }
+    let neg = n < 0;
+    let m = n;
+    if neg {
+        m = -m;
+    }
+    let out = "";
+    while m > 0 {
+        let d = m % 10;
+        m = m / 10;
+        // Miko: char + string is not allowed; substring the digit out of the table.
+        out = substring("0123456789", d, 1) + out;
+    }
+    if neg {
+        out = "-" + out;
+    }
+    return out;
+}
+
+fn main() {
+    let answer: i64 = 42;
+    let attempts: i64 = 0;
+    print("guess the number (1-100, answer is 42):");
+    while true {
+        let s = input();
+        let g = parse_int(s);
+        if g == 0 {
+            print("that's not a number, try 1-100");
+            continue;
+        }
+        if g < 1 || g > 100 {
+            print("out of range, try 1-100");
+            continue;
+        }
+        attempts = attempts + 1;
+        if g == answer {
+            print("correct in " + to_str(attempts) + " tries!");
+            break;
+        }
+        if g < answer {
+            print("too small, guess bigger");
+        } else {
+            print("too big, guess smaller");
+        }
+        print("guess the number:");
+    }
+}

@@ -1,0 +1,19 @@
+// clock_ms / mono_ms: wall-clock epoch milliseconds + monotonic milliseconds.
+fn fib(n: i64): i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    print(clock_ms() > 1600000000000);
+
+    let start = mono_ms();
+    print(fib(20));
+    let elapsed = mono_ms() - start;
+    print(elapsed >= 0);
+
+    // A tiny self-timing report, the kind a self-hosting compiler prints.
+    print("compile-like workload took " + to_string_i64(elapsed) + " ms");
+}

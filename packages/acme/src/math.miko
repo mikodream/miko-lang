@@ -1,0 +1,7 @@
+fn adjust(value: i32): i32 {
+    return value + 1;
+}
+
+pub fn triple(value: i32): i32 {
+    return adjust(value) * 3;
+}

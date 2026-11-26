@@ -1,0 +1,16 @@
+// A string may hold NUL bytes: read_file of a binary gives back exactly the
+// bytes in the file, and length is carried explicitly rather than inferred from
+// a terminator. Everything that used to walk to a NUL - len, compare, search -
+// has to use the length instead, otherwise "abc\0xyz" would look like "abc".
+//
+// 19_embedded_nul.bin is 7 bytes: 61 62 63 00 78 79 7A.
+fn main() {
+    let s = read_file("tests/diff/19_embedded_nul.bin");
+    print(len(s));
+    print(str_index_of(s, "xyz"));
+    print(str_contains(s, "xyz"));
+    print(s == "abc");
+    print(s == s);
+    print(char_at(s, 4));
+    print(substring(s, 4, 3));
+}

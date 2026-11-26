@@ -1,0 +1,14 @@
+// 基准测试1：递归斐波那契
+// 测试函数调用开销
+
+fn fib(n: i32): i32 {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    let result = fib(30);
+    print(result);
+}

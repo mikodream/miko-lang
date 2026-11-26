@@ -1,0 +1,15 @@
+import "module_enums_lib.miko" as lib;
+
+fn pick(f: lib.Fruit): string {
+    if f == lib.Fruit::Apple {
+        return "apple";
+    }
+    return "banana";
+}
+
+fn main() {
+    let f: lib.Fruit = lib.Fruit::Banana;
+    print(f == lib.Fruit::Banana);
+    print(pick(f));
+    print(pick(lib.Fruit::Apple));
+}

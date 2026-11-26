@@ -1,0 +1,43 @@
+// enum: scoped integer constants, referenced as EnumName::Member.
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+enum Light {
+    Off,
+    On,
+}
+
+fn describe(c: Color): string {
+    if c == Color::Red {
+        return "red";
+    }
+    if c == Color::Green {
+        return "green";
+    }
+    return "blue";
+}
+
+fn next(c: Color): Color {
+    if c == Color::Red {
+        return Color::Green;
+    }
+    if c == Color::Green {
+        return Color::Blue;
+    }
+    return Color::Red;
+}
+
+fn main() {
+    let favorite: Color = Color::Green;
+    print(favorite == Color::Green);
+    print(favorite == Color::Red);
+    print(describe(favorite));
+    print(describe(next(favorite)));
+
+    let lamp = Light::On;
+    print(lamp == Light::On);
+    print(describe(Color::Blue));
+}

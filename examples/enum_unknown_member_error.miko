@@ -1,0 +1,9 @@
+enum Color {
+    Red,
+    Green,
+}
+
+fn main() {
+    let c: Color = Color::Purple;
+    print(c);
+}

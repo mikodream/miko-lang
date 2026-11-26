@@ -1,0 +1,16 @@
+fn main() {
+    print(to_string_i64(42));
+    print(to_string_i64(-7));
+    print(to_string_bool(1 < 2));
+    print(to_string_char(66));
+    print(str_to_i64("123"));
+    print(str_index_of("hello", "ll"));
+    print(str_index_of("hello", "zz"));
+    print(str_contains("hello", "ell"));
+    print(str_contains("hello", "zzz"));
+    seed_i64(7);
+    print(rand_i64());
+    print(rand_i64());
+    print(mono_ms() >= 0);
+    print(arg_count() >= 0);
+}

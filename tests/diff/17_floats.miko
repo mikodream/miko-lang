@@ -1,0 +1,21 @@
+fn main() {
+    let x: f64 = 1.5;
+    print(x);
+    print(2.25 + 0.75);
+    print(10.0 / 4.0);
+    print(3.0 * 2.0);
+    print(5.0 - 1.25);
+    print(x > 1.0);
+    print(sqrt_f64(16.0));
+    print(floor_f64(2.7));
+    print(ceil_f64(2.1));
+    print(round_f64(2.5));
+    print(f64_to_i64(3.9));
+    print(to_string_f64(1.5));
+    print(str_to_f64("2.5"));
+    print(x * 2);
+    print(1e3);
+    print(1e-5);
+    print(2.5e2);
+    print(1_000.5);
+}

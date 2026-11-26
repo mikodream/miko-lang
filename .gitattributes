@@ -1,0 +1,21 @@
+# Line endings are normalised on commit and chosen on checkout by platform.
+#
+# This matters more than it usually would. The compiler sources are lexed as text
+# and the shell script below is executed directly, so a stray CR breaks both: a
+# CRLF miko-link.sh fails on Linux with "bad interpreter", and mixed endings make
+# the .miko files disagree about what "end of line" means depending on who
+# checked them out. The repository already had one file with both endings in it.
+* text=auto eol=lf
+
+# Windows batch files are the exception: cmd.exe treats a bare LF badly in some
+# constructs, and CRLF is what it expects.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts are executed, so they must be LF and they must keep their mode.
+*.sh text eol=lf
+
+# Test fixtures are compared byte for byte against what the compiler prints, so
+# they must not be rewritten on checkout.
+*.expected -text
+*.bin -text

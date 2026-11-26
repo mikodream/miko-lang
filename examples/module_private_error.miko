@@ -1,0 +1,5 @@
+import core.math as math;
+
+fn main() {
+    print(math.pick_low(1, 2));
+}

@@ -1,0 +1,230 @@
+import "symbols.miko" as symbols;
+import "type.miko" as types;
+
+fn find_char(text: string, start: i64, target: char): i64 {
+    let i = start;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == target {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn starts_with_at(text: string, start: i64, prefix: string): bool {
+    let n = len(text);
+    let m = len(prefix);
+    if start + m > n {
+        return false;
+    }
+    return substring(text, start, m) == prefix;
+}
+
+fn trim_indent(line: string): string {
+    let i: i64 = 0;
+    let n = len(line);
+    while i < n && char_at(line, i) == ' ' {
+        i = i + 1;
+    }
+    return substring(line, i, n - i);
+}
+
+fn expr_from_line(line: string): string {
+    if starts_with_at(line, 0, "Expr ") {
+        return substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Call ") {
+        return substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Left ") {
+        return substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Right ") {
+        return substring(line, 6, len(line) - 6);
+    }
+    return line;
+}
+
+fn append_check(out: string, msg: string): string {
+    return out + "  " + msg + "\n";
+}
+
+fn binding_name_from_line(line: string): string {
+    if starts_with_at(line, 0, "Let ") {
+        return substring(line, 4, len(line) - 4);
+    }
+    if starts_with_at(line, 0, "Const ") {
+        return substring(line, 6, len(line) - 6);
+    }
+    return "";
+}
+
+fn field_type_for_expr(expr: string, locals: string): string {
+    if !contains_text(expr, ".") {
+        return types.type_unknown();
+    }
+    let dot = find_char(expr, 0, '.');
+    let base = substring(expr, 0, dot);
+    let base_type = symbols.lookup_symbol(locals, base);
+    if base_type == "Point" {
+        return types.type_i64();
+    }
+    return types.type_unknown();
+}
+
+fn contains_text(text: string, needle: string): bool {
+    let n = len(text);
+    let m = len(needle);
+    let i: i64 = 0;
+    while i + m <= n {
+        if substring(text, i, m) == needle {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn trim_right_spaces(text: string): string {
+    let end = len(text);
+    while end > 0 && char_at(text, end - 1) == ' ' {
+        end = end - 1;
+    }
+    return substring(text, 0, end);
+}
+
+// Type name of a bare `Enum :: Member` expression, or "" when the expression
+// is anything else (comparisons etc. keep their normal inference).
+fn enum_ref_type(expr: string): string {
+    if !contains_text(expr, " :: ") {
+        return "";
+    }
+    let colon = find_char(expr, 0, ':');
+    if colon == 0 {
+        return "";
+    }
+    if !starts_with_at(expr, colon, " :: ") {
+        return "";
+    }
+    let name = trim_right_spaces(substring(expr, 0, colon));
+    let member_start = colon + 4;
+    let member = substring(expr, member_start, len(expr) - member_start);
+    if name == "" || member == "" || contains_text(member, " ") {
+        return "";
+    }
+    return name;
+}
+
+fn infer_expr(expr: string, locals: string): string {
+    let inferred = types.infer_expr_type_with_symbols(expr, locals);
+    if inferred != types.type_unknown() {
+        return inferred;
+    }
+    let field_type = field_type_for_expr(expr, locals);
+    if field_type != types.type_unknown() {
+        return field_type;
+    }
+    return types.type_unknown();
+}
+
+pub fn check_program(tree: string): string {
+    let out = "Sema\n";
+    let globals = symbols.empty_symbols();
+    let locals = symbols.empty_symbols();
+    let current_function = "";
+    let pending_binding = "";
+    let pending_declared_type = "";
+    let pending_return = false;
+
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let raw = substring(tree, i, line_end - i);
+        let line = trim_indent(raw);
+
+        if starts_with_at(line, 0, "Enum ") {
+            let enum_name = substring(line, 5, len(line) - 5);
+            out = append_check(out, "Enum " + enum_name);
+        } else {
+            if starts_with_at(line, 0, "Member ") {
+                out = append_check(out, "EnumMember " + substring(line, 7, len(line) - 7));
+            } else {
+                if starts_with_at(line, 0, "Function ") {
+            current_function = substring(line, 9, len(line) - 9);
+            globals = symbols.put_symbol(globals, current_function, "fn");
+            locals = symbols.empty_symbols();
+            out = append_check(out, "Function " + current_function);
+            pending_binding = "";
+            pending_declared_type = "";
+            pending_return = false;
+        } else {
+            if starts_with_at(line, 0, "Param ") {
+                let colon = find_char(line, 0, ':');
+                let name = substring(line, 6, colon - 6);
+                let ty = substring(line, colon + 2, len(line) - colon - 2);
+                locals = symbols.put_symbol(locals, name, ty);
+                out = append_check(out, "Param " + name + ": " + ty);
+            } else {
+                if starts_with_at(line, 0, "Let ") || starts_with_at(line, 0, "Const ") {
+                    pending_binding = binding_name_from_line(line);
+                    pending_declared_type = "";
+                    out = append_check(out, "Bind " + pending_binding);
+                } else {
+                    if starts_with_at(line, 0, "Type ") && pending_binding != "" {
+                        pending_declared_type = substring(line, 5, len(line) - 5);
+                        out = append_check(out, "DeclaredType " + pending_declared_type + " for " + pending_binding);
+                    } else {
+                        if starts_with_at(line, 0, "Expr ") || starts_with_at(line, 0, "Call ") {
+                            let expr = expr_from_line(line);
+                            let inferred2 = infer_expr(expr, locals);
+                            let enum_type = enum_ref_type(expr);
+                            if enum_type != "" {
+                                inferred2 = enum_type;
+                            }
+                            out = append_check(out, "ExprType " + inferred2 + " for " + expr);
+                            if pending_binding != "" {
+                                let final_type = inferred2;
+                                if pending_declared_type != "" {
+                                    final_type = pending_declared_type;
+                                }
+                                locals = symbols.put_symbol(locals, pending_binding, final_type);
+                                out = append_check(out, "Resolved binding " + pending_binding + ": " + final_type);
+                                pending_binding = "";
+                                pending_declared_type = "";
+                            }
+                            if pending_return {
+                                out = append_check(out, "ReturnExpr " + inferred2 + " in " + current_function);
+                                pending_return = false;
+                            }
+                        } else {
+                            if starts_with_at(line, 0, "Binary ") {
+                                let op = substring(line, 7, len(line) - 7);
+                                out = append_check(out, "BinaryOp " + op);
+                            } else {
+                                if starts_with_at(line, 0, "ReturnType ") {
+                                    out = append_check(out, "ReturnType " + substring(line, 11, len(line) - 11));
+                                } else {
+                                    if starts_with_at(line, 0, "Return") {
+                                        out = append_check(out, "Return in " + current_function);
+                                        pending_return = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        }
+        }
+
+        if line_end >= n {
+            return out;
+        }
+        i = line_end + 1;
+    }
+    return out;
+}

@@ -1,0 +1,196 @@
+import "symbols.miko" as symbols;
+
+pub fn type_i32(): string {
+    return "i32";
+}
+
+pub fn type_i64(): string {
+    return "i64";
+}
+
+pub fn type_bool(): string {
+    return "bool";
+}
+
+pub fn type_string(): string {
+    return "string";
+}
+
+pub fn type_char(): string {
+    return "char";
+}
+
+pub fn type_unknown(): string {
+    return "unknown";
+}
+
+fn is_digit(ch: char): bool {
+    return ch >= '0' && ch <= '9';
+}
+
+fn is_alpha(ch: char): bool {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_';
+}
+
+fn is_alnum(ch: char): bool {
+    return is_alpha(ch) || is_digit(ch);
+}
+
+fn is_space(ch: char): bool {
+    return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+}
+
+fn starts_with_at(text: string, start: i64, prefix: string): bool {
+    let n = len(text);
+    let m = len(prefix);
+    if start + m > n {
+        return false;
+    }
+    return substring(text, start, m) == prefix;
+}
+
+fn contains_text(text: string, needle: string): bool {
+    let n = len(text);
+    let m = len(needle);
+    let i: i64 = 0;
+    while i + m <= n {
+        if substring(text, i, m) == needle {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn trim_spaces(text: string): string {
+    let start: i64 = 0;
+    let finish = len(text);
+    while start < finish && is_space(char_at(text, start)) {
+        start = start + 1;
+    }
+    while finish > start && is_space(char_at(text, finish - 1)) {
+        finish = finish - 1;
+    }
+    return substring(text, start, finish - start);
+}
+
+fn first_identifier(expr: string): string {
+    let n = len(expr);
+    let i: i64 = 0;
+    while i < n {
+        let ch = char_at(expr, i);
+        if is_alpha(ch) {
+            let start = i;
+            i = i + 1;
+            while i < n && is_alnum(char_at(expr, i)) {
+                i = i + 1;
+            }
+            return substring(expr, start, i - start);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn infer_literal_type(expr: string): string {
+    if len(expr) == 0 {
+        return type_unknown();
+    }
+
+    let first = char_at(expr, 0);
+    if first >= '0' && first <= '9' {
+        if contains_text(expr, ".") {
+            return "f64";
+        }
+        return type_i64();
+    }
+    if first == '"' {
+        return type_string();
+    }
+    if first == '\'' {
+        return type_char();
+    }
+    if first == '[' {
+        return "[i64]";
+    }
+    if first == '-' && len(expr) > 1 && is_digit(char_at(expr, 1)) {
+        return type_i64();
+    }
+    if expr == "true" || expr == "false" {
+        return type_bool();
+    }
+    return type_unknown();
+}
+
+fn infer_operator_type(expr: string, locals: string): string {
+    if contains_text(expr, " == ") || contains_text(expr, " != ") || contains_text(expr, " < ")
+        || contains_text(expr, " <= ") || contains_text(expr, " > ") || contains_text(expr, " >= ")
+        || contains_text(expr, " && ") || contains_text(expr, " || ") {
+        return type_bool();
+    }
+    if contains_text(expr, " + ") {
+        let left = trim_spaces(substring(expr, 0, find_plus(expr)));
+        let right = trim_spaces(substring(expr, find_plus(expr) + 3, len(expr) - find_plus(expr) - 3));
+        if infer_expr_type_with_symbols(left, locals) == type_string() || infer_expr_type_with_symbols(right, locals) == type_string() {
+            return type_string();
+        }
+        return type_i64();
+    }
+    if contains_text(expr, " - ") || contains_text(expr, " * ") || contains_text(expr, " / ") || contains_text(expr, " % ") {
+        return type_i64();
+    }
+    return type_unknown();
+}
+
+fn find_plus(expr: string): i64 {
+    let n = len(expr);
+    let i: i64 = 0;
+    while i + 2 < n {
+        if char_at(expr, i) == ' ' && char_at(expr, i + 1) == '+' && char_at(expr, i + 2) == ' ' {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+pub fn infer_expr_type_with_symbols(expr: string, locals: string): string {
+    let trimmed = trim_spaces(expr);
+    let literal = infer_literal_type(trimmed);
+    if literal != type_unknown() {
+        return literal;
+    }
+
+    if starts_with_at(trimmed, 0, "len ( ") || starts_with_at(trimmed, 0, "len(") {
+        return type_i64();
+    }
+    if starts_with_at(trimmed, 0, "arg_count ( ") || starts_with_at(trimmed, 0, "arg_count(") {
+        return type_i64();
+    }
+    if starts_with_at(trimmed, 0, "arg_at ( ") || starts_with_at(trimmed, 0, "arg_at(") {
+        return type_string();
+    }
+
+    let op_type = infer_operator_type(trimmed, locals);
+    if op_type != type_unknown() {
+        return op_type;
+    }
+
+    if contains_text(trimmed, ".") {
+        return type_i64();
+    }
+    if contains_text(trimmed, "[") {
+        return type_i64();
+    }
+
+    let name = first_identifier(trimmed);
+    if name != "" && symbols.has_symbol(locals, name) {
+        return symbols.lookup_symbol(locals, name);
+    }
+
+    return type_unknown();
+}
+
+pub fn infer_expr_type(expr: string): string {
+    return infer_expr_type_with_symbols(expr, "");
+}

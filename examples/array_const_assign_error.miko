@@ -1,0 +1,4 @@
+fn main() {
+    const nums: [i32; 3] = [1, 2, 3];
+    nums[0] = 9;
+}

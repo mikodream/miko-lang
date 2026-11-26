@@ -1,0 +1,78 @@
+pub fn empty_symbols(): string {
+    return "";
+}
+
+pub fn add_symbol(symbols: string, name: string, ty: string): string {
+    if has_symbol(symbols, name) {
+        return symbols;
+    }
+    return symbols + name + ":" + ty + "\n";
+}
+
+pub fn put_symbol(symbols: string, name: string, ty: string): string {
+    let out = "";
+    let n = len(symbols);
+    let i = 0;
+    let updated = false;
+    let needle = name + ":";
+    let m = len(needle);
+
+    while i < n {
+        let line_start = i;
+        while i < n && char_at(symbols, i) != '\n' {
+            i = i + 1;
+        }
+        let line_end = i;
+        let line = substring(symbols, line_start, line_end - line_start);
+
+        if len(line) >= m && substring(line, 0, m) == needle {
+            out = append_str(out, name + ":" + ty + "\n");
+            updated = true;
+        } else {
+            out = append_str(out, line + "\n");
+        }
+
+        if i < n {
+            i = i + 1;
+        }
+    }
+
+    if updated {
+        return out;
+    }
+    return out + name + ":" + ty + "\n";
+}
+
+pub fn has_symbol(symbols: string, name: string): bool {
+    let needle = name + ":";
+    let n = len(symbols);
+    let m = len(needle);
+    let i = 0;
+    while i + m <= n {
+        let line_start = i == 0 || char_at(symbols, i - 1) == '\n';
+        if line_start && substring(symbols, i, m) == needle {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn lookup_symbol(symbols: string, name: string): string {
+    let needle = name + ":";
+    let n = len(symbols);
+    let m = len(needle);
+    let i = 0;
+    while i + m <= n {
+        let line_start = i == 0 || char_at(symbols, i - 1) == '\n';
+        if line_start && substring(symbols, i, m) == needle {
+            let j = i + m;
+            while j < n && char_at(symbols, j) != '\n' {
+                j = j + 1;
+            }
+            return substring(symbols, i + m, j - i - m);
+        }
+        i = i + 1;
+    }
+    return "unknown";
+}

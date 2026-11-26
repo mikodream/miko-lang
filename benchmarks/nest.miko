@@ -1,0 +1,18 @@
+// 基准测试3：嵌套循环
+// 测试分支预测和密集计算
+
+fn main() {
+    let count = 0;
+    let i = 0;
+    while i < 1000 {
+        let j = 0;
+        while j < 1000 {
+            if i * j % 7 == 0 {
+                count = count + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    print(count);
+}

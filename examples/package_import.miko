@@ -1,0 +1,5 @@
+import acme.math as pkg;
+
+fn main() {
+    print(pkg.triple(4));
+}

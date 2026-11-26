@@ -1,0 +1,223 @@
+// string.miko - string utilities built on the stage0 builtins.
+//
+// All functions are pure miko so they run identically under the interpreter
+// and any native backend.
+
+pub fn starts_with(text: string, prefix: string): bool {
+    let text_len = len(text);
+    let prefix_len = len(prefix);
+    if prefix_len > text_len {
+        return false;
+    }
+    if prefix_len == 0 {
+        return true;
+    }
+    return substring(text, 0, prefix_len) == prefix;
+}
+
+pub fn ends_with(text: string, suffix: string): bool {
+    let text_len = len(text);
+    let suffix_len = len(suffix);
+    if suffix_len > text_len {
+        return false;
+    }
+    if suffix_len == 0 {
+        return true;
+    }
+    return substring(text, text_len - suffix_len, suffix_len) == suffix;
+}
+
+pub fn contains(text: string, needle: string): bool {
+    return str_contains(text, needle);
+}
+
+pub fn index_of(text: string, needle: string): i64 {
+    return str_index_of(text, needle);
+}
+
+pub fn is_space_char(code: i64): bool {
+    return code == 32 || code == 9 || code == 10 || code == 13;
+}
+
+pub fn is_digit_char(code: i64): bool {
+    return code >= 48 && code <= 57;
+}
+
+pub fn is_alpha_char(code: i64): bool {
+    return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+pub fn trim_start(text: string): string {
+    let start: i64 = 0;
+    let text_len = len(text);
+    while start < text_len {
+        let code = char_at(text, start);
+        if is_space_char(code) {
+            start = start + 1;
+        } else {
+            return substring(text, start, text_len - start);
+        }
+    }
+    return "";
+}
+
+pub fn trim_end(text: string): string {
+    let text_len = len(text);
+    let end = text_len;
+    while end > 0 {
+        let code = char_at(text, end - 1);
+        if is_space_char(code) {
+            end = end - 1;
+        } else {
+            return substring(text, 0, end);
+        }
+    }
+    return "";
+}
+
+pub fn trim(text: string): string {
+    return trim_end(trim_start(text));
+}
+
+pub fn upper(text: string): string {
+    let out = "";
+    let text_len = len(text);
+    let i: i64 = 0;
+    while i < text_len {
+        let code = char_at(text, i);
+        if code >= 97 && code <= 122 {
+            out = out + to_string_char(code - 32);
+        } else {
+            out = out + to_string_char(code);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn lower(text: string): string {
+    let out = "";
+    let text_len = len(text);
+    let i: i64 = 0;
+    while i < text_len {
+        let code = char_at(text, i);
+        if code >= 65 && code <= 90 {
+            out = out + to_string_char(code + 32);
+        } else {
+            out = out + to_string_char(code);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn replace(text: string, from: string, to: string): string {
+    if from == "" {
+        return text;
+    }
+    let out = "";
+    let cursor: i64 = 0;
+    let text_len = len(text);
+    let from_len = len(from);
+    while cursor < text_len {
+        let found = str_index_of(substring(text, cursor, text_len - cursor), from);
+        if found < 0 {
+            out = out + substring(text, cursor, text_len - cursor);
+            return out;
+        }
+        out = out + substring(text, cursor, found);
+        out = out + to;
+        cursor = cursor + found + from_len;
+    }
+    return out;
+}
+
+pub fn split(text: string, sep: string): vec<string> {
+    let parts: vec<string> = vec_new();
+    if sep == "" {
+        vec_push(parts, text);
+        return parts;
+    }
+    let text_len = len(text);
+    let sep_len = len(sep);
+    let cursor: i64 = 0;
+    while cursor <= text_len {
+        let found = str_index_of(substring(text, cursor, text_len - cursor), sep);
+        if found < 0 {
+            vec_push(parts, substring(text, cursor, text_len - cursor));
+            return parts;
+        }
+        vec_push(parts, substring(text, cursor, found));
+        cursor = cursor + found + sep_len;
+    }
+    return parts;
+}
+
+pub fn join(parts: vec<string>, sep: string): string {
+    let out = "";
+    let count = len(parts);
+    let i: i64 = 0;
+    while i < count {
+        if i > 0 {
+            out = out + sep;
+        }
+        out = out + parts[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn repeat(text: string, count: i64): string {
+    let out = "";
+    let i: i64 = 0;
+    while i < count {
+        out = out + text;
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn reverse(text: string): string {
+    let out = "";
+    let text_len = len(text);
+    let i = text_len;
+    while i > 0 {
+        i = i - 1;
+        out = out + to_string_char(char_at(text, i));
+    }
+    return out;
+}
+
+pub fn pad_start(text: string, width: i64, pad: string): string {
+    let text_len = len(text);
+    if text_len >= width {
+        return text;
+    }
+    if pad == "" {
+        pad = " ";
+    }
+    return repeat(pad, width - text_len) + text;
+}
+
+pub fn pad_end(text: string, width: i64, pad: string): string {
+    let text_len = len(text);
+    if text_len >= width {
+        return text;
+    }
+    if pad == "" {
+        pad = " ";
+    }
+    return text + repeat(pad, width - text_len);
+}
+
+pub fn string_len(value: string): i64 {
+    return len(value);
+}
+
+pub fn string_eq(left: string, right: string): bool {
+    return left == right;
+}
+
+pub fn string_concat(left: string, right: string): string {
+    return left + right;
+}

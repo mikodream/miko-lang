@@ -1,0 +1,12 @@
+pub struct Point {
+    x: i32;
+    y: i32;
+}
+
+pub fn origin(): Point {
+    return Point { x: 10, y: 20 };
+}
+
+pub fn sum(point: Point): i32 {
+    return point.x + point.y;
+}

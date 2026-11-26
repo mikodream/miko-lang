@@ -1,0 +1,6 @@
+import core.math as core;
+import core.string as core;
+
+fn main() {
+    print(core.max_i32(1, 2));
+}

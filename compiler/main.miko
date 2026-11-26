@@ -1,0 +1,60 @@
+// main.miko - driver for the self-hosted miko->C compiler (stage1, C backend).
+//
+// Pipeline: read source -> lex -> parse -> sema -> codegen_c -> write .c
+//
+// This driver deliberately does NOT import codegen_ll: the C backend and the
+// LLVM IR backend are two independent backends with their own self-hosting
+// chains (see main_ll.miko and cmake/BootstrapLLVM.cmake). Keeping the two
+// driver programs separate means neither backend has to be understood by the
+// other's self-compilation path.
+import "lexer.miko" as lexer;
+import "parser.miko" as parser;
+import "sema.miko" as sema;
+import "codegen_c.miko" as codegen_c;
+
+fn compile_sample(source_path: string, output_prefix: string) {
+    let source = read_file(source_path);
+    let stream = lexer.lex(source);
+    write_file(output_prefix + ".tokens", stream);
+    let tree = parser.parse_program(stream);
+    write_file(output_prefix + ".ast", tree);
+    let checked = sema.check_program(tree);
+    write_file(output_prefix + ".sema", checked);
+    let c_source = codegen_c.generate_c(tree);
+    write_file(output_prefix + ".c", c_source);
+    print(c_source);
+}
+
+// Self-check mode: run a sample through every stage and print each artifact in
+// order, so one invocation demonstrates the whole pipeline.
+fn self_check(source_path: string) {
+    let source = read_file(source_path);
+    let stream = lexer.lex(source);
+    print(stream);
+    let tree = parser.parse_program(stream);
+    print(tree);
+    let checked = sema.check_program(tree);
+    print(checked);
+    print(codegen_c.generate_c(tree));
+}
+
+fn main(): i32 {
+    if arg_count() >= 2 {
+        compile_sample(arg_at(0), arg_at(1));
+        return 0;
+    }
+    if arg_count() == 1 {
+        self_check(arg_at(0));
+        return 0;
+    }
+    // No arguments: sweep one sample per language feature, so the printed token
+    // stream, AST, sema dump and generated C together cover functions, control
+    // flow, structs and arrays. The bootstrap chain always passes an explicit
+    // input and output prefix, so it never lands here.
+    self_check("examples/hello.miko");
+    self_check("examples/functions.miko");
+    self_check("examples/control.miko");
+    self_check("examples/structs.miko");
+    self_check("examples/arrays.miko");
+    return 0;
+}

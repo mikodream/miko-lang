@@ -1,0 +1,16 @@
+// io.miko - console and file I/O helpers.
+//
+// read_file / write_file / file_exists / input / print / eprint are stage0
+// builtins and can be used directly; these wrappers exist for readability.
+
+pub fn read_line(): string {
+    return input();
+}
+
+pub fn print_line(value: string) {
+    print(value);
+}
+
+pub fn eprint_line(value: string) {
+    eprint(value);
+}

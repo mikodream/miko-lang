@@ -1,0 +1,17 @@
+// conversions between strings and numbers, plus search primitives.
+fn main() {
+    print(to_string_i64(1234));
+    print(to_string_i64(-42));
+    print(to_string_f64(2.5));
+    print(to_string_bool(1 == 1));
+    print(to_string_bool(false));
+    print(to_string_char(72) + to_string_char(105));
+
+    print(str_to_i64("8192") + 1);
+    print(str_to_f64("3.5") * 2.0);
+    print(str_index_of("mikolang", "lang"));
+    print(str_index_of("mikolang", "zzz"));
+    print(str_contains("mikolang", "ko"));
+    print(str_contains("mikolang", "ok"));
+    print(len("miko"));
+}

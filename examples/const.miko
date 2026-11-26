@@ -1,0 +1,5 @@
+fn main() {
+    const answer: i32 = 40;
+    let bonus = 2;
+    print(answer + bonus);
+}

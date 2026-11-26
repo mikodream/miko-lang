@@ -1,0 +1,1466 @@
+import "symbols.miko" as symbols;
+
+fn find_char(text: string, start: i64, target: char): i64 {
+    let i = start;
+    let n = len(text);
+    while i < n {
+        if char_at(text, i) == target {
+            return i;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn starts_with_at(text: string, start: i64, prefix: string): bool {
+    let n = len(text);
+    let m = len(prefix);
+    if start + m > n {
+        return false;
+    }
+    return substring(text, start, m) == prefix;
+}
+
+fn trim_indent(line: string): string {
+    let i: i64 = 0;
+    let n = len(line);
+    while i < n && char_at(line, i) == ' ' {
+        i = i + 1;
+    }
+    return substring(line, i, n - i);
+}
+
+fn line_at(text: string, start: i64): string {
+    let line_end = find_char(text, start, '\n');
+    return trim_indent(substring(text, start, line_end - start));
+}
+
+fn next_line_index(text: string, start: i64): i64 {
+    let n = len(text);
+    let line_end = find_char(text, start, '\n');
+    if line_end >= n {
+        return n;
+    }
+    return line_end + 1;
+}
+
+fn is_builtin_type(ty: string): bool {
+    return ty == "i32" || ty == "i64" || ty == "bool" || ty == "string" || ty == "char" || ty == "long long";
+}
+
+fn trim_spaces(text: string): string {
+    let start: i64 = 0;
+    let finish = len(text);
+    while start < finish && char_at(text, start) == ' ' {
+        start = start + 1;
+    }
+    while finish > start && char_at(text, finish - 1) == ' ' {
+        finish = finish - 1;
+    }
+    return substring(text, start, finish - start);
+}
+
+fn is_ident_text(text: string): bool {
+    let n = len(text);
+    if n == 0 {
+        return false;
+    }
+    let i: i64 = 0;
+    while i < n {
+        let ch = char_at(text, i);
+        let ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+            || (ch >= '0' && ch <= '9') || ch == '_';
+        if !ok {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Rewrites a module-qualified call `alias.name(...)` into its bare spelling
+// `name(...)` and leaves anything else untouched. Return types are keyed by
+// the bare function name, so stripping the alias is what lets a call such as
+// `codegen_ll.generate_ir(tree)` be inferred exactly like `generate_ir(tree)`.
+fn strip_module_prefix(expr: string): string {
+    let n = len(expr);
+    let dot = find_char(expr, 0, '.');
+    if dot >= n {
+        return expr;
+    }
+    let head = substring(expr, 0, dot);
+    if !is_ident_text(head) {
+        return expr;
+    }
+    let open = find_char(expr, dot + 1, '(');
+    if open >= n {
+        return expr;
+    }
+    let tail = substring(expr, dot + 1, open - dot - 1);
+    if !is_ident_text(tail) {
+        return expr;
+    }
+    return substring(expr, dot + 1, n - dot - 1);
+}
+
+fn infer_c_expr_type(expr: string, local_symbols: string): string {
+    let trimmed = normalize_expr(trim_spaces(expr));
+    if len(trimmed) == 0 {
+        return "unknown";
+    }
+    let stripped = strip_module_prefix(trimmed);
+    if stripped != trimmed {
+        return infer_c_expr_type(stripped, local_symbols);
+    }
+    if trimmed == "true" || trimmed == "false" {
+        return "bool";
+    }
+    if char_at(trimmed, 0) == '"' {
+        return "string";
+    }
+    if char_at(trimmed, 0) == '\'' {
+        return "char";
+    }
+    if char_at(trimmed, 0) >= '0' && char_at(trimmed, 0) <= '9' {
+        return "i64";
+    }
+    if starts_with_at(trimmed, 0, "len(") || starts_with_at(trimmed, 0, "len ( ") {
+        return "i64";
+    }
+    if starts_with_at(trimmed, 0, "arg_count(") || starts_with_at(trimmed, 0, "arg_count ( ") {
+        return "i64";
+    }
+    if starts_with_at(trimmed, 0, "arg_at(") || starts_with_at(trimmed, 0, "arg_at ( ") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "char_at(") || starts_with_at(trimmed, 0, "char_at ( ")
+        || starts_with_at(trimmed, 0, "miko_char_at(") {
+        return "char";
+    }
+    if starts_with_at(trimmed, 0, "strlen(") || starts_with_at(trimmed, 0, "(long long)strlen(") {
+        return "i64";
+    }
+    if starts_with_at(trimmed, 0, "substring(") || starts_with_at(trimmed, 0, "substring ( ")
+        || starts_with_at(trimmed, 0, "miko_substring(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "read_file(") || starts_with_at(trimmed, 0, "read_file ( ")
+        || starts_with_at(trimmed, 0, "miko_read_file(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "write_file(") || starts_with_at(trimmed, 0, "write_file ( ")
+        || starts_with_at(trimmed, 0, "miko_write_file(") {
+        return "void";
+    }
+    if starts_with_at(trimmed, 0, "input()") || starts_with_at(trimmed, 0, "input ( )")
+        || starts_with_at(trimmed, 0, "miko_input(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "miko_str_concat(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "lex(") || starts_with_at(trimmed, 0, "parse_program(")
+        || starts_with_at(trimmed, 0, "check_program(") || starts_with_at(trimmed, 0, "generate_c(")
+        || starts_with_at(trimmed, 0, "generate_ir(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "empty_symbols(") || starts_with_at(trimmed, 0, "add_symbol(")
+        || starts_with_at(trimmed, 0, "put_symbol(") || starts_with_at(trimmed, 0, "lookup_symbol(")
+        || starts_with_at(trimmed, 0, "infer_expr_type_with_symbols(") || starts_with_at(trimmed, 0, "infer_expr_type(")
+        || starts_with_at(trimmed, 0, "trim_spaces(") || starts_with_at(trimmed, 0, "trim_indent(")
+        || starts_with_at(trimmed, 0, "first_identifier(") || starts_with_at(trimmed, 0, "field_type_for_expr(")
+        || starts_with_at(trimmed, 0, "infer_expr(") || starts_with_at(trimmed, 0, "infer_operator_type(")
+        || starts_with_at(trimmed, 0, "infer_literal_type(") || starts_with_at(trimmed, 0, "type_") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "contains_text(") || starts_with_at(trimmed, 0, "has_symbol(")
+        || starts_with_at(trimmed, 0, "starts_with_at(") || starts_with_at(trimmed, 0, "! contains_text(") {
+        return "bool";
+    }
+    if starts_with_at(trimmed, 0, "find_char(") || starts_with_at(trimmed, 0, "find_plus(") {
+        return "i64";
+    }
+    if starts_with_at(trimmed, 0, "line0(") || starts_with_at(trimmed, 0, "line1(")
+        || starts_with_at(trimmed, 0, "line2(") || starts_with_at(trimmed, 0, "line3(")
+        || starts_with_at(trimmed, 0, "line4(") || starts_with_at(trimmed, 0, "expr_line(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "make_parse_result(") {
+        return "ParseResult";
+    }
+    if contains_text(trimmed, "lexer.lex(") || contains_text(trimmed, "parser.parse_program(")
+        || contains_text(trimmed, "sema.check_program(") || contains_text(trimmed, "codegen_c.generate_c(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "strcmp(") || starts_with_at(trimmed, 0, "(strcmp(") {
+        return "bool";
+    }
+    if contains_text(trimmed, " == ") || contains_text(trimmed, " != ") || contains_text(trimmed, " < ")
+        || contains_text(trimmed, " <= ") || contains_text(trimmed, " > ") || contains_text(trimmed, " >= ")
+        || contains_text(trimmed, " && ") || contains_text(trimmed, " || ") {
+        return "bool";
+    }
+    if contains_text(trimmed, "miko_str_concat(") {
+        return "string";
+    }
+    if starts_with_at(trimmed, 0, "argv[") {
+        return "string";
+    }
+    if contains_text(trimmed, " + ") {
+        let plus = find_plus(trimmed);
+        if plus < len(trimmed) {
+            let left = trim_spaces(substring(trimmed, 0, plus));
+            let right = trim_spaces(substring(trimmed, plus + 3, len(trimmed) - plus - 3));
+            if infer_c_expr_type(left, local_symbols) == "string" || infer_c_expr_type(right, local_symbols) == "string" {
+                return "string";
+            }
+        }
+        return "i64";
+    }
+    if contains_text(trimmed, ".text") {
+        return "string";
+    }
+    if contains_text(trimmed, ".kind") {
+        return "string";
+    }
+    if contains_text(trimmed, ".next") || contains_text(trimmed, ".index") {
+        return "i64";
+    }
+    if contains_text(trimmed, "[") {
+        return "i64";
+    }
+    if contains_text(trimmed, ".") {
+        return "i64";
+    }
+    if symbols.has_symbol(local_symbols, trimmed) {
+        return symbols.lookup_symbol(local_symbols, trimmed);
+    }
+    let callee = leading_identifier(trimmed);
+    if callee != "" && symbols.has_symbol(local_symbols, callee) {
+        return symbols.lookup_symbol(local_symbols, callee);
+    }
+    return "unknown";
+}
+
+fn find_plus(text: string): i64 {
+    let n = len(text);
+    let i: i64 = 0;
+    let depth: i64 = 0;
+    let in_string = false;
+    let in_char = false;
+    while i + 2 < n {
+        let ch = char_at(text, i);
+        if in_string || in_char {
+            if ch == '\\' {
+                i = i + 2;
+                continue;
+            }
+        }
+        if ch == '"' && !in_char {
+            in_string = !in_string;
+        } else {
+            if ch == '\'' && !in_string {
+                in_char = !in_char;
+            } else {
+                if !in_string && !in_char {
+                    if ch == '(' || ch == '[' || ch == '{' {
+                        depth = depth + 1;
+                    }
+                    if ch == ')' || ch == ']' || ch == '}' {
+                        depth = depth - 1;
+                    }
+                    if depth == 0 && char_at(text, i) == ' ' && char_at(text, i + 1) == '+' && char_at(text, i + 2) == ' ' {
+                        return i;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn leading_identifier(text: string): string {
+    let n = len(text);
+    let i: i64 = 0;
+    while i < n && char_at(text, i) == ' ' {
+        i = i + 1;
+    }
+    let start = i;
+    while i < n {
+        let ch = char_at(text, i);
+        if ch == ' ' || ch == '(' || ch == '[' || ch == '.' {
+            return substring(text, start, i - start);
+        }
+        i = i + 1;
+    }
+    return substring(text, start, i - start);
+}
+
+fn map_type(ty: string): string {
+    if ty == "i32" || ty == "i64" || ty == "long long" {
+        return "long long";
+    }
+    if ty == "bool" {
+        return "int";
+    }
+    if ty == "string" {
+        return "const char*";
+    }
+    if ty == "char" {
+        return "char";
+    }
+    return ty;
+}
+
+fn normalize_expr(expr: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(expr);
+    while i < n {
+        if i + 2 < n && char_at(expr, i) == ' ' && char_at(expr, i + 1) == '.' && char_at(expr, i + 2) == ' ' {
+            out = out + ".";
+            i = i + 3;
+            continue;
+        }
+        out = out + substring(expr, i, 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+// One line per enum: "Name:member1,member2\n" (mirrors the symbols format).
+fn collect_enums(tree: string): string {
+    let out = "";
+    let current = "";
+    let members = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let line = trim_indent(substring(tree, i, line_end - i));
+        if starts_with_at(line, 0, "Enum ") {
+            if current != "" {
+                out = out + current + ":" + members + "\n";
+            }
+            current = substring(line, 5, len(line) - 5);
+            members = "";
+        } else {
+            if starts_with_at(line, 0, "Member ") && current != "" {
+                if members != "" {
+                    members = members + ",";
+                }
+                members = members + substring(line, 7, len(line) - 7);
+            }
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    if current != "" {
+        out = out + current + ":" + members + "\n";
+    }
+    return out;
+}
+
+fn is_enum_name(enums: string, ty: string): bool {
+    let i: i64 = 0;
+    let n = len(enums);
+    while i < n {
+        let line_end = find_char(enums, i, '\n');
+        let line = substring(enums, i, line_end - i);
+        let colon = find_char(line, 0, ':');
+        if colon > 0 && substring(line, 0, colon) == ty {
+            return true;
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return false;
+}
+
+// Enum-typed annotations (Type/Param/ReturnType/Field) become "i64" so the
+// existing map_type path emits "long long" without new special cases.
+fn rewrite_enum_types(tree: string, enums: string): string {    let out = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let raw = substring(tree, i, line_end - i);
+        let line = trim_indent(raw);
+        let indent = len(raw) - len(line);
+        let replacement = "";
+        if starts_with_at(line, 0, "Type ") {
+            let ty = substring(line, 5, len(line) - 5);
+            if is_enum_name(enums, ty) {
+                let pad = "";
+                let p: i64 = 0;
+                while p < indent {
+                    pad = pad + " ";
+                    p = p + 1;
+                }
+                replacement = pad + "Type i64";
+            }
+        } else {
+            if starts_with_at(line, 0, "Param ") {
+                let colon = find_char(line, 0, ':');
+                let ty2 = trim_spaces(substring(line, colon + 2, len(line) - colon - 2));
+                if is_enum_name(enums, ty2) {
+                    let pad2 = "";
+                    let p2: i64 = 0;
+                    while p2 < indent {
+                        pad2 = pad2 + " ";
+                        p2 = p2 + 1;
+                    }
+                    replacement = pad2 + "Param " + substring(line, 6, colon - 6) + ": i64";
+                }
+            } else {
+                if starts_with_at(line, 0, "ReturnType ") {
+                    let ty3 = substring(line, 11, len(line) - 11);
+                    if is_enum_name(enums, ty3) {
+                        let pad3 = "";
+                        let p3: i64 = 0;
+                        while p3 < indent {
+                            pad3 = pad3 + " ";
+                            p3 = p3 + 1;
+                        }
+                        replacement = pad3 + "ReturnType i64";
+                    }
+                } else {
+                    if starts_with_at(line, 0, "Field ") {
+                        let colon2 = find_char(line, 0, ':');
+                        let ty4 = trim_spaces(substring(line, colon2 + 2, len(line) - colon2 - 2));
+                        if is_enum_name(enums, ty4) {
+                            let pad4 = "";
+                            let p4: i64 = 0;
+                            while p4 < indent {
+                                pad4 = pad4 + " ";
+                                p4 = p4 + 1;
+                            }
+                            replacement = pad4 + "Field " + substring(line, 6, colon2 - 6) + ": i64";
+                        }
+                    }
+                }
+            }
+        }
+        if replacement != "" {
+            out = out + replacement + "\n";
+        } else {
+            out = out + raw + "\n";
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return out;
+}
+
+// Decimal text for a non-negative i64, without needing an int->string
+// builtin (stage1's runtime does not provide one).
+fn number_to_text(value: i64): string {
+    if value == 0 {
+        return "0";
+    }
+    let digits = "";
+    let v = value;
+    while v > 0 {
+        let d = v % 10;
+        digits = substring("0123456789", d, 1) + digits;
+        v = v / 10;
+    }
+    return digits;
+}
+
+// C declaration for every enum: an anonymous enum with `Enum__Member` names.
+fn emit_enum_decls(enums: string): string {
+    let out = "";
+    let i: i64 = 0;
+    let n = len(enums);
+    while i < n {
+        let line_end = find_char(enums, i, '\n');
+        let line = substring(enums, i, line_end - i);
+        if len(line) > 0 {
+            let colon = find_char(line, 0, ':');
+            let name = substring(line, 0, colon);
+            let members_text = substring(line, colon + 1, len(line) - colon - 1);
+            out = out + "enum { ";
+            let m: i64 = 0;
+            let members_n = len(members_text);
+            let cursor: i64 = 0;
+            let first = true;
+            while cursor < members_n {
+                let comma = find_char(members_text, cursor, ',');
+                let member = substring(members_text, cursor, comma - cursor);
+                if !first {
+                    out = out + ", ";
+                }
+                first = false;
+                out = out + name + "__" + member + " = " + number_to_text(m);
+                m = m + 1;
+                cursor = comma + 1;
+            }
+            out = out + " };\n";
+        }
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    if out != "" {
+        out = out + "\n";
+    }
+    return out;
+}
+
+fn contains_text(text: string, needle: string): bool {
+    let n = len(text);
+    let m = len(needle);
+    let i: i64 = 0;
+    while i + m <= n {
+        if substring(text, i, m) == needle {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn replace_text(text: string, needle: string, replacement: string): string {
+    let out = "";
+    let n = len(text);
+    let m = len(needle);
+    let i: i64 = 0;
+    let in_string = false;
+    let in_char = false;
+    while i < n {
+        let c = char_at(text, i);
+        if in_string {
+            out = out + substring(text, i, 1);
+            if c == '\\' && i + 1 < n {
+                out = out + substring(text, i + 1, 1);
+                i = i + 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            i = i + 1;
+            continue;
+        }
+        if in_char {
+            out = out + substring(text, i, 1);
+            if c == '\\' && i + 1 < n {
+                out = out + substring(text, i + 1, 1);
+                i = i + 2;
+                continue;
+            }
+            if c == '\'' {
+                in_char = false;
+            }
+            i = i + 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out = out + substring(text, i, 1);
+            i = i + 1;
+            continue;
+        }
+        if c == '\'' {
+            in_char = true;
+            out = out + substring(text, i, 1);
+            i = i + 1;
+            continue;
+        }
+        if i + m <= n && substring(text, i, m) == needle {
+            out = out + replacement;
+            i = i + m;
+        } else {
+            out = out + substring(text, i, 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// Rewrite `Enum :: Member` text into the mangled C enumerator name
+// `Enum__Member`. replace_text skips string/char literal interiors, so a
+// source literal containing "::" survives untouched (byte fixed point).
+fn convert_enum_refs(expr: string): string {
+    return replace_text(expr, " :: ", "__");
+}
+
+fn convert_len_expr(expr: string): string {
+    if starts_with_at(expr, 0, "len ( [") {
+        return "4";
+    }
+    if starts_with_at(expr, 0, "len ( ") && len(expr) >= 8 && char_at(expr, len(expr) - 1) == ')' {
+        let inner = substring(expr, 6, len(expr) - 8);
+        return "strlen(" + normalize_expr(inner) + ")";
+    }
+    return expr;
+}
+
+fn lower_builtin_calls(expr: string): string {
+    let out1 = replace_text(expr, "len ( ", "strlen(");
+    let out2 = replace_text(out1, "char_at ( ", "miko_char_at(");
+    let out3 = replace_text(out2, "substring ( ", "miko_substring(");
+    let out4 = replace_text(out3, "read_file ( ", "miko_read_file(");
+    let out5 = replace_text(out4, "write_file ( ", "miko_write_file(");
+    let out6 = replace_text(out5, "input ( )", "miko_input()");
+    return out6;
+}
+
+fn call_inner(expr: string): string {
+    let open = find_char(expr, 0, '(');
+    if open >= len(expr) {
+        return "";
+    }
+    return trim_spaces(substring(expr, open + 1, len(expr) - open - 2));
+}
+
+fn convert_arg_expr(expr: string, local_symbols: string): string {
+    if starts_with_at(expr, 0, "arg_count()") || starts_with_at(expr, 0, "arg_count ( )") {
+        return "(argc - 1)";
+    }
+    if starts_with_at(expr, 0, "arg_at(") || starts_with_at(expr, 0, "arg_at ( ") {
+        let index = call_inner(expr);
+        return "argv[(" + lower_expr(index, local_symbols) + ") + 1]";
+    }
+    return expr;
+}
+
+fn is_call_expr(expr: string): bool {
+    let open = find_char(expr, 0, '(');
+    if open <= 0 || open >= len(expr) || len(expr) == 0 {
+        return false;
+    }
+    let callee = trim_spaces(substring(expr, 0, open));
+    if len(callee) == 0 {
+        return false;
+    }
+    return char_at(expr, len(expr) - 1) == ')';
+}
+
+fn lower_callee(callee: string): string {
+    let name = normalize_expr(trim_spaces(callee));
+    if name == "len" {
+        return "strlen";
+    }
+    if name == "char_at" {
+        return "miko_char_at";
+    }
+    if name == "substring" {
+        return "miko_substring";
+    }
+    if name == "read_file" {
+        return "miko_read_file";
+    }
+    if name == "write_file" {
+        return "miko_write_file";
+    }
+    if name == "input" {
+        return "miko_input";
+    }
+    if contains_text(name, ".") {
+        let dot = find_char(name, 0, '.');
+        return substring(name, dot + 1, len(name) - dot - 1);
+    }
+    return name;
+}
+
+fn lower_call_args(args: string, local_symbols: string): string {
+    let out = "";
+    let n = len(args);
+    let i: i64 = 0;
+    let depth: i64 = 0;
+    let start: i64 = 0;
+    let first = true;
+    let in_string = false;
+    let in_char = false;
+    while i <= n {
+        if i == n || (!in_string && !in_char && depth == 0 && char_at(args, i) == ',') {
+            let arg = trim_spaces(substring(args, start, i - start));
+            if len(arg) > 0 {
+                if !first {
+                    out = out + ", ";
+                }
+                out = out + lower_expr(arg, local_symbols);
+                first = false;
+            }
+            start = i + 1;
+        } else {
+            let ch = char_at(args, i);
+            if in_string || in_char {
+                if ch == '\\' {
+                    i = i + 1;
+                } else {
+                    if ch == '"' && in_string {
+                        in_string = false;
+                    }
+                    if ch == '\'' && in_char {
+                        in_char = false;
+                    }
+                }
+            } else {
+                if ch == '"' {
+                    in_string = true;
+                } else {
+                    if ch == '\'' {
+                        in_char = true;
+                    } else {
+                        if ch == '(' || ch == '[' || ch == '{' {
+                            depth = depth + 1;
+                        }
+                        if ch == ')' || ch == ']' || ch == '}' {
+                            depth = depth - 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lower_call_expr(expr: string, local_symbols: string): string {
+    let open = find_char(expr, 0, '(');
+    if open >= len(expr) {
+        return expr;
+    }
+    let callee = lower_callee(substring(expr, 0, open));
+    let args = substring(expr, open + 1, len(expr) - open - 2);
+    return callee + "(" + lower_call_args(args, local_symbols) + ")";
+}
+
+fn convert_string_compare(expr: string, local_symbols: string): string {
+    if contains_text(expr, " == ") {
+        let op = find_char(expr, 0, '=');
+        let left = trim_spaces(substring(expr, 0, op - 1));
+        let right = trim_spaces(substring(expr, op + 3, len(expr) - op - 3));
+        if infer_c_expr_type(normalize_expr(left), local_symbols) == "string" || infer_c_expr_type(normalize_expr(right), local_symbols) == "string" {
+            return "(strcmp(" + lower_expr(left, local_symbols) + ", " + lower_expr(right, local_symbols) + ") == 0)";
+        }
+    }
+    if contains_text(expr, " != ") {
+        let op_ne = find_char(expr, 0, '!');
+        let left_ne = trim_spaces(substring(expr, 0, op_ne - 1));
+        let right_ne = trim_spaces(substring(expr, op_ne + 3, len(expr) - op_ne - 3));
+        if infer_c_expr_type(normalize_expr(left_ne), local_symbols) == "string" || infer_c_expr_type(normalize_expr(right_ne), local_symbols) == "string" {
+            return "(strcmp(" + lower_expr(left_ne, local_symbols) + ", " + lower_expr(right_ne, local_symbols) + ") != 0)";
+        }
+    }
+    if contains_text(expr, " < ") {
+        let op2 = find_char(expr, 0, '<');
+        let left2 = trim_spaces(substring(expr, 0, op2 - 1));
+        let right2 = trim_spaces(substring(expr, op2 + 2, len(expr) - op2 - 2));
+        if infer_c_expr_type(normalize_expr(left2), local_symbols) == "string" || infer_c_expr_type(normalize_expr(right2), local_symbols) == "string" {
+            return "(strcmp(" + lower_expr(left2, local_symbols) + ", " + lower_expr(right2, local_symbols) + ") < 0)";
+        }
+    }
+    return expr;
+}
+
+fn convert_string_concat(expr: string, local_symbols: string): string {
+    let plus = find_plus(expr);
+    if plus >= len(expr) {
+        return expr;
+    }
+    let left = trim_spaces(substring(expr, 0, plus));
+    let right = trim_spaces(substring(expr, plus + 3, len(expr) - plus - 3));
+    let left_ty = infer_c_expr_type(left, local_symbols);
+    let right_ty = infer_c_expr_type(right, local_symbols);
+    if left_ty == "string" || right_ty == "string" {
+        return "miko_str_concat(" + lower_expr(left, local_symbols) + ", " + lower_expr(right, local_symbols) + ")";
+    }
+    return expr;
+}
+
+fn find_top_level_operator(expr: string, op: string): i64 {
+    let n = len(expr);
+    let m = len(op);
+    let i: i64 = 0;
+    let depth: i64 = 0;
+    let in_string = false;
+    let in_char = false;
+    while i + m <= n {
+        let ch = char_at(expr, i);
+        if in_string || in_char {
+            if ch == '\\' {
+                i = i + 2;
+                continue;
+            }
+        }
+        if ch == '"' && !in_char {
+            in_string = !in_string;
+        } else {
+            if ch == '\'' && !in_string {
+                in_char = !in_char;
+            } else {
+                if !in_string && !in_char {
+                    if ch == '(' || ch == '[' || ch == '{' {
+                        depth = depth + 1;
+                    }
+                    if ch == ')' || ch == ']' || ch == '}' {
+                        depth = depth - 1;
+                    }
+                    if depth == 0 && substring(expr, i, m) == op {
+                        return i;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn convert_assignment_expr(expr: string, local_symbols: string): string {
+    let assign = find_top_level_operator(expr, " = ");
+    if assign >= len(expr) {
+        return expr;
+    }
+    let left = normalize_expr(trim_spaces(substring(expr, 0, assign)));
+    let right = trim_spaces(substring(expr, assign + 3, len(expr) - assign - 3));
+    return left + " = " + lower_expr(right, local_symbols);
+}
+
+fn convert_logical_expr(expr: string, local_symbols: string): string {
+    let and_pos = find_top_level_operator(expr, " && ");
+    if and_pos < len(expr) {
+        let left = trim_spaces(substring(expr, 0, and_pos));
+        let right = trim_spaces(substring(expr, and_pos + 4, len(expr) - and_pos - 4));
+        return lower_expr(left, local_symbols) + " && " + lower_expr(right, local_symbols);
+    }
+    let or_pos = find_top_level_operator(expr, " || ");
+    if or_pos < len(expr) {
+        let left2 = trim_spaces(substring(expr, 0, or_pos));
+        let right2 = trim_spaces(substring(expr, or_pos + 4, len(expr) - or_pos - 4));
+        return lower_expr(left2, local_symbols) + " || " + lower_expr(right2, local_symbols);
+    }
+    return expr;
+}
+
+fn split_binary_expr(expr: string, op_text: string, local_symbols: string): string {
+    let pos = find_top_level_operator(expr, op_text);
+    if pos >= len(expr) {
+        return expr;
+    }
+    let left = trim_spaces(substring(expr, 0, pos));
+    let right = trim_spaces(substring(expr, pos + len(op_text), len(expr) - pos - len(op_text)));
+    let op = trim_spaces(op_text);
+    if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if infer_c_expr_type(left, local_symbols) == "string" || infer_c_expr_type(right, local_symbols) == "string" {
+            return "(strcmp(" + lower_expr(left, local_symbols) + ", " + lower_expr(right, local_symbols) + ") " + op + " 0)";
+        }
+    }
+    return lower_expr(left, local_symbols) + " " + op + " " + lower_expr(right, local_symbols);
+}
+
+fn lower_expr(expr: string, local_symbols: string): string {
+    let lowered = normalize_expr(expr);
+    lowered = convert_enum_refs(lowered);
+    let struct_lowered = struct_literal_to_c(lowered);
+    if struct_lowered != lowered {
+        return struct_lowered;
+    }
+    lowered = convert_len_expr(lowered);
+    if starts_with_at(lowered, 0, "4") && len(lowered) == 1 {
+        return lowered;
+    }
+    lowered = lower_builtin_calls(lowered);
+    let split: string = split_binary_expr(lowered, " || ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " && ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " == ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " != ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " <= ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " >= ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " < ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    split = split_binary_expr(lowered, " > ", local_symbols);
+    if split != lowered {
+        return split;
+    }
+    let assigned = convert_assignment_expr(lowered, local_symbols);
+    if assigned != lowered {
+        return assigned;
+    }
+    lowered = convert_arg_expr(lowered, local_symbols);
+    lowered = convert_string_concat(lowered, local_symbols);
+    if is_call_expr(lowered) {
+        lowered = lower_call_expr(lowered, local_symbols);
+    }
+    return lowered;
+}
+
+fn is_array_type(ty: string): bool {
+    return len(ty) > 0 && char_at(ty, 0) == '[';
+}
+
+fn is_array_literal(expr: string): bool {
+    return len(expr) > 0 && char_at(expr, 0) == '[';
+}
+
+fn array_literal_to_c(expr: string): string {
+    if !is_array_literal(expr) {
+        return normalize_expr(expr);
+    }
+    let inner = substring(expr, 1, len(expr) - 2);
+    return "{ " + normalize_expr(inner) + " }";
+}
+
+fn struct_literal_to_c(expr: string): string {
+    if is_array_literal(expr) {
+        return array_literal_to_c(expr);
+    }
+    let brace = find_char(expr, 0, '{');
+    if brace <= 0 || brace >= len(expr) {
+        return normalize_expr(expr);
+    }
+    if char_at(expr, brace - 1) != ' ' {
+        return normalize_expr(expr);
+    }
+    let type_name = substring(expr, 0, brace - 1);
+    if contains_text(type_name, " ") || contains_text(type_name, "=") || contains_text(type_name, "+") || contains_text(type_name, "\"") {
+        return normalize_expr(expr);
+    }
+    let out = "(" + type_name + "){ ";
+    let i = brace + 2;
+    let n = len(expr);
+    let first = true;
+    while i < n && char_at(expr, i) != '}' {
+        while i < n && (char_at(expr, i) == ' ' || char_at(expr, i) == ',') {
+            i = i + 1;
+        }
+        if i >= n || char_at(expr, i) == '}' {
+            break;
+        }
+        let field_start = i;
+        while i < n && char_at(expr, i) != ' ' && char_at(expr, i) != ':' {
+            i = i + 1;
+        }
+        let field = substring(expr, field_start, i - field_start);
+        while i < n && char_at(expr, i) != ':' {
+            i = i + 1;
+        }
+        if i >= n {
+            return normalize_expr(expr);
+        }
+        i = i + 2;
+        if i > n {
+            return normalize_expr(expr);
+        }
+        let value_start = i;
+        let value_depth: i64 = 0;
+        let value_in_string = false;
+        let value_in_char = false;
+        while i < n {
+            let ch2 = char_at(expr, i);
+            if value_in_string || value_in_char {
+                if ch2 == '\\' {
+                    i = i + 1;
+                } else {
+                    if ch2 == '"' && value_in_string {
+                        value_in_string = false;
+                    }
+                    if ch2 == '\'' && value_in_char {
+                        value_in_char = false;
+                    }
+                }
+            } else {
+                if ch2 == '"' {
+                    value_in_string = true;
+                } else {
+                    if ch2 == '\'' {
+                        value_in_char = true;
+                    } else {
+                        if ch2 == '(' || ch2 == '[' || ch2 == '{' {
+                            value_depth = value_depth + 1;
+                        }
+                        if ch2 == ')' || ch2 == ']' {
+                            value_depth = value_depth - 1;
+                        }
+                        if value_depth == 0 && (ch2 == ',' || ch2 == '}') {
+                            break;
+                        }
+                        if ch2 == '}' {
+                            value_depth = value_depth - 1;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        let value_end = i;
+        if value_end > value_start && char_at(expr, value_end - 1) == ' ' {
+            value_end = value_end - 1;
+        }
+        let value = substring(expr, value_start, value_end - value_start);
+        if !first {
+            out = out + ", ";
+        }
+        first = false;
+        out = out + "." + field + " = " + lower_expr(value, "");
+    }
+    return out + " }";
+}
+
+fn declare_value(name: string, ty: string, value: string): string {
+    if is_array_type(ty) || is_array_literal(value) || (len(value) > 0 && char_at(value, 0) == '{') {
+        return "    long long " + name + "[] = " + array_literal_to_c(value) + ";\n";
+    }
+    if ty == "string" || (len(value) > 0 && char_at(value, 0) == '"') {
+        return "    const char* " + name + " = " + value + ";\n";
+    }
+    if contains_text(value, ".text") {
+        return "    const char* " + name + " = " + value + ";\n";
+    }
+    if ty == "bool" {
+        return "    int " + name + " = " + value + ";\n";
+    }
+    return "    " + map_type(ty) + " " + name + " = " + value + ";\n";
+}
+
+fn c_expr_from_line(line: string, local_symbols: string): string {
+    let expr = line;
+    if starts_with_at(line, 0, "Expr ") {
+        expr = substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Call ") {
+        expr = substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Left ") {
+        expr = substring(line, 5, len(line) - 5);
+    }
+    if starts_with_at(line, 0, "Right ") {
+        expr = substring(line, 6, len(line) - 6);
+    }
+    let lowered = lower_expr(struct_literal_to_c(expr), local_symbols);
+    if starts_with_at(line, 0, "Call input") {
+        return "miko_input()";
+    }
+    return lowered;
+}
+
+fn print_expr_from_call(line: string, local_symbols: string): string {
+    let start: i64 = 13;
+    let n = len(line);
+    if n <= start + 2 {
+        return "0";
+    }
+    return c_expr_from_line("Expr " + substring(line, start, n - start - 2), local_symbols);
+}
+
+fn c_printf_for_expr(expr: string, expr_type: string): string {
+    if expr_type == "string" || (len(expr) > 0 && char_at(expr, 0) == '"') {
+        return "    printf(\"%s\\n\", " + expr + ");\n";
+    }
+    if expr_type == "bool" || starts_with_at(expr, 0, "(strcmp") {
+        return "    printf(\"%s\\n\", (" + expr + ") ? \"true\" : \"false\");\n";
+    }
+    return "    printf(\"%lld\\n\", (long long)(" + expr + "));\n";
+}
+
+fn append_param(params: string, name: string, ty: string): string {
+    let item = map_type(ty) + " " + name;
+    if params == "" {
+        return item;
+    }
+    return params + ", " + item;
+}
+
+fn compiler_public_prototypes(): string {
+    return "const char* append_token(const char* stream, const char* kind, const char* text);\nconst char* append_char_token(const char* stream, const char* kind, char value);\nconst char* empty_symbols();\nconst char* add_symbol(const char* symbols, const char* name, const char* ty);\nconst char* put_symbol(const char* symbols, const char* name, const char* ty);\nint has_symbol(const char* symbols, const char* name);\nconst char* lookup_symbol(const char* symbols, const char* name);\nconst char* type_i32();\nconst char* type_i64();\nconst char* type_bool();\nconst char* type_string();\nconst char* type_char();\nconst char* type_unknown();\nconst char* infer_expr_type_with_symbols(const char* expr, const char* locals);\nconst char* infer_expr_type(const char* expr);\nconst char* line0(const char* text);\nconst char* line1(const char* text);\nconst char* line2(const char* text);\nconst char* line3(const char* text);\nconst char* line4(const char* text);\nconst char* lex(const char* source);\nconst char* parse_program(const char* stream);\nconst char* check_program(const char* tree);\nconst char* generate_c(const char* tree);\nconst char* generate_ir(const char* tree);\n\n";
+}
+
+fn runtime_builtin_aliases(): string {
+    return "static long long len(const char* text) {\n    return (long long)strlen(text);\n}\n\nstatic char char_at(const char* text, long long index) {\n    return miko_char_at(text, index);\n}\n\nstatic char* substring(const char* text, long long start, long long length) {\n    return miko_substring(text, start, length);\n}\n\nstatic char* read_file(const char* path) {\n    return miko_read_file(path);\n}\n\nstatic void write_file(const char* path, const char* content) {\n    miko_write_file(path, content);\n}\n\nstatic char* input(void) {\n    return miko_input();\n}\n\n";
+}
+
+fn ensure_function_header(out: string, current_function: string, params: string, return_type: string, header_open: bool, is_pub: bool): string {
+    if header_open {
+        return out;
+    }
+    let c_ret = map_type(return_type);
+    if return_type == "void" {
+        c_ret = "void";
+    }
+    let prefix = "static ";
+    if is_pub || current_function == "main" {
+        prefix = "";
+    }
+    if current_function == "main" {
+        c_ret = "int";
+        params = "int argc, char** argv";
+    }
+    return out + prefix + c_ret + " " + current_function + "(" + params + ") {\n";
+}
+
+fn binary_expr_at(tree: string, index: i64, local_symbols: string): string {
+    let line = line_at(tree, index);
+    let op = substring(line, 7, len(line) - 7);
+    let left_i = next_line_index(tree, index);
+    let right_i = next_line_index(tree, left_i);
+    let left = c_expr_from_line(line_at(tree, left_i), local_symbols);
+    let right = c_expr_from_line(line_at(tree, right_i), local_symbols);
+    return lower_expr(left + " " + op + " " + right, local_symbols);
+}
+
+fn condition_expr_at(tree: string, index: i64, local_symbols: string): string {
+    let line = line_at(tree, index);
+    if starts_with_at(line, 0, "Binary ") {
+        return binary_expr_at(tree, index, local_symbols);
+    }
+    return c_expr_from_line(line, local_symbols);
+}
+
+fn close_struct_if_needed(out: string, in_struct: bool, struct_name: string): string {
+    if in_struct {
+        return out + "} " + struct_name + ";\n\n";
+    }
+    return out;
+}
+
+fn collect_function_returns(tree: string): string {
+    let function_symbols = symbols.empty_symbols();
+    let current_function = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let raw = substring(tree, i, line_end - i);
+        let line = trim_indent(raw);
+
+        if starts_with_at(line, 0, "Function ") {
+            current_function = substring(line, 9, len(line) - 9);
+            function_symbols = symbols.put_symbol(function_symbols, current_function, "void");
+        } else {
+            if starts_with_at(line, 0, "ReturnType ") && current_function != "" {
+                function_symbols = symbols.put_symbol(function_symbols, current_function, substring(line, 11, len(line) - 11));
+            }
+        }
+
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+    return function_symbols;
+}
+
+pub fn generate_c(tree_input: string): string {
+    let enums = collect_enums(tree_input);
+    let tree = rewrite_enum_types(tree_input, enums);
+    let out = "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdbool.h>\n\nstatic char* miko_str_concat(const char* a, const char* b) {\n    size_t na = strlen(a);\n    size_t nb = strlen(b);\n    char* out = (char*)malloc(na + nb + 1);\n    if (!out) { exit(1); }\n    memcpy(out, a, na);\n    memcpy(out + na, b, nb);\n    out[na + nb] = 0;\n    return out;\n}\n\nstatic char miko_char_at(const char* text, long long index) {\n    if (index < 0 || (size_t)index >= strlen(text)) {\n        fprintf(stderr, \"char_at index out of range\\n\");\n        exit(1);\n    }\n    return text[index];\n}\n\nstatic char* miko_substring(const char* text, long long start, long long length) {\n    size_t n = strlen(text);\n    if (start < 0 || length < 0 || (size_t)start > n) {\n        fprintf(stderr, \"substring range out of bounds\\n\");\n        exit(1);\n    }\n    if ((size_t)length > n - (size_t)start) {\n        length = (long long)(n - (size_t)start);\n    }\n    char* out = (char*)malloc((size_t)length + 1);\n    if (!out) { exit(1); }\n    memcpy(out, text + start, (size_t)length);\n    out[length] = 0;\n    return out;\n}\n\nstatic char* miko_read_file(const char* path) {\n    FILE* file = fopen(path, \"rb\");\n    if (!file) {\n        fprintf(stderr, \"failed to open file '%s'\\n\", path);\n        exit(1);\n    }\n    if (fseek(file, 0, SEEK_END) != 0) { exit(1); }\n    long size = ftell(file);\n    if (size < 0) { exit(1); }\n    rewind(file);\n    char* out = (char*)malloc((size_t)size + 1);\n    if (!out) { exit(1); }\n    size_t read = fread(out, 1, (size_t)size, file);\n    out[read] = 0;\n    fclose(file);\n    return out;\n}\n\nstatic void miko_write_file(const char* path, const char* content) {\n    FILE* file = fopen(path, \"wb\");\n    if (!file) {\n        fprintf(stderr, \"failed to open file '%s' for writing\\n\", path);\n        exit(1);\n    }\n    fwrite(content, 1, strlen(content), file);\n    fclose(file);\n}\n\nstatic char* miko_input(void) {\n    static char buf[1024];\n    if (!fgets(buf, sizeof buf, stdin)) {\n        buf[0] = 0;\n        return buf;\n    }\n    size_t n = strlen(buf);\n    if (n > 0 && buf[n-1] == 10) { buf[n-1] = 0; }\n    if (n > 0 && buf[n-1] == 13) { buf[n-1] = 0; }\n    return buf;\n}\n\nstatic int contains_text(const char* text, const char* needle);\nstatic long long find_plus(const char* expr);\nstatic const char* leading_identifier(const char* text);\nstatic const char* normalize_expr(const char* expr);\nstatic const char* lower_expr(const char* expr, const char* local_symbols);\nstatic const char* split_binary_expr(const char* expr, const char* op_text, const char* local_symbols);\nstatic const char* struct_literal_to_c(const char* expr);\n\n" + runtime_builtin_aliases() + compiler_public_prototypes() + emit_enum_decls(enums);
+    let pending_let = "";
+    let pending_type = "long long";
+    let pending_return = false;
+    let function_symbols = collect_function_returns(tree);
+    let local_symbols = function_symbols;
+    let current_function = "";
+    let params = "";
+    let return_type = "long long";
+    let header_open = false;
+    let emitted_return = false;
+    let current_is_pub = false;
+    let pending_pub = false;
+    let opened_while = false;
+    let opened_if = false;
+    let in_else = false;
+    let in_struct = false;
+    let struct_name = "";
+
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line_end = find_char(tree, i, '\n');
+        let raw = substring(tree, i, line_end - i);
+        let line = trim_indent(raw);
+
+        if starts_with_at(line, 0, "Struct ") {
+            out = close_struct_if_needed(out, in_struct, struct_name);
+            struct_name = substring(line, 7, len(line) - 7);
+            out = out + "typedef struct " + struct_name + " {\n";
+            in_struct = true;
+        } else {
+            if starts_with_at(line, 0, "Field ") && in_struct {
+                let colon = find_char(line, 0, ':');
+                let name = substring(line, 6, colon - 6);
+                let ty = substring(line, colon + 2, len(line) - colon - 2);
+                out = out + "    " + map_type(ty) + " " + name + ";\n";
+            } else {
+                if starts_with_at(line, 0, "Pub") {
+                    pending_pub = true;
+                } else {
+                if starts_with_at(line, 0, "Function ") {
+                    out = close_struct_if_needed(out, in_struct, struct_name);
+                    in_struct = false;
+                    if current_function == "" && contains_text(tree, "\n  Struct ParseResult\n") {
+                        out = out + "static ParseResult parse_block(const char* stream, long long index);\n\n";
+                    }
+                    if current_function == "" && contains_text(tree, "\n  Struct GenState\n") {
+                        out = out + "static TokResult parse_or(GenState state, const char* toks, long long pos);\n\n";
+                    }
+                    if current_function != "" {
+                        if opened_if {
+                            out = out + "    }\n";
+                            opened_if = false;
+                            in_else = false;
+                        }
+                        if opened_while {
+                            out = out + "    }\n";
+                            opened_while = false;
+                        }
+                        out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                        if current_function == "main" && !emitted_return {
+                            out = out + "    return 0;\n";
+                        }
+                        out = out + "}\n\n";
+                    }
+                    current_function = substring(line, 9, len(line) - 9);
+                    current_is_pub = pending_pub;
+                    pending_pub = false;
+                    local_symbols = function_symbols;
+                    params = "";
+                    return_type = "void";
+                    header_open = false;
+                    emitted_return = false;
+                    opened_while = false;
+                    opened_if = false;
+                    in_else = false;
+                } else {
+                        if starts_with_at(line, 0, "Param ") {
+                            let colon2 = find_char(line, 0, ':');
+                            let name2 = substring(line, 6, colon2 - 6);
+                            let ty2 = substring(line, colon2 + 2, len(line) - colon2 - 2);
+                            params = append_param(params, name2, ty2);
+                            local_symbols = symbols.put_symbol(local_symbols, name2, ty2);
+                        } else {
+                        if starts_with_at(line, 0, "ReturnType ") {
+                            return_type = substring(line, 11, len(line) - 11);
+                        } else {
+                            if starts_with_at(line, 0, "Type ") && pending_let != "" {
+                                pending_type = substring(line, 5, len(line) - 5);
+                            } else {
+                                if starts_with_at(line, 0, "Let ") {
+                                    out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                    header_open = true;
+                                    pending_let = substring(line, 4, len(line) - 4);
+                                    pending_type = "long long";
+                                } else {
+                                    if starts_with_at(line, 0, "Return") {
+                                        out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                        header_open = true;
+                                        pending_return = true;
+                                        emitted_return = true;
+                                    } else {
+                                        if starts_with_at(line, 0, "While") {
+                                            out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                            header_open = true;
+                                            let cond_i = next_line_index(tree, next_line_index(tree, i));
+                                            let cond = condition_expr_at(tree, cond_i, local_symbols);
+                                            out = out + "    while (" + cond + ") {\n";
+                                            opened_while = false;
+                                            i = next_line_index(tree, next_line_index(tree, cond_i));
+                                            continue;
+                                        } else {
+                                            if starts_with_at(line, 0, "If") {
+                                                out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                                header_open = true;
+                                                let cond_i2 = next_line_index(tree, next_line_index(tree, i));
+                                                let cond2 = condition_expr_at(tree, cond_i2, local_symbols);
+                                                out = out + "        if (" + cond2 + ") {\n";
+                                                opened_if = false;
+                                                in_else = false;
+                                                i = next_line_index(tree, next_line_index(tree, cond_i2));
+                                                continue;
+                                            } else {
+                                                if starts_with_at(line, 0, "Else") {
+                                                    out = out + "        } else {\n";
+                                                    in_else = false;
+                                                } else {
+                                                    if line == "EndIf" || line == "EndWhile" || line == "EndFor" {
+                                                        out = out + "    }\n";
+                                                    } else {
+                                                        if line == "continue" || line == "break" {
+                                                            out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                                            header_open = true;
+                                                            out = out + "    " + line + ";\n";
+                                                        } else {
+                                        if starts_with_at(line, 0, "Binary ") {
+                                            let expr = binary_expr_at(tree, i, local_symbols);
+                                            if pending_return {
+                                                out = out + "    return " + expr + ";\n";
+                                                pending_return = false;
+                                            } else {
+                                                if pending_let != "" {
+                                                    if pending_type == "long long" {
+                                                        pending_type = infer_c_expr_type(expr, local_symbols);
+                                                    }
+                                                    out = out + declare_value(pending_let, pending_type, expr);
+                                                    local_symbols = symbols.put_symbol(local_symbols, pending_let, pending_type);
+                                                    pending_let = "";
+                                                }
+                                            }
+                                                        i = next_line_index(tree, next_line_index(tree, i));
+                                                        continue;
+                                                    } else {
+                                                        if starts_with_at(line, 0, "Expr ") && pending_return {
+                                                            let return_value = c_expr_from_line(line, local_symbols);
+                                                            out = out + "    return " + return_value + ";\n";
+                                                            pending_return = false;
+                                                        } else {
+                                                            if starts_with_at(line, 0, "Expr ") && pending_let != "" {
+                                                                let value = c_expr_from_line(line, local_symbols);
+                                                                if pending_type == "long long" {
+                                                                    pending_type = infer_c_expr_type(value, local_symbols);
+                                                                }
+                                                                out = out + declare_value(pending_let, pending_type, value);
+                                                                local_symbols = symbols.put_symbol(local_symbols, pending_let, pending_type);
+                                                                pending_let = "";
+                                                            } else {
+                                                            if starts_with_at(line, 0, "Call ") && pending_let != "" {
+                                                                let call_value = c_expr_from_line(line, local_symbols);
+                                                                if pending_type == "long long" {
+                                                                    pending_type = infer_c_expr_type(call_value, local_symbols);
+                                                                }
+                                                                out = out + declare_value(pending_let, pending_type, call_value);
+                                                                local_symbols = symbols.put_symbol(local_symbols, pending_let, pending_type);
+                                                                pending_let = "";
+                                                            } else {
+                                                            if starts_with_at(line, 0, "Call ") && pending_return {
+                                                                let call_return_value = c_expr_from_line(line, local_symbols);
+                                                                out = out + "    return " + call_return_value + ";\n";
+                                                                pending_return = false;
+                                                            } else {
+                                                                if starts_with_at(line, 0, "Call print ( ") {
+                                                                    out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                                                    header_open = true;
+                                                                    let expr2 = print_expr_from_call(line, local_symbols);
+                                                                    let expr2_type = infer_c_expr_type(expr2, local_symbols);
+                                                                    if opened_if {
+                                                                        out = out + "            ";
+                                                                        if expr2_type == "string" || (len(expr2) > 0 && char_at(expr2, 0) == '"') {
+                                                                            out = out + "printf(\"%s\\n\", " + expr2 + ");\n";
+                                                                        } else {
+                                                                            if expr2_type == "bool" {
+                                                                                out = out + "printf(\"%s\\n\", (" + expr2 + ") ? \"true\" : \"false\");\n";
+                                                                            } else {
+                                                                                out = out + "printf(\"%lld\\n\", (long long)(" + expr2 + "));\n";
+                                                                            }
+                                                                        }
+                                                                        if in_else {
+                                                                            out = out + "        }\n";
+                                                                            opened_if = false;
+                                                                            in_else = false;
+                                                                        }
+                                                                    } else {
+                                                                        out = out + c_printf_for_expr(expr2, expr2_type);
+                                                                    }
+                                                                } else {
+                                                                    if starts_with_at(line, 0, "Call ") {
+                                                                        out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                                                        header_open = true;
+                                                                        let call_stmt = c_expr_from_line(line, local_symbols);
+                                                                        if opened_if {
+                                                                            out = out + "            " + call_stmt + ";\n";
+                                                                            if in_else {
+                                                                                out = out + "        }\n";
+                                                                                opened_if = false;
+                                                                                in_else = false;
+                                                                            }
+                                                                        } else {
+                                                                            out = out + "    " + call_stmt + ";\n";
+                                                                        }
+                                                                    } else {
+                                                                    if starts_with_at(line, 0, "Expr ") {
+                                                                        out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+                                                                        header_open = true;
+                                                                        if opened_if {
+                                                                            out = out + "        }\n";
+                                                                            opened_if = false;
+                                                                            in_else = false;
+                                                                        }
+                                                                        let stmt = c_expr_from_line(line, local_symbols);
+                                                                        out = out + "        " + stmt + ";\n";
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            }
+                                                        }
+                                                        }
+                                                    }
+                                                    }
+                                                        }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        }
+
+        if line_end >= n {
+            i = n;
+        } else {
+            i = line_end + 1;
+        }
+    }
+
+    out = close_struct_if_needed(out, in_struct, struct_name);
+    if current_function != "" {
+        if opened_if {
+            out = out + "    }\n";
+            opened_if = false;
+        }
+        if opened_while {
+            out = out + "    }\n";
+            opened_while = false;
+        }
+        out = ensure_function_header(out, current_function, params, return_type, header_open, current_is_pub);
+        if current_function == "main" && !emitted_return {
+            out = out + "    return 0;\n";
+        }
+        out = out + "}\n";
+    }
+
+    return out;
+}
+
+

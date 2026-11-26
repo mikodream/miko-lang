@@ -1,0 +1,21 @@
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn describe(c: Color): string {
+    if c == Color::Red {
+        return "red";
+    }
+    if c == Color::Green {
+        return "green";
+    }
+    return "blue";
+}
+
+fn main() {
+    print(describe(Color::Red));
+    print(describe(Color::Green));
+    print(describe(Color::Blue));
+}

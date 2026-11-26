@@ -1,0 +1,47 @@
+// Two ways to build a string, side by side. Run with a value of n on the command
+// line; the timing comes from mono_ms so no external tool is needed.
+//
+//   dist\miko.exe benchmarks\str_build.miko out\str_build
+//   out\str_build.exe 20000           # both paths
+//   out\str_build.exe 160000 append   # append only
+//
+// `concat` is quadratic and is skipped above n = 20000: 8x the input would take
+// minutes, which proves nothing the shape below does not already show.
+fn main() {
+    let n: i64 = 20000;
+    if arg_count() >= 1 {
+        n = str_to_i64(arg_at(0));
+    }
+    let which = "both";
+    if arg_count() >= 2 {
+        which = arg_at(1);
+    }
+
+    if which == "both" && n <= 20000 {
+        let start = mono_ms();
+        let be = "";
+        let i: i64 = 0;
+        while i < n {
+            be = be + "x";
+            i = i + 1;
+        }
+        let elapsed = mono_ms() - start;
+        print("concat     n=" + to_string_i64(n) + "  " + to_string_i64(elapsed) + " ms  len=" + to_string_i64(len(be)));
+    }
+
+    let start2 = mono_ms();
+    let ap = "";
+    let j: i64 = 0;
+    while j < n {
+        ap = append_str(ap, "x");
+        j = j + 1;
+    }
+    let elapsed2 = mono_ms() - start2;
+    print("append_str n=" + to_string_i64(n) + "  " + to_string_i64(elapsed2) + " ms  len=" + to_string_i64(len(ap)));
+
+    // Both must have produced the same string, or the fast one is not a
+    // substitute for the slow one.
+    if len(ap) != n {
+        print("WRONG LENGTH");
+    }
+}

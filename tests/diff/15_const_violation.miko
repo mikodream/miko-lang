@@ -1,0 +1,5 @@
+fn main() {
+    const answer: i64 = 42;
+    answer = 43;
+    print(answer);
+}

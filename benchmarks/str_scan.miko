@@ -1,0 +1,28 @@
+// Character scan over a string read at run time.
+//
+// The string must come from a file, not a literal: with a literal clang can see
+// the length and hoist every strlen out of the loop, which hides the problem
+// this benchmark exists to measure. Each char_at() used to call strlen on the
+// whole string, so the loop was O(n^2) - the cost grew with the square of the
+// string while each step touches one byte.
+//
+// Measured on this file with 20 KB and 20 scans: 278 ms before the length moved
+// into the string header, 8 ms after. Raising n from 10k to 40k left the time
+// flat, which is the property being asserted: the per-character cost must not
+// depend on the string's size. See benchmarks/README.md.
+fn main() {
+    let s = read_file("benchmarks/str_scan.txt");
+    let total: i64 = 0;
+    let scan: i64 = 0;
+    while scan < 20 {
+        let i: i64 = 0;
+        let n = len(s);
+        while i < n {
+            total = total + char_at(s, i);
+            i = i + 1;
+        }
+        scan = scan + 1;
+    }
+    print(len(s));
+    print(total);
+}

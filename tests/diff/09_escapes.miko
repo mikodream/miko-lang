@@ -1,0 +1,4 @@
+fn main() {
+    print("A\x42C");
+    print(len("A\x42C"));
+}

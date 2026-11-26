@@ -1,0 +1,9 @@
+import core.io;
+import core.string;
+
+fn main() {
+    io.print_line("name?");
+    let name = io.read_line();
+    io.print_line(string.string_concat("hello ", name));
+    print(string.string_len(name));
+}

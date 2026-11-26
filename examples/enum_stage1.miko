@@ -1,0 +1,35 @@
+// Self-hosting check: enum must survive the full miko->C pipeline.
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn describe(c: i64): string {
+    if c == Color::Red {
+        return "red";
+    }
+    if c == Color::Green {
+        return "green";
+    }
+    return "blue";
+}
+
+fn advance(c: i64): i64 {
+    if c == Color::Red {
+        return Color::Green;
+    }
+    if c == Color::Green {
+        return Color::Blue;
+    }
+    return Color::Red;
+}
+
+fn main() {
+    let c: Color = Color::Green;
+    print(c == Color::Green);
+    print(describe(c));
+    print(describe(advance(c)));
+    print(advance(advance(c)) == Color::Red);
+    print("a :: b");
+}

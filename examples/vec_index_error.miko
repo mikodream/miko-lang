@@ -1,0 +1,5 @@
+fn main() {
+    let v: vec<i32> = vec_new();
+    vec_push(v, 1);
+    print(v[5]);
+}

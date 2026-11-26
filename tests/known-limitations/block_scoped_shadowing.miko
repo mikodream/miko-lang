@@ -1,0 +1,25 @@
+fn pick(op: string): string {
+    let v = "outer";
+    if op == "/" {
+        let v = "inner";
+        return v;
+    }
+    return v;
+}
+
+fn counter(): i64 {
+    let total = 1;
+    let i = 0;
+    while i < 3 {
+        let total = 100;
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() {
+    print(pick("+"));
+    print(pick("/"));
+    print(counter());
+}
