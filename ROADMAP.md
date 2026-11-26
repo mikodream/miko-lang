@@ -537,7 +537,27 @@ s = append_str(s, piece);
 
 修法是回退分支在看得见 Windows 系统目录时省掉 `-lm`（周围代码本来就靠这个判断选 `.exe` 后缀），并且 CI 门禁自己写一份 `miko.toolchain`，让门禁走的是发布包真正会走的那条路。
 
-### 9.5 结果
+### 9.5 结果的形状：四个平台，不是六个
+
+在写"发布成功"之前，先把成功是什么说清楚。矩阵原定六个平台，实际发布 **四个**：
+
+| 平台 | 状态 |
+| --- | --- |
+| linux-x64 | 成功 |
+| linux-arm64 | 成功 |
+| macos-x64 | 成功 |
+| windows-x64 | 成功 |
+| macos-arm64 | **不发布**，原因见下 |
+| windows-arm64 | **不发布**，原因见下 |
+
+`tag: v0.2.0-25`，release `miko 0.2.0 (build 25)`，四个资产：
+
+```
+miko-0.2.0-linux-x64.tar.gz     229293 bytes
+miko-0.2.0-linux-arm64.tar.gz   220813 bytes
+miko-0.2.0-macos-x64.tar.gz     224919 bytes
+miko-0.2.0-windows-x64.zip      337091 bytes
+```
 
 CI 上 `gate.yml` 通过：
 
@@ -550,11 +570,65 @@ CI 上 `gate.yml` 通过：
 
 定点哈希从 `F023F21A6EE36416` 变成 `3ED78C9CA5CE1E12`，因为改了 `main_ll.miko` 的回退分支。这个检查本来就是为此存在的：源一改，哈希就该变。
 
-本机干净 clone 验证过：`cmake -G "Visual Studio 18 2026" -A x64 -DMIKO_ENABLE_LLVM=ON` → 15.1 s，0 error → stage 1 → difftest 31/31 → bootstrap 定点。
+### 9.6 发布包真的能用吗
 
-### 9.6 没解决的
+发布成功不等于包能用。下了 Windows 包，解压，实际跑：
 
-- **`windows-arm64` 标了 `experimental`**。那个镜像最可能缺组件（LLVM 不是每处都装）。少一个平台的发布仍值得发，缺口在运行摘要里看得见，但它是缺口。
+```
+miko\miko.exe --version   →  miko 0.2.0 (miko-implemented, LLVM IR backend)
+miko --self out\g1        →  wrote out\g1.ll  (1351347 字节)
+miko-link.bat             →  out\g1.exe
+out\g1.exe --self out\g2  →  wrote out\g2.ll  (1351347 字节)
+g1.ll 3ED78C9CA5CE1E12 == g2.ll 3ED78C9CA5CE1E12
+```
+
+**包里的编译器自举到了和本机门禁完全相同的定点哈希。** 再用它编译一个程序、链接、运行，输出 `sum 1..10 = 55`。
+
+过程中我自己写错了两次：用了不存在的 `to_string`（真名 `to_string_i64`）和不存在的 `println`（内建是 `print`，且自带换行），还有一次把源文件放在 `--self` 前面——CLI 是 `miko --self [prefix]`，不是 `miko <src> --self`。这些都是我的调用错误，不是包的问题，但都说明了同一件事：发布包的行为要和文档一致，而文档在 `--help` 里。
+
+### 9.7 macOS arm64：每次都只是把失败挪了个位置
+
+这个平台试了五轮，每轮都真的往前推进了一点，然后撞上下一堵墙。完整记录，因为下一个人会从第一堵墙重来：
+
+1. `macos-14` 在启动的同一秒被取消，`runner_name` 为空、没有任何 step 运行——arm64 runner 根本没分配。换 `macos-15`。
+2. `macos-15` 有 runner 了，Homebrew 的 llvm 是 **23.1.5**，stage 1 每个函数都 `does not have terminator`。
+3. 换官方 `LLVM-22.1.8-macOS-ARM64.tar.xz`（发布清单里 **没有** macOS x64 归档，只有 ARM64，所以两个 Mac 走两条路）。链接缺 `libzstd`，归档不带，brew 装库补上。
+4. 链接器拒绝每一个归档里的 `.a`：`Unknown attribute kind (102) (Producer: 'LLVM22.1.8' Reader: 'LLVM APPLE_1_1700.0.13.5_0')`——归档的静态库是 LLVM bitcode，Xcode 的链接器是 LLVM 17，读不懂 22 的 bitcode。改用归档自带的 clang。
+5. 过了 bitcode，死在 `__hash_memory`：那个 clang 带自己的 libc++ 头，比 Xcode 的 libc++ 新，头能编、库没这个符号。用 `-nostdinc++` 指回 Xcode 的头，仍然缺。
+
+走到这一步，剩下的路只有两条：等 Homebrew 出 arm64 的 LLVM 22，或者为那个目标从源码建一份 LLVM。两条都不属于发布流水线该干的事。所以从矩阵里移掉，理由写在该条目原来的位置。
+
+一次真正的修复应该是移除失败，而不是把失败挪到下一堵墙——五轮里没有一次做到，所以不发布这个平台。
+
+### 9.8 windows-arm64：直接删掉更诚实
+
+`windows-11-arm` **没有 Visual Studio**，`vswhere.exe` 不存在。stage 0 是 MSVC 编译的 C++ 程序，在那里建不出来。原先标了 `experimental` + `continue-on-error`，结果是每次运行都红、从来没产出过包。移掉了。
+
+### 9.9 六个平台的链接顺序：为什么最后是靠"位置"解决的
+
+Linux 上最顽固的一个。症状始终是 `undefined reference to ZSTD_compressBound`，而 `libzstd.so` 明明在链接行上——问题只是它在 `libLLVMSupport.a` **前面**，而单遍链接器不会回头用已经走过的库。
+
+试过并且都失败的：
+
+| 尝试 | 结果 |
+| --- | --- |
+| `target_link_libraries` 直接加 | CMake 把它排在 LLVM 归档前面，两次都一样靠前 |
+| 重复列一遍 | CMake 把两份合并进同一个靠前的块 |
+| `target_link_options` | 选项排在库**之前**，方向反了 |
+| `-Wl,--start-group` 包住 `${LLVM_LIBS}` | 只有直接点名的九个组件进了组，传递依赖（还有第二个 `libLLVMSupport.a`）在 `--end-group` 之后 |
+| `LLVM_LINK_LLVM_DYLIB` | Ubuntu 上映射照样返回归档，还害得 macOS 丢了一个本来能过的 job |
+| 手工 `find_library` 找 `libLLVM.so` | arm64（18.1.3）找到，x64（18.1.8）没找到——同发行版、不同补丁版、不同布局 |
+
+最后成立的是 `CMAKE_CXX_STANDARD_LIBRARIES`——CMake 保证它在链接行的最末尾，在目标自己的库和它们拉进来的一切之后。
+
+然后还踩了两个坑：条件列表插进变量时是 CMake list，`;` 分隔，shell 把它当成**一个**参数 `-lz;-lzstd;-ltinfo`，于是 Linux 退回 `set_curterm` 未定义（必须先 `string(REPLACE ";" " ")`）；`-ltinfo` 只该在 Linux 加，macOS 的 terminfo 在 libSystem 里，加它就是 `ld: library 'tinfo' not found`。
+
+三个系统库现在各自"机器上有才加"，因为答案是按发行版变的：terminfo 只在 Linux，zstd 在 Debian 和 Homebrew 的 LLVM 构建里、官方归档不需要，`-lz` 到处都有。
+
+### 9.10 没解决的
+
+- **macOS arm64 和 Windows arm64 不发布**，原因见 9.7 / 9.8。缺口写在矩阵注释里，不藏在运行摘要里。
 - **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没有替他编一个。
 - **`.miko` 文件在库里仍存 CRLF**，虽然 `.gitattributes` 声明了 `text=auto eol=lf`。`git add --renormalize .` 能修；无害，因为词法接受两种换行。
-- **LLVM 版本上限是 22**。23 的 API 删改会让 stage 0 编译失败或 IR 验证失败。要么跟着改 API，要么就用 22——现在是钉住版本。这个约束写在这里，而不是留给下一个人去撞。
+- **LLVM 版本上限是 22**。23 删了 `IRBuilder::CreateGlobalStringPtr`、并且对 miko 生成的 IR 一律验证失败。现在靠三处钉版本：Linux 钉 18、Windows 下载 22.1.8 压缩包、macOS x64 靠 brew 恰好还是 22.1.8_2。**最后一条是运气，不是保证**——brew 一旦升到 23，macOS x64 会和 arm64 一样卡在版本上。这是这份流水线最脆的一处。
+- **`arg_count()` 风格的 CLI 有个不一致**：`arg_at(0)` 当模式用，但 `arg_count() >= 3` 分支用 `arg_at(1)`/`arg_at(2)`。按文档形式调用没问题，但这条路径没有测试覆盖。
