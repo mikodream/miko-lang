@@ -240,9 +240,17 @@ if(MIKO_ENABLE_LLVM)
     # link line, after the target's own libraries and everything they pull in. That is
     # exactly where these belong. Windows needs none of it: its zlib and zstd come
     # from the CRT or are imported by name, and it links clean today.
+    #
+    # terminfo is Linux-only. macOS keeps those symbols in libSystem and has no
+    # libtinfo to link, so asking for it stops the link with "library 'tinfo' not
+    # found" - which is a step backwards from the failure it was meant to fix.
     if(NOT WIN32)
         set(CMAKE_CXX_STANDARD_LIBRARIES
-            "${CMAKE_CXX_STANDARD_LIBRARIES} -lz -lzstd -ltinfo")
+            "${CMAKE_CXX_STANDARD_LIBRARIES} -lz -lzstd")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            set(CMAKE_CXX_STANDARD_LIBRARIES
+                "${CMAKE_CXX_STANDARD_LIBRARIES} -ltinfo")
+        endif()
     endif()
 
     llvm_map_components_to_libnames(LLVM_LIBS
@@ -256,7 +264,11 @@ if(MIKO_ENABLE_LLVM)
     target_link_libraries(miko PRIVATE ${LLVM_LIBS})
     message(STATUS "LLVM link libraries: ${LLVM_LIBS}")
     if(NOT WIN32)
-        message(STATUS "appended to the end of the link line: -lz -lzstd -ltinfo")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            message(STATUS "appended to the end of the link line: -lz -lzstd -ltinfo")
+        else()
+            message(STATUS "appended to the end of the link line: -lz -lzstd")
+        endif()
     endif()
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
