@@ -1,0 +1,78 @@
+name: probe macos arm64 llvm22
+
+# Temporary. Answers two things: whether Apple's libc++ really lacks __hash_memory,
+# and whether linking the official LLVM 22 archive's own libc++ statically makes the
+# arm64 macOS build work. Deleted once answered.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-stage0:
+    name: arm64 macOS stage 0
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Why __hash_memory is missing
+        run: |
+          set -x
+          sdk="$(xcrun --show-sdk-path)"
+          echo "sdk: $sdk"
+          echo "--- Apple libc++ version ---"
+          grep -m2 '_LIBCPP_VERSION' "$sdk/usr/include/c++/v1/__config" || echo "no __config"
+          echo "--- does Apple libc++ export __hash_memory ---"
+          grep -c 'hash_memory' "$sdk/usr/lib/libc++.1.tbd" || echo "0 matches in tbd"
+          echo "--- does Apple's hash.h reference it ---"
+          grep -c 'hash_memory' "$sdk/usr/include/c++/v1/__functional/hash.h" || echo "0 matches in header"
+
+      - name: Install LLVM 22.1.8 for arm64
+        run: |
+          set -euo pipefail
+          url='https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-ARM64.tar.xz'
+          curl -fsSL "$url" -o llvm.tar.xz
+          mkdir -p llvm-dist
+          tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
+          rm -f llvm.tar.xz
+          brew install zstd
+          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+          echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "LLVM_BIN=$PWD/llvm-dist/bin" >> "$GITHUB_ENV"
+          echo "LLVM_LIB=$PWD/llvm-dist/lib" >> "$GITHUB_ENV"
+          ./llvm-dist/bin/llvm-config --version
+          ls llvm-dist/lib/libc++.a llvm-dist/lib/libc++abi.a llvm-dist/lib/libunwind.a
+
+      - name: Attempt 1 - archive clang, static libc++ from the archive
+        run: |
+          set -uo pipefail
+          echo "=== attempt 1 ==="
+          rm -rf build-a1
+          CC="$LLVM_BIN/clang" CXX="$LLVM_BIN/clang++" cmake -S . -B build-a1 \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMIKO_ENABLE_LLVM=ON \
+            -DLLVM_DIR="$LLVM_DIR" \
+            -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ $LLVM_LIB/libc++.a $LLVM_LIB/libc++abi.a $LLVM_LIB/libunwind.a" \
+            2>&1 | tail -25
+          echo "configure exit: $?"
+          cmake --build build-a1 --target miko 2>&1 | tail -30
+          echo "build exit: $?"
+          if [ -f build-a1/miko ]; then ./build-a1/miko --version; echo "RUN_OK=$?"; else echo "RUN_OK=no-binary"; fi
+
+      - name: Attempt 2 - archive clang, archive libc++ dylib with rpath
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "=== attempt 2 ==="
+          rm -rf build-a2
+          CC="$LLVM_BIN/clang" CXX="$LLVM_BIN/clang++" cmake -S . -B build-a2 \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMIKO_ENABLE_LLVM=ON \
+            -DLLVM_DIR="$LLVM_DIR" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$LLVM_LIB -Wl,-rpath,$LLVM_LIB" \
+            2>&1 | tail -15
+          cmake --build build-a2 --target miko 2>&1 | tail -20
+          echo "build exit: $?"
+          if [ -f build-a2/miko ]; then ./build-a2/miko --version; echo "RUN_OK=$?"; fi
