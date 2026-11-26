@@ -125,26 +125,31 @@ jobs:
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
-      # Which directory holds LLVMConfig.cmake depends on the distributor, and the
-      # build cannot guess: it failed here the first time this ran, asking for
-      # LLVM_DIR. Report it explicitly rather than hoping find_package stumbles on
-      # it. Homebrew's current llvm formula is a version this compiler is verified
-      # against; if brew moves it past 22 the build fails loudly at compile, not
-      # silently.
-      - name: Install LLVM (macOS)
+      # Homebrew is no longer used for LLVM. On a fresh macos-15 arm64 image brew
+      # installed 23.1.5, and LLVM 23 rejects this backend's output outright - every
+      # function came back "Basic Block in function 'main' does not have terminator".
+      # A formula that tracks the newest release cannot be relied on to match a
+      # compiler that is verified against 22, so the official 22.1.8 archive is
+      # downloaded for the runner's own architecture, the same way Windows does it.
+      - name: Install LLVM 22.1.8 from the release archive (macOS)
         if: runner.os == 'macOS'
         run: |
-          # zstd and zlib are keg dependencies Homebrew's LLVM links against but does
-          # not re-export; without them the link stops on undefined ZSTD symbols.
-          brew install llvm zstd zlib
-          prefix="$(brew --prefix llvm)"
-          echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
-          # Homebrew's LLVM is keg-only: clang and llvm-config are not on PATH by
-          # default, and the link script calls bare `clang`.
-          echo "$prefix/bin" >> "$GITHUB_PATH"
-          # find_library has no reason to look inside the kegs.
-          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
-          echo "CPATH=$(brew --prefix zstd)/include:$(brew --prefix zlib)/include" >> "$GITHUB_ENV"
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64)  triple="arm64-apple-darwin" ;;
+            x86_64) triple="x86_64-apple-darwin" ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-${triple}.tar.xz"
+          # ~2 GB unpacked; the CI disk has room and a cache would need its own key per
+          # architecture, which is more moving parts than this is worth.
+          curl -fsSL "$url" -o llvm.tar.xz
+          mkdir -p llvm-dist
+          tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
+          rm -f llvm.tar.xz
+          echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
+          "$PWD/llvm-dist/bin/llvm-config" --version
 
       # Windows needs the LLVM release archive, not the LLVM installer: neither
       # `choco install llvm` nor the official LLVM-*-win64.exe publishes

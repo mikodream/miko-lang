@@ -241,15 +241,32 @@ if(MIKO_ENABLE_LLVM)
     # exactly where these belong. Windows needs none of it: its zlib and zstd come
     # from the CRT or are imported by name, and it links clean today.
     #
-    # terminfo is Linux-only. macOS keeps those symbols in libSystem and has no
-    # libtinfo to link, so asking for it stops the link with "library 'tinfo' not
-    # found" - which is a step backwards from the failure it was meant to fix.
+    # Each one is added only when the machine actually has it, because the answer
+    # differs by distributor and a missing -l stops the link:
+    #   - terminfo: Linux only. macOS keeps those symbols in libSystem and has no
+    #     libtinfo, so asking for it there fails with "library 'tinfo' not found".
+    #   - zstd: present in Homebrew's LLVM build and in Debian's, absent from the
+    #     official macOS release archive, which needs nothing beyond the system.
+    #   - z: in the macOS SDK and every Linux distribution.
     if(NOT WIN32)
-        set(CMAKE_CXX_STANDARD_LIBRARIES
-            "${CMAKE_CXX_STANDARD_LIBRARIES} -lz -lzstd")
+        set(_tail_libs "")
+        find_library(MIKO_SYS_Z NAMES z libz)
+        if(MIKO_SYS_Z)
+            list(APPEND _tail_libs "-lz")
+        endif()
+        find_library(MIKO_SYS_ZSTD NAMES zstd libzstd)
+        if(MIKO_SYS_ZSTD)
+            list(APPEND _tail_libs "-lzstd")
+        endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            find_library(MIKO_SYS_TINFO NAMES tinfo terminfo)
+            if(MIKO_SYS_TINFO)
+                list(APPEND _tail_libs "-ltinfo")
+            endif()
+        endif()
+        if(_tail_libs)
             set(CMAKE_CXX_STANDARD_LIBRARIES
-                "${CMAKE_CXX_STANDARD_LIBRARIES} -ltinfo")
+                "${CMAKE_CXX_STANDARD_LIBRARIES} ${_tail_libs}")
         endif()
     endif()
 
@@ -264,11 +281,7 @@ if(MIKO_ENABLE_LLVM)
     target_link_libraries(miko PRIVATE ${LLVM_LIBS})
     message(STATUS "LLVM link libraries: ${LLVM_LIBS}")
     if(NOT WIN32)
-        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            message(STATUS "appended to the end of the link line: -lz -lzstd -ltinfo")
-        else()
-            message(STATUS "appended to the end of the link line: -lz -lzstd")
-        endif()
+        message(STATUS "appended to the end of the link line: ${_tail_libs}")
     endif()
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
