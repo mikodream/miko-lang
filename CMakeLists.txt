@@ -228,107 +228,39 @@ if(MIKO_ENABLE_LLVM)
         passes
     )
 
-    # The component list covers LLVM's own archives but not the system libraries
-    # those archives were built against, and a distribution's LLVM references them
-    # for real: on Linux LLVMSupport calls set_curterm/setupterm/tigetnum from
-    # terminfo and the zstd entry points, so the link stops with "undefined
-    # reference to set_curterm" on a machine where nothing was installed by hand.
-    # llvm-config knows the set, which beats guessing -lz -lzstd -ltinfo per
-    # platform.
+    # Linking against LLVM's static archives means the linker sees a long list of .a
+    # files whose order decides whether anything resolves, and a distribution's
+    # LLVMSupport calls into zstd and terminfo, which must therefore appear after it.
+    # CMake does not preserve that order: it groups imported targets and raw paths
+    # however it likes, so the command failed with "undefined reference to
+    # ZSTD_compressBound" while libzstd.so was in it twice, both times too early.
+    # Passing the libraries as link options is no better - those are emitted before
+    # the libraries, not after. Appending them a second time did not help either.
     #
-    # The list is filtered rather than trusted: the Windows archive reports
-    # xml2s.lib, an internal static library it links while building itself but does
-    # not ship, and handing that to the linker turns a working build into
-    # "LNK1181: cannot open input file 'xml2s.lib'". Anything already resolvable as
-    # a -l flag, or as a file that exists, is kept.
-    # Ubuntu installs llvm-config as llvm-config-18 rather than llvm-config, so
-    # looking only for the unversioned name finds nothing there and silently links
-    # no system libraries at all - which is why terminfo stayed missing after this
-    # was first added. The version comes from the package that was just found.
-    set(_llvm_config_names llvm-config llvm-config.exe)
-    if(LLVM_PACKAGE_VERSION_MAJOR)
-        list(APPEND _llvm_config_names
-            "llvm-config-${LLVM_PACKAGE_VERSION_MAJOR}"
-            "llvm-config-${LLVM_PACKAGE_VERSION}")
-    endif()
-    if(LLVM_PACKAGE_VERSION)
-        string(REGEX MATCH "^[0-9]+" _llvm_major "${LLVM_PACKAGE_VERSION}")
-        if(_llvm_major)
-            list(APPEND _llvm_config_names "llvm-config-${_llvm_major}")
-        endif()
-    endif()
-    find_program(MIKO_LLVM_CONFIG_EXE NAMES ${_llvm_config_names})
-    set(MIKO_LLVM_SYSTEM_LIBS "")
-    if(MIKO_LLVM_CONFIG_EXE)
-        execute_process(
-            COMMAND ${MIKO_LLVM_CONFIG_EXE} --system-libs
-            OUTPUT_VARIABLE _system_libs_raw
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
+    # So the ordering is not fought: on non-Windows the build links the shared library
+    # and the archives are dropped, because a shared library resolves in any order.
+    # Homebrew and the Debian packages both ship one. Windows keeps the static
+    # archives - they were verified to link there, its zlib and zstd come from the CRT
+    # or are imported by name, and the official archive ships no C++ dylib.
+    if(WIN32)
+        target_link_libraries(miko PRIVATE ${LLVM_LIBS})
+    else()
+        # find_library has no reason to look in the LLVM keg or in /usr/lib/llvm-18/lib,
+        # so LLVM's own reported libdir is supplied as a hint.
+        find_library(MIKO_LLVM_SHARED
+            NAMES LLVM-${LLVM_PACKAGE_VERSION_MAJOR} LLVM
+            HINTS ${LLVM_LIBRARY_DIRS}
         )
-        if(_system_libs_raw)
-            separate_arguments(_system_libs_list UNIX_COMMAND "${_system_libs_raw}")
-            foreach(_lib ${_system_libs_list})
-                if(_lib MATCHES "^-l" OR _lib MATCHES "^-")
-                    list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
-                elseif(IS_ABSOLUTE "${_lib}" AND EXISTS "${_lib}")
-                    list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
-                elseif(NOT IS_ABSOLUTE "${_lib}")
-                    # A bare name such as xml2s.lib: keep it only if the linker could
-                    # actually find it, which is not knowable here. Windows system
-                    # libraries are found by name, so names that look like SDK libraries
-                    # are kept and LLVM's internal ones are not.
-                    if(_lib MATCHES "\\.lib$")
-                        set(_lib_base "${_lib}")
-                        string(REGEX REPLACE "\\.lib$" "" _lib_base "${_lib_base}")
-                        find_library(MIKO_FOUND_${_lib_base} NAMES ${_lib_base})
-                        if(MIKO_FOUND_${_lib_base})
-                            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
-                        endif()
-                    else()
-                        list(APPEND MIKO_LLVM_SYSTEM_LIBS "${_lib}")
-                    endif()
-                endif()
-            endforeach()
+        if(MIKO_LLVM_SHARED)
+            target_link_libraries(miko PRIVATE "${MIKO_LLVM_SHARED}")
+            message(STATUS "LLVM shared library: ${MIKO_LLVM_SHARED}")
+        else()
+            # Nothing better available: fall back to the archives and the system
+            # libraries, in the order that at least worked where it was tried.
+            target_link_libraries(miko PRIVATE ${LLVM_LIBS} -lz -lzstd -ltinfo)
+            message(STATUS "LLVM shared library not found; linking static archives")
         endif()
     endif()
-
-    # A second line of defence: llvm-config --system-libs is not dependable across
-    # distributions - Ubuntu's LLVM 18 omits terminfo even though LLVMSupport calls
-    # into it, and Homebrew's LLVM does not publish its zstd/zlib paths outside the
-    # keg. Both are needed to link, so whatever is actually installed is added here
-    # as well and duplicates are harmless. On Windows these live in the CRT or are
-    # imported by name, so none of it applies.
-    if(NOT WIN32)
-        find_library(MIKO_TERMINFO_LIB NAMES tinfo terminfo)
-        if(MIKO_TERMINFO_LIB)
-            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${MIKO_TERMINFO_LIB}")
-        endif()
-        find_library(MIKO_ZLIB_LIB NAMES z libz)
-        if(MIKO_ZLIB_LIB)
-            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${MIKO_ZLIB_LIB}")
-        endif()
-        find_library(MIKO_ZSTD_SYS_LIB NAMES zstd libzstd)
-        if(MIKO_ZSTD_SYS_LIB)
-            list(APPEND MIKO_LLVM_SYSTEM_LIBS "${MIKO_ZSTD_SYS_LIB}")
-        endif()
-    endif()
-
-    # The one-pass linker problem. ld resolves a static archive's undefined symbols
-    # only against libraries that come *after* it, and the archive calling
-    # ZSTD_compress is libLLVMSupport.a. CMake placed the paths find_library returned
-    # ahead of the LLVM archives, so libzstd.so sat before the archive that needs it
-    # and the link failed with "undefined reference to ZSTD_compressBound" while the
-    # library was plainly on the line.
-    #
-    # Listing the set again after the archives fixes the order. The LINK_GROUP /
-    # RESCAN generator expression does not work here - it made configure fail on
-    # add_executable and dropped LLVM's own symbols from the link - so this is the
-    # plain repeat, which is enough for a single pass.
-    target_link_libraries(miko PRIVATE ${LLVM_LIBS} ${MIKO_LLVM_SYSTEM_LIBS})
-    foreach(_lib ${MIKO_LLVM_SYSTEM_LIBS})
-        target_link_libraries(miko PRIVATE ${_lib})
-    endforeach()
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
 endif()
