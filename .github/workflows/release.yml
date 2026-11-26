@@ -57,6 +57,11 @@ jobs:
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
+    # The arm64 images are the ones most likely to be missing a component (LLVM is
+    # not installed everywhere). A release missing one platform is still worth
+    # shipping, and the gap is visible in the run summary, so those jobs are marked
+    # experimental rather than allowed to fail the whole release.
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       # One platform failing must not cancel the others: a release missing only
       # the arm64 Mac is still worth shipping, and the failure is visible in the
@@ -93,6 +98,7 @@ jobs:
             os: windows-11-arm
             arch: arm64
             target: windows-arm64
+            experimental: true
             archive: miko-${{ needs.version.outputs.version }}-windows-arm64.zip
 
     steps:
@@ -123,32 +129,39 @@ jobs:
           # default, and the link script calls bare `clang`.
           echo "$prefix/bin" >> "$GITHUB_PATH"
 
-      - name: Install LLVM (Windows)
+      # LLVM is not installed on Windows on purpose: the runner image already has a
+      # full LLVM at C:\Program Files\LLVM, and `choco install llvm` replaces it with
+      # a clang-only build that ships no LLVMConfig.cmake - which is why this job
+      # failed inside find_package(LLVM) the first time it ran. MinGW is still
+      # needed because difftest links the emitted IR with gcc.
+      - name: Install MinGW and locate LLVM (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install llvm --yes --no-progress
-          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-          # The self-hosted stage builds a .exe, so it needs a linker and headers
-          # that a bare clang install cannot find on Windows. MinGW provides both.
           choco install mingw --yes --no-progress
           "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
-          # Locate the CMake package wherever the install put it. Both the official
-          # installer and the chocolatey package normally use Program Files, but
-          # the tools directory is checked too because that is where choco unpacks.
           $candidates = @(
             "C:\Program Files\LLVM\lib\cmake\llvm",
-            "C:\ProgramData\chocolatey\lib\llvm\tools\LLVM\lib\cmake\llvm"
+            "C:\Program Files (x86)\LLVM\lib\cmake\llvm"
           )
           $found = $candidates | Where-Object { Test-Path (Join-Path $_ "LLVMConfig.cmake") } | Select-Object -First 1
           if (-not $found) {
-            $found = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Recurse -Filter "LLVMConfig.cmake" -ErrorAction SilentlyContinue |
-              Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
+            $llvmConfig = Get-Command llvm-config -ErrorAction SilentlyContinue
+            if ($llvmConfig) {
+              $dir = & $llvmConfig.Source --cmakedir 2>$null
+              if ($dir -and (Test-Path (Join-Path $dir.Trim() "LLVMConfig.cmake"))) { $found = $dir.Trim() }
+            }
           }
-          if (-not $found) { throw "LLVMConfig.cmake not found after installing LLVM" }
+          if (-not $found) { throw "LLVMConfig.cmake not found; the runner image changed" }
           Write-Host "LLVM_DIR=$found"
           "LLVM_DIR=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+          # clang has to be on PATH: the link script and difftest both call it by
+          # name, and the arm64 image does not put it there.
+          $bin = Split-Path (Split-Path (Split-Path $found -Parent) -Parent) -Parent
+          $binDir = Join-Path $bin "bin"
+          if (Test-Path (Join-Path $binDir "clang.exe")) { $binDir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH }
 
       - name: Report the toolchain
         shell: bash
