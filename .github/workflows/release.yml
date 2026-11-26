@@ -125,31 +125,47 @@ jobs:
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
-      # Homebrew is no longer used for LLVM. On a fresh macos-15 arm64 image brew
-      # installed 23.1.5, and LLVM 23 rejects this backend's output outright - every
-      # function came back "Basic Block in function 'main' does not have terminator".
-      # A formula that tracks the newest release cannot be relied on to match a
-      # compiler that is verified against 22, so the official 22.1.8 archive is
-      # downloaded for the runner's own architecture, the same way Windows does it.
-      - name: Install LLVM 22.1.8 from the release archive (macOS)
+      # macOS gets LLVM 22 two different ways, because only one of them exists for each
+      # architecture.
+      #
+      # Homebrew tracks the newest release and on a fresh macos-15 arm64 image that is
+      # 23.1.5, which rejects this backend's output outright - every function came back
+      # "Basic Block in function 'main' does not have terminator". On macos-15-intel
+      # the same formula was 22.1.8_2 and worked, so Brew is kept for x64.
+      #
+      # The official 22.1.8 release has no macOS x64 asset at all - checking the
+      # release listing shows only LLVM-22.1.8-macOS-ARM64.tar.xz - so arm64 downloads
+      # that and x64 has no alternative to Brew.
+      - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           case "$(uname -m)" in
-            arm64)  triple="arm64-apple-darwin" ;;
-            x86_64) triple="x86_64-apple-darwin" ;;
+            arm64)  triple="ARM64" ;;
+            x86_64) triple="" ;;
             *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
           esac
-          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-${triple}.tar.xz"
-          # ~2 GB unpacked; the CI disk has room and a cache would need its own key per
-          # architecture, which is more moving parts than this is worth.
-          curl -fsSL "$url" -o llvm.tar.xz
-          mkdir -p llvm-dist
-          tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
-          rm -f llvm.tar.xz
-          echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
-          echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
-          "$PWD/llvm-dist/bin/llvm-config" --version
+          if [ -n "$triple" ]; then
+            url="https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-${triple}.tar.xz"
+            curl -fsSL "$url" -o llvm.tar.xz
+            mkdir -p llvm-dist
+            tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
+            rm -f llvm.tar.xz
+            echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
+            echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
+            "$PWD/llvm-dist/bin/llvm-config" --version
+          else
+            # zstd and zlib are what Homebrew's LLVM build links against and does not
+            # re-export.
+            brew install llvm zstd zlib
+            prefix="$(brew --prefix llvm)"
+            echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+            # keg-only: clang and llvm-config are not on PATH, and the link script calls
+            # bare `clang`.
+            echo "$prefix/bin" >> "$GITHUB_PATH"
+            echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
+            "$prefix/bin/llvm-config" --version
+          fi
 
       # Windows needs the LLVM release archive, not the LLVM installer: neither
       # `choco install llvm` nor the official LLVM-*-win64.exe publishes

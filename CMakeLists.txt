@@ -265,8 +265,13 @@ if(MIKO_ENABLE_LLVM)
             endif()
         endif()
         if(_tail_libs)
+            # The list is joined with spaces before it goes into the variable. Left as a
+            # CMake list it interpolates as one string containing semicolons -
+            # "-lz;-lzstd;-ltinfo" - which the shell hands to the compiler as a single
+            # argument, and the whole point of these flags is lost.
+            string(REPLACE ";" " " _tail_str "${_tail_libs}")
             set(CMAKE_CXX_STANDARD_LIBRARIES
-                "${CMAKE_CXX_STANDARD_LIBRARIES} ${_tail_libs}")
+                "${CMAKE_CXX_STANDARD_LIBRARIES} ${_tail_str}")
         endif()
     endif()
 
