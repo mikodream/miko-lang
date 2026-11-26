@@ -1,0 +1,95 @@
+name: probe arm64 windows build
+
+# Temporary. Installs the Visual Studio C++ toolset on the arm64 Windows runner and
+# then does the real thing: configure and build miko's stage 0 against LLVM's
+# aarch64 Windows archive, and run the resulting binary. If this works, the same
+# steps belong in the release workflow. Deleted once answered.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-stage0:
+    name: arm64 stage 0
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Visual Studio C++ toolset
+        shell: pwsh
+        run: |
+          $exe = "$env:TEMP\vs_buildtools.exe"
+          curl.exe -sSL -o $exe https://aka.ms/vs/17/release/vs_buildtools.exe
+          # No Visual Studio is present on this image, so stage 0 - a C++ program -
+          # has nothing to build it with. The Windows SDK is already here; the
+          # compiler and the CRT are what the installer adds.
+          $args = @(
+            '--quiet', '--wait', '--norestart', '--nocache',
+            '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+            '--includeRecommended'
+          )
+          $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+
+      - name: Report what landed
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          Write-Host "vswhere: $(Test-Path $vswhere)"
+          if (Test-Path $vswhere) { & $vswhere -latest -products * -property installationPath }
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "VS: $_" }
+          Write-Host "--- cl.exe instances ---"
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\*\*\cl.exe" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.FullName)" }
+          Write-Host "--- arm64 CRT/libpresent ---"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib\*\um\*" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  um/$($_.Name)" }
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\lib\*" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  msvc lib/$($_.Name)" }
+
+      - name: Install LLVM 22.1.8 for arm64
+        shell: pwsh
+        run: |
+          # 22.1.8 is the version this backend is verified against; 23 rejects its IR.
+          # This is the native aarch64 Windows build of the same release.
+          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-aarch64-pc-windows-msvc.tar.xz'
+          curl.exe -sSL -o llvm.tar.xz $url
+          New-Item -ItemType Directory -Force -Path C:\llvmarm | Out-Null
+          tar -xf llvm.tar.xz --strip-components=1 -C C:\llvmarm
+          Write-Host "LLVMConfig: $(Test-Path 'C:\llvmarm\lib\cmake\llvm\LLVMConfig.cmake')"
+          & C:\llvmarm\bin\llvm-config.exe --version
+
+      - name: Configure and build stage 0
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $using = $null
+          foreach ($try in @('18', '17')) {
+            $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationVersion 2>$null
+            if ($found) { Write-Host "VS with arm64 tools: $found" }
+          }
+          $v = & $vswhere -latest -products * -property installationVersion
+          Write-Host "latest VS: $v"
+          $major = ($v -split '\.')[0]
+          $generator = if ([int]$major -ge 18) { 'Visual Studio 18 2026' } else { 'Visual Studio 17 2022' }
+          Write-Host "generator: $generator"
+          $env:PATH = "C:\llvmarm\bin;$env:PATH"
+          cmake -S . -B build-arm64 -G $generator -A ARM64 `
+            -DMIKO_ENABLE_LLVM=ON -DLLVM_DIR="C:/llvmarm/lib/cmake/llvm"
+          Write-Host "configure exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { Get-ChildItem build-arm64 -Recurse -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName | Select-Object -Last 20 } }
+          cmake --build build-arm64 --config Release --target miko
+          Write-Host "build exit: $LASTEXITCODE"
+
+      - name: Run it
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build-arm64 -Recurse -Filter miko.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "no miko.exe produced" }
+          Write-Host "exe: $($exe.FullName)"
+          & $exe.FullName --version
+          Write-Host "version exit: $LASTEXITCODE"
+          & $exe.FullName --help | Select-Object -First 3
