@@ -153,12 +153,17 @@ jobs:
             rm -f llvm.tar.xz
             # The archive does not carry libzstd, but its LLVMSupport is built against
             # it: without the library the link stops at "ld: library 'zstd' not found".
-            # Only the library is needed, so the keg goes on the search path rather
-            # than replacing the compiler that was just unpacked.
             brew install zstd
             echo "LIBRARY_PATH=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
             echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
             echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
+            # This archive's static libraries are LLVM bitcode, not native objects, so
+            # they have to be linked by a linker that reads LLVM 22 bitcode. Xcode's is
+            # LLVM 17 and refuses every one of them with "Unknown attribute kind (102)
+            # (Producer: 'LLVM22.1.8' Reader: 'LLVM APPLE_1_1700.0.13.5_0')". Building
+            # with the archive's own clang keeps producer and reader in step.
+            echo "CC=$PWD/llvm-dist/bin/clang" >> "$GITHUB_ENV"
+            echo "CXX=$PWD/llvm-dist/bin/clang++" >> "$GITHUB_ENV"
             "$PWD/llvm-dist/bin/llvm-config" --version
           else
             # zstd and zlib are what Homebrew's LLVM build links against and does not
