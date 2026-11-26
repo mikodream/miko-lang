@@ -79,16 +79,23 @@ jobs:
             arch: x64
             target: macos-x64
             archive: miko-${{ needs.version.outputs.version }}-macos-x64.tar.gz
-          - name: macos-arm64
-            # macos-14 here was cancelled the instant it started: no runner was ever
-            # assigned, runner_name came back empty and no step ran. macos-15 is the
-            # current Apple Silicon image. If this one is cancelled the same way, the
-            # account cannot obtain an arm64 macOS runner and the entry should go,
-            # rather than sitting in the matrix failing every release.
-            os: macos-15
-            arch: arm64
-            target: macos-arm64
-            archive: miko-${{ needs.version.outputs.version }}-macos-arm64.tar.gz
+          # macos-arm64 is not built, and the reason is not a lack of interest.
+          #
+          # A release needs LLVM 22: LLVM 23 removed IRBuilder::CreateGlobalStringPtr
+          # and rejects this backend's output outright. On the arm64 macOS image
+          # Homebrew's llvm is 23.1.5, so Brew is out. The official
+          # LLVM-22.1.8-macOS-ARM64 archive is the only 22 available, and it cannot be
+          # linked against with Apple's toolchain: its static libraries are LLVM
+          # bitcode, which Xcode's LLVM 17 linker refuses with "Unknown attribute kind
+          # (102) (Producer: 'LLVM22.1.8' Reader: 'LLVM APPLE_1_1700.0.13.5_0')".
+          # Building with the archive's own clang fixes that and then fails on
+          # __hash_memory, because that clang's libc++ expects a newer libc++ than
+          # Xcode ships. Both halves of that pairing have to match and only one of them
+          # can be chosen from here.
+          #
+          # Four platforms build and are published. This gap is stated rather than
+          # hidden: it needs either a Homebrew formula for LLVM 22 on arm64 or an
+          # LLVM built from source for that target.
           - name: windows-x64
             os: windows-latest
             arch: x64
@@ -125,66 +132,25 @@ jobs:
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
-      # macOS gets LLVM 22 two different ways, because only one of them exists for each
-      # architecture.
+      # macOS x64 only. Brew's llvm resolved to 22.1.8_2 on the Intel image and built
+      # and linked, while the same formula on the arm64 image is 23.1.5, which is a
+      # version this backend cannot target. See the matrix note for why arm64 is absent.
       #
-      # Homebrew tracks the newest release and on a fresh macos-15 arm64 image that is
-      # 23.1.5, which rejects this backend's output outright - every function came back
-      # "Basic Block in function 'main' does not have terminator". On macos-15-intel
-      # the same formula was 22.1.8_2 and worked, so Brew is kept for x64.
-      #
-      # The official 22.1.8 release has no macOS x64 asset at all - checking the
-      # release listing shows only LLVM-22.1.8-macOS-ARM64.tar.xz - so arm64 downloads
-      # that and x64 has no alternative to Brew.
+      # zstd and zlib are what Homebrew's LLVM build links against and does not
+      # re-export; without them the link stops on undefined ZSTD symbols.
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            arm64)  triple="ARM64" ;;
-            x86_64) triple="" ;;
-            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          if [ -n "$triple" ]; then
-            url="https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-${triple}.tar.xz"
-            curl -fsSL "$url" -o llvm.tar.xz
-            mkdir -p llvm-dist
-            tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
-            rm -f llvm.tar.xz
-            # The archive does not carry libzstd, but its LLVMSupport is built against
-            # it: without the library the link stops at "ld: library 'zstd' not found".
-            brew install zstd
-            echo "LIBRARY_PATH=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
-            echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
-            echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
-            # This archive's static libraries are LLVM bitcode, not native objects, so
-            # they have to be linked by a linker that reads LLVM 22 bitcode. Xcode's is
-            # LLVM 17 and refuses every one of them with "Unknown attribute kind (102)
-            # (Producer: 'LLVM22.1.8' Reader: 'LLVM APPLE_1_1700.0.13.5_0')". Building
-            # with the archive's own clang keeps producer and reader in step.
-            echo "CC=$PWD/llvm-dist/bin/clang" >> "$GITHUB_ENV"
-            echo "CXX=$PWD/llvm-dist/bin/clang++" >> "$GITHUB_ENV"
-            # That clang also brings its own libc++ headers, which expect a newer libc++
-            # than the one in Xcode - the link then fails on __hash_memory, a symbol the
-            # older library does not export. Pointing at Xcode's headers keeps the
-            # headers and the library the same vintage.
-            xcode_cxx="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1"
-            if [ -d "$xcode_cxx" ]; then
-              echo "CXXFLAGS=-nostdinc++ -isystem $xcode_cxx" >> "$GITHUB_ENV"
-            fi
-            "$PWD/llvm-dist/bin/llvm-config" --version
-          else
-            # zstd and zlib are what Homebrew's LLVM build links against and does not
-            # re-export.
-            brew install llvm zstd zlib
-            prefix="$(brew --prefix llvm)"
-            echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
-            # keg-only: clang and llvm-config are not on PATH, and the link script calls
-            # bare `clang`.
-            echo "$prefix/bin" >> "$GITHUB_PATH"
-            echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
-            "$prefix/bin/llvm-config" --version
-          fi
+          brew install llvm zstd zlib
+          prefix="$(brew --prefix llvm)"
+          echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+          # keg-only: clang and llvm-config are not on PATH, and the link script calls
+          # bare `clang`.
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          # find_library consults these through the hints CMakeLists passes it.
+          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
+          "$prefix/bin/llvm-config" --version
 
       # Windows needs the LLVM release archive, not the LLVM installer: neither
       # `choco install llvm` nor the official LLVM-*-win64.exe publishes
