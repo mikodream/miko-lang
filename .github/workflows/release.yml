@@ -164,6 +164,14 @@ jobs:
             # with the archive's own clang keeps producer and reader in step.
             echo "CC=$PWD/llvm-dist/bin/clang" >> "$GITHUB_ENV"
             echo "CXX=$PWD/llvm-dist/bin/clang++" >> "$GITHUB_ENV"
+            # That clang also brings its own libc++ headers, which expect a newer libc++
+            # than the one in Xcode - the link then fails on __hash_memory, a symbol the
+            # older library does not export. Pointing at Xcode's headers keeps the
+            # headers and the library the same vintage.
+            xcode_cxx="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1"
+            if [ -d "$xcode_cxx" ]; then
+              echo "CXXFLAGS=-nostdinc++ -isystem $xcode_cxx" >> "$GITHUB_ENV"
+            fi
             "$PWD/llvm-dist/bin/llvm-config" --version
           else
             # zstd and zlib are what Homebrew's LLVM build links against and does not
