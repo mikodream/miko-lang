@@ -1,0 +1,86 @@
+name: probe arm64 toolchains
+
+# Temporary. Reports what the arm64 Windows runner actually has, so the release
+# workflow can be written against facts instead of guesses. Deleted once answered.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe-windows-arm64:
+    name: probe windows-arm64
+    runs-on: windows-11-arm
+    steps:
+      - name: Report the environment
+        shell: pwsh
+        run: |
+          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "Arch: $env:PROCESSOR_ARCHITECTURE  $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          Write-Host "Disk free: $([math]::Round((Get-PSDrive C).Free/1GB,1)) GB"
+
+          Write-Host "`n=== Visual Studio ==="
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          Write-Host "vswhere: $(Test-Path $vswhere)"
+          Write-Host "VS dirs:"
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  $_" }
+
+          Write-Host "`n=== Windows SDK ==="
+          $kits = "C:\Program Files (x86)\Windows Kits\10\Lib"
+          Write-Host "Kits\10\Lib exists: $(Test-Path $kits)"
+          Get-ChildItem $kits -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name |
+            ForEach-Object { Write-Host "  sdk $_" }
+          Get-ChildItem (Join-Path $kits "*\um") -Directory -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name -Unique | ForEach-Object { Write-Host "  um arch: $_" }
+
+          Write-Host "`n=== compilers on PATH ==="
+          foreach ($c in @('cl','clang','clang++','clang-cl','gcc','g++','lld-link')) {
+            $p = Get-Command $c -ErrorAction SilentlyContinue
+            Write-Host ("  {0,-10} {1}" -f $c, ($(if ($p) { $p.Source } else { '-' })))
+          }
+
+          Write-Host "`n=== installers reachable ==="
+          foreach ($u in @(
+            'https://aka.ms/vs/17/release/vs_buildtools.exe',
+            'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-aarch64-pc-windows-msvc.tar.xz'
+          )) {
+            try {
+              $r = Invoke-WebRequest -Uri $u -Method Head -MaximumRedirection 5 -TimeoutSec 40 -UseBasicParsing
+              Write-Host ("  {0} -> {1}" -f $u, $r.StatusCode)
+            } catch {
+              Write-Host ("  {0} -> ERR {1}" -f $u, $_.Exception.Message)
+            }
+          }
+
+      - name: Can Build Tools install here
+        shell: pwsh
+        run: |
+          Write-Host "winget: $([bool](Get-Command winget -ErrorAction SilentlyContinue))"
+          $exe = "$env:TEMP\vs_buildtools.exe"
+          try {
+            curl.exe -sSL -o $exe https://aka.ms/vs/17/release/vs_buildtools.exe
+            Write-Host "downloaded: $(Test-Path $exe)  $([math]::Round((Get-Item $exe -ErrorAction SilentlyContinue).Length/1MB,1)) MB"
+          } catch {
+            Write-Host "download failed: $($_.Exception.Message)"
+          }
+
+  probe-macos-arm64:
+    name: probe macos-arm64
+    runs-on: macos-15
+    steps:
+      - name: Report the environment
+        run: |
+          set -x
+          uname -m
+          sw_vers
+          xcode-select -p
+          ls "$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1" | head -5
+          echo "--- does Apple libc++ export __hash_memory ---"
+          libcxx="$(xcrun --show-sdk-path)/usr/lib/libc++.1.tbd"
+          ls -l "$libcxx" 2>/dev/null || echo "no tbd at $libcxx"
+          nm -gU "$(xcrun --find clang++ | xargs dirname)/../lib/libc++.1.dylib" 2>/dev/null | grep -c hash_memory || echo "nm on toolchain dylib unavailable"
+          echo "--- brew llvm availability ---"
+          brew info llvm 2>&1 | head -3
+          brew info llvm@22 2>&1 | head -3 || true
+          echo "--- clang version shipped by Xcode ---"
+          clang++ --version
