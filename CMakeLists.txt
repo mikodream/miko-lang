@@ -314,7 +314,21 @@ if(MIKO_ENABLE_LLVM)
         endif()
     endif()
 
+    # The one-pass linker problem. ld resolves a static archive's undefined symbols
+    # only against libraries that come *after* it, and the archive calling
+    # ZSTD_compress is libLLVMSupport.a. CMake placed the paths find_library returned
+    # ahead of the LLVM archives, so libzstd.so sat before the archive that needs it
+    # and the link failed with "undefined reference to ZSTD_compressBound" while the
+    # library was plainly on the line.
+    #
+    # Listing the set again after the archives fixes the order. The LINK_GROUP /
+    # RESCAN generator expression does not work here - it made configure fail on
+    # add_executable and dropped LLVM's own symbols from the link - so this is the
+    # plain repeat, which is enough for a single pass.
     target_link_libraries(miko PRIVATE ${LLVM_LIBS} ${MIKO_LLVM_SYSTEM_LIBS})
+    foreach(_lib ${MIKO_LLVM_SYSTEM_LIBS})
+        target_link_libraries(miko PRIVATE ${_lib})
+    endforeach()
 else()
     target_compile_definitions(miko PRIVATE MIKO_ENABLE_LLVM=0)
 endif()
