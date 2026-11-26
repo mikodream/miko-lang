@@ -124,6 +124,10 @@ jobs:
         shell: pwsh
         run: |
           Get-Process | Where-Object { $_.ProcessName -match 'miko' } | ForEach-Object { try { $_.Kill() } catch {} }
+          # out/ is not in the repository, so on a fresh clone it does not exist and
+          # the IR writer reports "no such file or directory" for a path it was never
+          # able to create.
+          New-Item -ItemType Directory -Force -Path out | Out-Null
           & build-vs-llvm\Release\miko.exe compiler\main_ll.miko --compile --emit-ir -o out\self.ll
           if ($LASTEXITCODE -ne 0) { throw "self-hosted IR emission failed" }
           cmd /c "dist\miko-link.bat out\self.ll out\miko_self.exe"
