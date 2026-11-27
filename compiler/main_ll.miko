@@ -806,21 +806,26 @@ fn compile_file(source_path: string, output_prefix: string, want_exe: bool): i32
     let error = check_static_rules(tree);
     if error != "" {
         eprint("error: " + error);
+        print("failed");
         return 1;
     }
     let imported = imp_gather(tree, "");
     let ir = codegen_ll.generate_ir(imported + "Module " + "program" + "\n" + tree);
     write_file(output_prefix + ".ll", ir);
-    print("wrote " + output_prefix + ".ll");
     if want_exe {
         let status = link_executable(output_prefix);
         if status != 0 {
             eprint("miko: linking failed with exit status " + digits_of(status));
             eprint("miko: the .ll was written; check miko.toolchain for the clang paths");
+            print("failed");
             return 1;
         }
-        print("wrote " + output_prefix + ".exe");
     }
+    // One word, because the previous two lines both said "wrote" and one of them
+    // said "<prefix>.exe" on platforms where the binary has no extension at all.
+    // Naming the outputs is what introduced that lie; the caller supplied the
+    // prefix and can look.
+    print("success");
     return 0;
 }
 
@@ -831,7 +836,7 @@ fn compile_self_to(prefix: string) {
     write_file(prefix + ".sema", checked);
     let ir = codegen_ll.generate_ir(tree);
     write_file(prefix + ".ll", ir);
-    print("wrote " + prefix + ".ll");
+    print("success");
 }
 
 fn compile_self() {
@@ -845,11 +850,12 @@ fn usage() {
     print("  miko --version              print the version");
     print("  miko --help                 print this text");
     print("  miko --self [prefix]        compile the whole compiler to <prefix>.ll");
-    print("  miko <src.miko> <prefix>    compile one program to <prefix>.exe");
+    print("  miko <src.miko> <prefix>    compile one program and link it");
     print("  miko                        same as --self with prefix out/whole_program");
     print("");
     print("compiling a program is a single step: <prefix>.ll is emitted and linked");
-    print("against runtime/miko_runtime.c into <prefix>.exe.");
+    print("against runtime/miko_runtime.c. The binary is <prefix>, plus .exe on");
+    print("Windows. On success the compiler prints one word: success.");
     print("");
     print("add --emit-ir to stop after the IR and skip linking:");
     print("  miko --emit-ir <src.miko> <prefix>");

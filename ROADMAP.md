@@ -563,7 +563,7 @@ miko-0.2.0-windows-arm64.zip    248635
 
 八个 job 全绿：三个 `decide the tag` / 四个原生构建 / `windows, cross-compiled` / 两个 `verify windows-*` / `tag and release`。
 
-CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两代 `1351347` 字节、`3ED78C9CA5CE1E12`。
+CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两代 `1350783` 字节、`FD688C651F0031DB`。
 
 ### 9.6 解决 windows-arm64：把编译器从 Windows 上拿掉
 
@@ -575,7 +575,7 @@ CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两�
 
 链路是：Linux 建 stage 0 → stage 1 → `stage1/miko --self out/compiler` 得到无 triple 的 IR → 两个目标各链一次（`-static`，所以包不依赖任何运行库 DLL）。同一个 `miko.ll` 变成 Linux 二进制、Windows x64 二进制、Windows arm64 二进制。
 
-交叉编译不许偷掉验证。单独的 job 把包下到真实 Windows runner（`windows-latest` 和 `windows-11-arm`）上：跑 `--version`、跑 `--self`（产出 1351347 字节）、再跑 19 个从同一份 IR 交叉链接出来的 difftest 程序，逐个比 `.expected`。**19/19 全过，两个架构都是。** 跑不起的 Windows 二进制在 CI 就红，不会到用户机器上才红。
+交叉编译不许偷掉验证。单独的 job 把包下到真实 Windows runner（`windows-latest` 和 `windows-11-arm`）上：跑 `--version`、跑 `--self`（产出 1350783 字节）、再跑 19 个从同一份 IR 交叉链接出来的 difftest 程序，逐个比 `.expected`。**19/19 全过，两个架构都是。** 跑不起的 Windows 二进制在 CI 就红，不会到用户机器上才红。
 
 `dist/miko-link.bat` 里的 vswhere、vcvars64.bat、MSVC 工具链全部删掉：现在是 `MIKO_CC` 优先，其次 PATH 上的 clang，其次 llvm-mingw 和 LLVM 的常规安装位置。两条路径都在本机对 llvm-mingw 20261117 验过，链接并运行正常。
 
@@ -607,11 +607,11 @@ CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两�
 miko.exe --version        →  miko 0.2.0 (miko-implemented, LLVM IR backend)
 miko.exe d.miko d         →  wrote d.exe
 d.exe                     →  sum = 55
-miko.exe --self out2\g1   →  1351347 字节, 3ED78C9CA5CE1E12
-out2\g1.exe --self g2     →  1351347 字节, 3ED78C9CA5CE1E12
+miko.exe --self out2\g1   →  1350783 字节, FD688C651F0031DB
+out2\g1.exe --self g2     →  1350783 字节, FD688C651F0031DB
 ```
 
-两代一致，且**与本机门禁同一定点** `3ED78C9CA5CE1E12`——一个完全独立编译出来的包，复现了门禁的数字。
+两代一致，且**与本机门禁同一定点** `FD688C651F0031DB`——一个完全独立编译出来的包，复现了门禁的数字。
 
 两个 exe 的 PE 头也核过：x64 包是 `x86-64`，arm64 包是 `ARM64`。
 
@@ -643,7 +643,32 @@ Linux 上最顽固的一个。症状始终是 `undefined reference to ZSTD_compr
 
 **stage 0 是唯一需要 LLVM 的东西。** 从 stage 1 开始全是 IR 文本。所以 LLVM 的 ABI 只影响"在哪建 stage 0"，不影响"给哪个平台出包"——这正是 Windows 能完全离开 MSVC 的原因。
 
-### 9.11 没解决的
+### 9.11 编译输出改成一句话
+
+`miko program.miko program` 原来打两行：
+
+```
+wrote program.ll
+wrote program.exe
+```
+
+第二行在 macOS 和 Linux 上是错的——产物叫 `program`，没有扩展名。`link_executable` 自己算得对（只有 Windows 加 `.exe`），错的是打印那句把 `.exe` 写死了。
+
+修法不是把后缀算对再拼上去，是把文件名从句子里去掉：调用者自己给的 prefix，自己能看。现在成功一行 `success`，失败一行 `failed`，诊断信息仍然走 stderr：
+
+```
+$ ./miko program.miko program
+success
+$ echo $?
+0
+```
+
+静态规则拒绝和链接失败两条路都验过，都是 `failed` 加退出码 1。`--emit-ir` 也一样。
+
+改了 `main_ll.miko`，定点哈希随之改变，这本来就是它的作用：`3ED78C9CA5CE1E12` → `FD688C651F0031DB`，尺寸 `1351347` → `1350783`（少了那些打印语句）。门禁仍然全绿：difftest `31 / 31`，bootstrap 两代同哈希、19/19。
+
+顺带一提，`program.ast` 和 `program.sema` 每次编译都会写在产物旁边。它们是调试用的中间产物，注释里写明是为了让 import 解析失败可见。没动，但每次都留两个文件在用户目录里，这个可以再商量。
+### 9.12 没解决的
 
 - **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没替他编一个。
 - **`.miko` 文件在库里仍存 CRLF**，虽然 `.gitattributes` 声明了 `text=auto eol=lf`。`git add --renormalize .` 能修；无害，因为词法接受两种换行。
