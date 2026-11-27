@@ -115,8 +115,12 @@ if ($IROnly) {
         # match, which is non-empty whenever any line lacks the pattern, so testing
         # an array that way reports a missing section for a file that has it.
         $sections = (& $Objdump -h $exe 2>&1 | Out-String)
-        $hasLine = $sections -match "\.debug_line"
-        $hasInfo = $sections -match "\.debug_info"
+        # No leading dot in these patterns. The section is .debug_line in ELF and
+        # COFF but __debug_line in Mach-O, inside a segment named __DWARF, so
+        # matching the dotted form reported "none" for the two macOS jobs while the
+        # info was there all along.
+        $hasLine = $sections -match "debug_line"
+        $hasInfo = $sections -match "debug_info"
 
         # The compiler's part is finished once the IR holds resolvable metadata; from
         # there the linker decides what reaches the executable. clang keeps the
@@ -132,8 +136,9 @@ if ($IROnly) {
             # missing leaves the next question - did the linker keep CodeView, or
             # nothing at all - to a second run.
             $dbgSeen = @()
-            foreach ($m in [regex]::Matches($sections, "(?m)^\s*\d+\s+(\.\S+)")) {
-                if ($m.Groups[1].Value -match "debug") { $dbgSeen += $m.Groups[1].Value }
+            foreach ($m in [regex]::Matches($sections, "(?:^|[\s,])(_{0,2}debug[_.\w]*)")) {
+                $name = $m.Groups[1].Value
+                if ($dbgSeen -notcontains $name) { $dbgSeen += $name }
             }
             $listed = "none"
             if ($dbgSeen.Count -gt 0) { $listed = $dbgSeen -join ", " }
