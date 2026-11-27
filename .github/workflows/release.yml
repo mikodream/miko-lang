@@ -155,15 +155,25 @@ jobs:
           # archive's clang is 22.
           echo "CC=$PWD/llvm-dist/bin/clang" >> "$GITHUB_ENV"
           echo "CXX=$PWD/llvm-dist/bin/clang++" >> "$GITHUB_ENV"
-          # -nostdlib++ stops the driver adding -lc++, then the archive's static
-          # libraries are named directly so the linker takes those and not Apple's.
+          # The archive's clang has to be the compiler, because only it reads LLVM 22
+          # bitcode and its static libraries are bitcode. Its libc++ headers must not
+          # come along, though: they declare __hash_memory as an exported symbol at
+          # version 220108, and Apple's libc++.1.dylib does not have it.
           #
-          # Exported under a private name and passed to cmake as -D below, because
-          # CMake initialises its flags from the _INIT environment variables: setting
-          # CMAKE_EXE_LINKER_FLAGS in the environment is silently ignored, and the
-          # link then fails on __hash_memory exactly as if the flag were never set.
-          libs="$PWD/llvm-dist/lib"
-          echo "MIKO_EXE_LINKER_FLAGS=-nostdlib++ $libs/libc++.a" >> "$GITHUB_ENV"
+          # Two ways to make headers and library agree were measured by compiling the
+          # whole compiler, which is the workload that shows the difference.
+          # -nostdlib++ with the archive's libc++.a links and then aborts inside
+          # libc++abi ("typed operator new being invoked before its static initializer
+          # in libcxx has been executed"), because libSystem already supplies libc++abi
+          # and the binary ends up with two copies and the wrong init order; libc++.a on
+          # its own is incomplete, it wants ___cxa_uncaught_exceptions and
+          # ___gxx_personality_v0 from libc++abi. Pointing at the SDK's own headers
+          # instead works: 0 occurrences of __hash_memory in them, and 2193829 bytes of
+          # IR from compiling the compiler.
+          #
+          # So the headers come from the SDK and the library is Apple's, unchanged.
+          sdk="$(xcrun --show-sdk-path)"
+          echo "MIKO_CXX_FLAGS=-nostdinc++ -isystem $sdk/usr/include/c++/v1" >> "$GITHUB_ENV"
           ./llvm-dist/bin/llvm-config --version
 
       - name: Install LLVM (macOS x64)
@@ -190,13 +200,13 @@ jobs:
       - name: Configure and build stage 0
         run: |
           set -euo pipefail
-          # MIKO_EXE_LINKER_FLAGS is only set by the macOS arm64 job, where the C++
-          # runtime has to come from the LLVM archive to match the archive's headers.
+          # MIKO_CXX_FLAGS is only set by the macOS arm64 job, where the C++ headers
+          # have to come from the SDK rather than from the LLVM archive.
           # A plain string rather than an array: macOS ships bash 3.2, where an empty
           # array counts as unset under `set -u` and `${extra[@]}` aborts the script.
           extra=""
-          if [ -n "${MIKO_EXE_LINKER_FLAGS:-}" ]; then
-            extra="-DCMAKE_EXE_LINKER_FLAGS=$MIKO_EXE_LINKER_FLAGS"
+          if [ -n "${MIKO_CXX_FLAGS:-}" ]; then
+            extra="-DCMAKE_CXX_FLAGS=$MIKO_CXX_FLAGS"
           fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -528,7 +538,12 @@ jobs:
           foreach ($exe in (Get-ChildItem tests\diff -Filter *.exe | Sort-Object Name)) {
             $expected = $exe.FullName -replace '\.exe$', '.expected'
             if (-not (Test-Path $expected)) { continue }
-            $actual = Normalize (& $exe.FullName 2>&1 | Out-String)
+            # stdout only, as tools/difftest.ps1 does. A case that is meant to die at
+            # run time keeps its message on stderr, and the .expected file records what
+            # the program printed, not what it complained about: merging the two made
+            # the bounds and division-by-zero cases look like mismatches when their
+            # stdout was exactly right.
+            $actual = Normalize (& $exe.FullName 2>$null | Out-String)
             $want = Normalize (Get-Content $expected -Raw)
             if ($actual -eq $want) { $pass++ }
             else {
