@@ -537,73 +537,85 @@ s = append_str(s, piece);
 
 修法是回退分支在看得见 Windows 系统目录时省掉 `-lm`（周围代码本来就靠这个判断选 `.exe` 后缀），并且 CI 门禁自己写一份 `miko.toolchain`，让门禁走的是发布包真正会走的那条路。
 
-### 9.5 结果的形状：四个平台，不是六个
+### 9.5 六个平台，全绿
 
-在写"发布成功"之前，先把成功是什么说清楚。矩阵原定六个平台，实际发布 **四个**：
+原先只发布四个：`windows-arm64` 和 `macos-arm64` 各自卡在一个不可绕过的地方。两个都解决了，但解法不是"再试一次"，是换掉前提。
 
-| 平台 | 状态 |
+| 平台 | 怎么建的 | 结果 |
+| --- | --- | --- |
+| linux-x64 | 原生，LLVM 18 | 通过 |
+| linux-arm64 | 原生，LLVM 18 | 通过 |
+| macos-x64 | 原生，Brew LLVM 22.1.8_2 | 通过 |
+| macos-arm64 | 原生，官方 22.1.8 归档 + SDK 头 | 通过 |
+| windows-x64 | **在 Linux 上交叉编译，llvm-mingw** | 通过 |
+| windows-arm64 | **在 Linux 上交叉编译，llvm-mingw** | 通过 |
+
+`tag: v0.2.0-35`，六个资产：
+
+```
+miko-0.2.0-linux-x64.tar.gz     231885
+miko-0.2.0-linux-arm64.tar.gz   223222
+miko-0.2.0-macos-x64.tar.gz     227353
+miko-0.2.0-macos-arm64.tar.gz   223264
+miko-0.2.0-windows-x64.zip      258730
+miko-0.2.0-windows-arm64.zip    248635
+```
+
+八个 job 全绿：三个 `decide the tag` / 四个原生构建 / `windows, cross-compiled` / 两个 `verify windows-*` / `tag and release`。
+
+CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两代 `1351347` 字节、`3ED78C9CA5CE1E12`。
+
+### 9.6 解决 windows-arm64：把编译器从 Windows 上拿掉
+
+`windows-11-arm` 没有 Visual Studio，`vswhere.exe` 都不在，而 stage 0 是 MSVC 编的 C++ 程序——所以不管流水线怎么写都建不出来。试过在 runner 上装 VS Build Tools（能下下来，4.3 MB），但那条路的终点是"必须有 MSVC"。
+
+**换掉的是前提，不是参数。** 关键事实是：自举编译器产出的 IR **没有 target triple，也没有 data layout**（实测 0 次出现，stage 0 的 LLVM 会写一行，自举后端不写）。目标只在链接 IR 的时候才进来。
+
+于是 Windows 全部在 `ubuntu-latest` 上用 **llvm-mingw** 交叉编译：一个 clang，自带 MinGW-w64 的 C 运行库和头文件，同时支持 `x86_64-w64-mingw32` 和 `aarch64-w64-mingw32`。一个 job 出两个架构，全程没有 Windows、没有 Visual Studio、没有 Windows SDK。
+
+链路是：Linux 建 stage 0 → stage 1 → `stage1/miko --self out/compiler` 得到无 triple 的 IR → 两个目标各链一次（`-static`，所以包不依赖任何运行库 DLL）。同一个 `miko.ll` 变成 Linux 二进制、Windows x64 二进制、Windows arm64 二进制。
+
+交叉编译不许偷掉验证。单独的 job 把包下到真实 Windows runner（`windows-latest` 和 `windows-11-arm`）上：跑 `--version`、跑 `--self`（产出 1351347 字节）、再跑 19 个从同一份 IR 交叉链接出来的 difftest 程序，逐个比 `.expected`。**19/19 全过，两个架构都是。** 跑不起的 Windows 二进制在 CI 就红，不会到用户机器上才红。
+
+`dist/miko-link.bat` 里的 vswhere、vcvars64.bat、MSVC 工具链全部删掉：现在是 `MIKO_CC` 优先，其次 PATH 上的 clang，其次 llvm-mingw 和 LLVM 的常规安装位置。两条路径都在本机对 llvm-mingw 20261117 验过，链接并运行正常。
+
+### 9.7 解决 macos-arm64：三次尝试，前两次都"看起来成功"
+
+这个平台失败过五轮，最后三行是：
+
+1. 归档的静态库是 LLVM 22 bitcode，Xcode 的链接器是 17，读不懂 → 改用归档自带的 clang 编译。
+2. 归档 clang 带自己的 libc++ 头，`__hash_memory` 在 libc++ 220108 里是 `_LIBCPP_EXPORTED_FROM_ABI`，Apple 的 `libc++.1.dylib` 没有这个符号 → 想静态链归档的 libc++。
+3. 静态链 `libc++.a` 链接通过，跑 `--version` 也正常，**然后编译真东西时 abort**：`libc++abi: Terminating due to typed operator new being invoked before its static initializer in libcxx has been executed`。原因是 libSystem 本来就提供 libc++abi，静态再链一份就有两个副本、初始化顺序错了。而只链 `libc++.a` 又缺 `___cxa_uncaught_exceptions` 和 `___gxx_personality_v0`。
+
+**前两次探针给了我假信号，因为只跑了 `--version`。** 后来把探针改成"完整编译编译器"，才是能暴露问题的负载。一跑三种配对的对比：
+
+| 配对 | 完整编译 |
 | --- | --- |
-| linux-x64 | 成功 |
-| linux-arm64 | 成功 |
-| macos-x64 | 成功 |
-| windows-x64 | 成功 |
-| macos-arm64 | **不发布**，原因见下 |
-| windows-arm64 | **不发布**，原因见下 |
+| 归档 `libc++.a` 静态 | 运行期 abort |
+| 只链 `libc++.a` | 链接失败，缺 libc++abi 符号 |
+| **SDK 的头 + Apple 的库** | **成功，2193829 字节 IR** |
 
-`tag: v0.2.0-25`，release `miko 0.2.0 (build 25)`，四个资产：
+所以最终是：**归档的 clang 当编译器**（只有它读得了 bitcode），**C++ 头用 SDK 自带的**（里面 `hash_memory` 出现 0 次），**库用 Apple 的、不动**。头和库自然同代。
 
-```
-miko-0.2.0-linux-x64.tar.gz     229293 bytes
-miko-0.2.0-linux-arm64.tar.gz   220813 bytes
-miko-0.2.0-macos-x64.tar.gz     224919 bytes
-miko-0.2.0-windows-x64.zip      337091 bytes
-```
+还差一个：归档 clang 不是 Apple 的，不按 Xcode 的方式找 SDK，链接阶段编译 C 运行时就 `fatal error: 'stdio.h' file not found`。加 `SDKROOT` 就够——一个环境变量，链接脚本一行都不用改。
 
-CI 上 `gate.yml` 通过：
+### 9.8 发布包真的能用吗
 
-| 检查 | 结果 |
-| --- | --- |
-| difftest | 31 / 31，三端一致 |
-| bootstrap gen1 | 1351347 字节，19/19，`3ED78C9CA5CE1E12` |
-| bootstrap gen2 | 1351347 字节，19/19，`3ED78C9CA5CE1E12` |
-| 定点 | 成立 |
-
-定点哈希从 `F023F21A6EE36416` 变成 `3ED78C9CA5CE1E12`，因为改了 `main_ll.miko` 的回退分支。这个检查本来就是为此存在的：源一改，哈希就该变。
-
-### 9.6 发布包真的能用吗
-
-发布成功不等于包能用。下了 Windows 包，解压，实际跑：
+发布成功不等于包能用。下了 v0.2.0-35 的 Windows x64 包，解压，实际跑：
 
 ```
-miko\miko.exe --version   →  miko 0.2.0 (miko-implemented, LLVM IR backend)
-miko --self out\g1        →  wrote out\g1.ll  (1351347 字节)
-miko-link.bat             →  out\g1.exe
-out\g1.exe --self out\g2  →  wrote out\g2.ll  (1351347 字节)
-g1.ll 3ED78C9CA5CE1E12 == g2.ll 3ED78C9CA5CE1E12
+miko.exe --version        →  miko 0.2.0 (miko-implemented, LLVM IR backend)
+miko.exe d.miko d         →  wrote d.exe
+d.exe                     →  sum = 55
+miko.exe --self out2\g1   →  1351347 字节, 3ED78C9CA5CE1E12
+out2\g1.exe --self g2     →  1351347 字节, 3ED78C9CA5CE1E12
 ```
 
-**包里的编译器自举到了和本机门禁完全相同的定点哈希。** 再用它编译一个程序、链接、运行，输出 `sum 1..10 = 55`。
+两代一致，且**与本机门禁同一定点** `3ED78C9CA5CE1E12`——一个完全独立编译出来的包，复现了门禁的数字。
 
-过程中我自己写错了两次：用了不存在的 `to_string`（真名 `to_string_i64`）和不存在的 `println`（内建是 `print`，且自带换行），还有一次把源文件放在 `--self` 前面——CLI 是 `miko --self [prefix]`，不是 `miko <src> --self`。这些都是我的调用错误，不是包的问题，但都说明了同一件事：发布包的行为要和文档一致，而文档在 `--help` 里。
+两个 exe 的 PE 头也核过：x64 包是 `x86-64`，arm64 包是 `ARM64`。
 
-### 9.7 macOS arm64：每次都只是把失败挪了个位置
-
-这个平台试了五轮，每轮都真的往前推进了一点，然后撞上下一堵墙。完整记录，因为下一个人会从第一堵墙重来：
-
-1. `macos-14` 在启动的同一秒被取消，`runner_name` 为空、没有任何 step 运行——arm64 runner 根本没分配。换 `macos-15`。
-2. `macos-15` 有 runner 了，Homebrew 的 llvm 是 **23.1.5**，stage 1 每个函数都 `does not have terminator`。
-3. 换官方 `LLVM-22.1.8-macOS-ARM64.tar.xz`（发布清单里 **没有** macOS x64 归档，只有 ARM64，所以两个 Mac 走两条路）。链接缺 `libzstd`，归档不带，brew 装库补上。
-4. 链接器拒绝每一个归档里的 `.a`：`Unknown attribute kind (102) (Producer: 'LLVM22.1.8' Reader: 'LLVM APPLE_1_1700.0.13.5_0')`——归档的静态库是 LLVM bitcode，Xcode 的链接器是 LLVM 17，读不懂 22 的 bitcode。改用归档自带的 clang。
-5. 过了 bitcode，死在 `__hash_memory`：那个 clang 带自己的 libc++ 头，比 Xcode 的 libc++ 新，头能编、库没这个符号。用 `-nostdinc++` 指回 Xcode 的头，仍然缺。
-
-走到这一步，剩下的路只有两条：等 Homebrew 出 arm64 的 LLVM 22，或者为那个目标从源码建一份 LLVM。两条都不属于发布流水线该干的事。所以从矩阵里移掉，理由写在该条目原来的位置。
-
-一次真正的修复应该是移除失败，而不是把失败挪到下一堵墙——五轮里没有一次做到，所以不发布这个平台。
-
-### 9.8 windows-arm64：直接删掉更诚实
-
-`windows-11-arm` **没有 Visual Studio**，`vswhere.exe` 不存在。stage 0 是 MSVC 编译的 C++ 程序，在那里建不出来。原先标了 `experimental` + `continue-on-error`，结果是每次运行都红、从来没产出过包。移掉了。
-
+过程中踩到的坑都是我自己的：用了不存在的 `to_string`（真名 `to_string_i64`）和 `println`（内建是 `print`），把源文件放在 `--self` 前面（CLI 是 `miko --self [prefix]`），还有本机 TMP 目录不可写导致 clang 报 `unable to make temporary file`。
 ### 9.9 六个平台的链接顺序：为什么最后是靠"位置"解决的
 
 Linux 上最顽固的一个。症状始终是 `undefined reference to ZSTD_compressBound`，而 `libzstd.so` 明明在链接行上——问题只是它在 `libLLVMSupport.a` **前面**，而单遍链接器不会回头用已经走过的库。
@@ -625,10 +637,17 @@ Linux 上最顽固的一个。症状始终是 `undefined reference to ZSTD_compr
 
 三个系统库现在各自"机器上有才加"，因为答案是按发行版变的：terminfo 只在 Linux，zstd 在 Debian 和 Homebrew 的 LLVM 构建里、官方归档不需要，`-lz` 到处都有。
 
-### 9.10 没解决的
+### 9.10 架构上值得记住的两句话
 
-- **macOS arm64 和 Windows arm64 不发布**，原因见 9.7 / 9.8。缺口写在矩阵注释里，不藏在运行摘要里。
-- **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没有替他编一个。
+**自举产出的 IR 是跨目标的。** 没有 target triple、没有 data layout，目标只在链接时进来。这不是偶然，是 9.6 能成立的全部原因：同一份 `miko.ll` 喂给四个不同的 clang，得到四个平台的二进制。任何往 IR 里写 triple 的改动都会悄悄毁掉这条性质，所以 `cross-windows` 里显式检查它，发现就报错退出。
+
+**stage 0 是唯一需要 LLVM 的东西。** 从 stage 1 开始全是 IR 文本。所以 LLVM 的 ABI 只影响"在哪建 stage 0"，不影响"给哪个平台出包"——这正是 Windows 能完全离开 MSVC 的原因。
+
+### 9.11 没解决的
+
+- **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没替他编一个。
 - **`.miko` 文件在库里仍存 CRLF**，虽然 `.gitattributes` 声明了 `text=auto eol=lf`。`git add --renormalize .` 能修；无害，因为词法接受两种换行。
-- **LLVM 版本上限是 22**。23 删了 `IRBuilder::CreateGlobalStringPtr`、并且对 miko 生成的 IR 一律验证失败。现在靠三处钉版本：Linux 钉 18、Windows 下载 22.1.8 压缩包、macOS x64 靠 brew 恰好还是 22.1.8_2。**最后一条是运气，不是保证**——brew 一旦升到 23，macOS x64 会和 arm64 一样卡在版本上。这是这份流水线最脆的一处。
+- **LLVM 版本上限是 22**（Linux 钉 18）。23 删了 `IRBuilder::CreateGlobalStringPtr`、并且对 miko 生成的 IR 一律验证失败。现在 macos-x64 靠 brew 恰好还是 22.1.8_2——**这条是运气，不是保证**：brew 一升到 23，macos-x64 会和之前的 macos-arm64 一样卡在版本上。macos-arm64 用的是钉死的官方归档，不受影响。这是这份流水线最脆的一处。
+- **macOS 的 `-nostdinc++` 意味着 miko 的 C++ 代码只能用 SDK 那代 libc++ 头**。如果哪天表达式用到更新的东西，会先失败在编译，而不是在链接——失败点更清楚，但这个约束真实存在。
+- **`verify-windows` 只跑 19 个 difftest 用例**，不是全量 31 个：`tests/diff` 里带 `.expected` 的那些才交叉链接。另外 12 个是拒绝用例，靠 `gate.yml` 的三端一致覆盖。
 - **`arg_count()` 风格的 CLI 有个不一致**：`arg_at(0)` 当模式用，但 `arg_count() >= 3` 分支用 `arg_at(1)`/`arg_at(2)`。按文档形式调用没问题，但这条路径没有测试覆盖。
