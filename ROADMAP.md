@@ -793,6 +793,25 @@ name: "hello.miko"
 
 `MIKO_GC_STRESS=1` 下 difftest 同样 `44 / 44`。
 
+### 9.16.1 让六个平台都同意：-g，以及各平台把 DWARF 放在哪
+
+加进发布流水线之后，检查脚本在 CI 上失败了五次，每次都是我写错了地方，只有最后一次是真问题：
+
+| 现象 | 原因 | 归属 |
+| --- | --- | --- |
+| gate：exe 无 `.debug_line` | MSVC 链接出来的 PE 连 CodeView 都没有 | 工具链 |
+| linux/mac：`no executable written` | Unix 上输出没有 `.exe` 后缀 | 我的脚本 |
+| mac：段名 `none` | Mach-O 里叫 `__debug_line`，在 `__DWARF` 段内 | 我的脚本 |
+| mac：段名仍 `none` | 干脆不用 `objdump` 列段，改用 dwarfdump 直接看 | 我的脚本 |
+| mac：`--debug-info` 只有 114 字节 | ld64 不把 `__DWARF` 带进镜像 | 平台 |
+
+最后一个是真的。同一个 `.ll` 编成 `arm64-apple-macos11` 的目标文件，`__debug_info` 和 `__debug_line` 都点名 `linecheck.miko`；链成可执行文件就没了，`-g` 也救不回来。
+
+于是断言跟着"能存住它的那个产物"走：IR 永远查，Mach-O 查目标文件，ELF 和 mingw 的 COFF 查可执行文件。
+
+顺带一个产品改动：两个链接脚本都加了 `-g`。IR 自带元数据，mingw 和 Linux 的 clang 本来就会把它变成段，但 Apple 的 clang 不会。代价实测 261632 → 289280 字节，约 10%。定点没动（`5DA42A1AEF52B962` 前后一致），说明它只是链接参数，不是 IR 改动。
+
+诚实记一笔：**发出去的 `miko` 二进制自己没有 miko 的调试信息**。它的 IR 是 C++ 后端生成的，而 DWARF 只在自举编译器里实现。用户程序带行号表（实测 `demo.miko` 映射到第 1、3、9 行），编译器自身要等下一轮自举才带。
 ### 9.17 没解决的
 
 - **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没替他编一个。
