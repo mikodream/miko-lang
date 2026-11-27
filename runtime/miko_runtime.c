@@ -6,13 +6,26 @@
  * clang, or ahead of time and linked.
  */
 
+/* _GNU_SOURCE is required for pthread_getattr_np on Linux, and it must come
+ * before any header. It only widens what the C library exposes. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+/* GetCurrentThreadStackLimits is documented from Windows 8 on. miko targets
+ * Windows 10 and later, so asking for that API level is accurate rather than
+ * optimistic. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
 #include <windows.h>
 #include <direct.h>
 static void miko_mkdir(const char* path) {
@@ -22,6 +35,7 @@ static void miko_mkdir(const char* path) {
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <pthread.h>
 static void miko_mkdir(const char* path) {
     mkdir(path, 0777);
 }
@@ -64,6 +78,438 @@ typedef struct {
 
 #define MIKO_HEADER_SIZE (sizeof(MikoStringHeader))
 
+/* ---- garbage collection ---------------------------------------------------
+ *
+ * Every string used to be allocated and never freed: `free()` was called zero
+ * times in this file. A loop building two million small strings reached 99.8 MB
+ * of peak RSS for about 16 MB of live data, growing linearly and without bound,
+ * so no long-running miko program was viable.
+ *
+ * What is collected: strings, and only strings. Structs live in `alloca` slots on
+ * the stack (the backend emits alloca for every aggregate), so the heap holds no
+ * aggregate and **no heap object contains a pointer to another heap object**. That
+ * single fact is what keeps this collector small and safe: marking is shallow,
+ * with no traversal, no recursion, and no chance of following a stale pointer
+ * inside string data.
+ *
+ * How liveness is decided: conservatively. The stack is scanned word by word and
+ * any word that is exactly the address of a live block marks that block. This is
+ * the same approach Boehm's collector takes, and it needs no cooperation from the
+ * code generator - which matters because the IR passes strings around as plain
+ * `ptr`. A value that happens to look like a block address only delays a free by
+ * one cycle, which is harmless; the danger in a conservative collector is the
+ * opposite one, freeing something still in use, so every ambiguity here resolves
+ * toward keeping.
+ *
+ * Registers: a pointer that lives only in a register would not be seen by a stack
+ * scan, so setjmp() spills the register file onto the stack before the scan
+ * begins. That is the standard trick and the reason the collector cannot miss a
+ * value it is holding.
+ *
+ * Stack bounds: obtained from the operating system, per platform. If that ever
+ * fails the collector turns itself off and the program keeps the old
+ * allocate-and-never-free behaviour. Leaking is recoverable; freeing a live string
+ * is not.
+ */
+
+typedef struct MikoGcBlock {
+    struct MikoGcBlock* next;
+    struct MikoGcBlock* prev;
+    size_t bytes;
+    int marked;
+} MikoGcBlock;
+
+/* The collector metadata sits *before* the string header, so the pointers the IR
+ * already uses are unchanged: miko_str_header(text) is still text - header size,
+ * and a string literal emitted into .data is still a valid miko string with no
+ * metadata. Literals are never registered, so they are never freed. */
+static MikoGcBlock miko_gc_head = { &miko_gc_head, &miko_gc_head, 0, 0 };
+
+static char* miko_gc_stack_low = NULL;    /* exclusive: lowest address to scan */
+static char* miko_gc_stack_high = NULL;   /* inclusive: highest address to scan */
+static int miko_gc_ready = 0;
+static int miko_gc_disabled = 0;
+static size_t miko_gc_live_bytes = 0;
+static size_t miko_gc_threshold = 0;
+static size_t miko_gc_next_collect = 0;
+static int miko_gc_stress = -1;           /* MIKO_GC_STRESS: collect every alloc */
+static long long miko_gc_runs = 0;
+static long long miko_gc_freed_blocks = 0;
+
+/* ---- address set: which pointers are live block starts --------------------
+ *
+ * Marking asks "is this word a block start?" once per stack word, so a linked
+ * list walk would be quadratic. Open addressing with linear probing gives a
+ * constant-time answer; rebuilds keep the load factor under 3/4.
+ */
+
+typedef struct {
+    void** keys;
+    size_t capacity;   /* power of two */
+    size_t used;       /* keys != NULL and != TOMBSTONE */
+    size_t filled;     /* used + tombstones */
+} MikoGcSet;
+
+static void* const MIKO_GC_TOMBSTONE = (void*)(size_t)1;
+static MikoGcSet miko_gc_set;
+
+static size_t miko_gc_hash(void* key) {
+    size_t value = (size_t)key;
+    value ^= value >> 33;
+    value *= (size_t)0xff51afd7ed558ccdULL;
+    value ^= value >> 29;
+    return value;
+}
+
+static void miko_gc_set_put_raw(MikoGcSet* set, void* key) {
+    size_t mask = set->capacity - 1;
+    size_t slot = miko_gc_hash(key) & mask;
+    while (set->keys[slot] != NULL && set->keys[slot] != MIKO_GC_TOMBSTONE) {
+        if (set->keys[slot] == key) {
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    set->keys[slot] = key;
+    set->used = set->used + 1;
+}
+
+static int miko_gc_set_grow(void) {
+    size_t old_capacity = miko_gc_set.capacity;
+    void** old_keys = miko_gc_set.keys;
+    size_t new_capacity = old_capacity == 0 ? 1024 : old_capacity * 2;
+    void** fresh = (void**)calloc(new_capacity, sizeof(void*));
+    if (!fresh) {
+        return 0;
+    }
+    miko_gc_set.keys = fresh;
+    miko_gc_set.capacity = new_capacity;
+    miko_gc_set.used = 0;
+    miko_gc_set.filled = 0;
+    for (size_t i = 0; i < old_capacity; i++) {
+        if (old_keys[i] != NULL && old_keys[i] != MIKO_GC_TOMBSTONE) {
+            miko_gc_set_put_raw(&miko_gc_set, old_keys[i]);
+        }
+    }
+    free(old_keys);
+    /* put_raw does not maintain `filled`, and `filled` is what keeps the table
+     * from ever becoming completely full. Leaving it at zero after a rehash let
+     * `used` climb to `capacity`; at that point linear probing had no empty slot
+     * to stop at and the collector spun forever. After a rehash every entry is
+     * live, so filled equals used by definition. */
+    miko_gc_set.filled = miko_gc_set.used;
+    return 1;
+}
+
+/* Rebuilds the address set from the block list.
+ *
+ * An earlier version maintained the set incrementally with tombstones, and that
+ * incremental maintenance was the source of an intermittent access violation: a
+ * removed entry could survive a probe chain and later authorise a write to a
+ * block the heap had already taken back. The set has exactly one job - answer
+ * "is this address a live block start" - and the block list already holds that
+ * answer, so the set is thrown away and refilled once per collection. Live sets
+ * are small next to the number of allocations, so the cost is a single pass and
+ * the invariant becomes trivial: after this call the set names every live block
+ * and nothing else. */
+static void miko_gc_set_clear(void) {
+    if (miko_gc_set.keys != NULL) {
+        free(miko_gc_set.keys);
+    }
+    miko_gc_set.keys = NULL;
+    miko_gc_set.capacity = 0;
+    miko_gc_set.used = 0;
+    miko_gc_set.filled = 0;
+}
+
+static void miko_gc_set_insert(void* key) {
+    if (miko_gc_set.capacity == 0 || (miko_gc_set.filled + 1) * 4 >= miko_gc_set.capacity * 3) {
+        if (!miko_gc_set_grow()) {
+            return;
+        }
+    }
+    size_t mask = miko_gc_set.capacity - 1;
+    size_t slot = miko_gc_hash(key) & mask;
+    while (miko_gc_set.keys[slot] != NULL && miko_gc_set.keys[slot] != MIKO_GC_TOMBSTONE) {
+        if (miko_gc_set.keys[slot] == key) {
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+    if (miko_gc_set.keys[slot] == NULL) {
+        miko_gc_set.filled = miko_gc_set.filled + 1;
+    }
+    miko_gc_set.keys[slot] = key;
+    miko_gc_set.used = miko_gc_set.used + 1;
+}
+
+static int miko_gc_set_has(const void* key) {
+    if (miko_gc_set.capacity == 0) {
+        return 0;
+    }
+    size_t mask = miko_gc_set.capacity - 1;
+    size_t slot = miko_gc_hash((void*)key) & mask;
+    while (miko_gc_set.keys[slot] != NULL) {
+        if (miko_gc_set.keys[slot] == key) {
+            return 1;
+        }
+        slot = (slot + 1) & mask;
+    }
+    return 0;
+}
+
+
+/* ---- stack bounds -------------------------------------------------------- */
+
+static int miko_gc_learn_stack_bounds(void) {
+#ifdef _WIN32
+    /* GetCurrentThreadStackLimits needs a higher API level than MinGW declares by
+     * default, and the TEB layout is not documented. VirtualQuery is available on
+     * every version and every toolchain: the stack is one reservation, so its
+     * AllocationBase is the low end and walking up while the base stays the same
+     * finds the high end. */
+    int here = 0;
+    MEMORY_BASIC_INFORMATION info;
+    char* probe = (char*)&here;
+    if (VirtualQuery(probe, &info, sizeof(info)) == 0) {
+        return 0;
+    }
+    char* base = (char*)info.AllocationBase;
+    if (base == NULL) {
+        return 0;
+    }
+    char* top = base;
+    char* cursor = base;
+    MEMORY_BASIC_INFORMATION walk;
+    /* The reservation holds three kinds of page: committed and readable (in use),
+     * reserved but not committed (below the stack, never touched yet), and the
+     * guard page just under the current frame, which faults on touch. Only the
+     * first kind may be read, so the scanned range is the span of those pages
+     * rather than the whole reservation. Skipping a region instead of stopping at
+     * it matters: the bottom of the stack is usually still uncommitted, so
+     * breaking there produced an empty range and silently switched the collector
+     * off. */
+    char* low_seen = NULL;
+    char* high_seen = NULL;
+    while (VirtualQuery(cursor, &walk, sizeof(walk)) != 0) {
+        if ((char*)walk.AllocationBase != base) {
+            break;
+        }
+        int readable = walk.State == MEM_COMMIT
+            && (walk.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+        if (readable) {
+            char* region_low = (char*)walk.BaseAddress;
+            char* region_high = region_low + walk.RegionSize;
+            if (low_seen == NULL || region_low < low_seen) {
+                low_seen = region_low;
+            }
+            if (high_seen == NULL || region_high > high_seen) {
+                high_seen = region_high;
+            }
+        }
+        cursor = (char*)walk.BaseAddress + walk.RegionSize;
+    }
+    if (high_seen != NULL) {
+        top = high_seen;
+    }
+    if (low_seen != NULL) {
+        base = low_seen;
+    }
+    if (base >= top) {
+        return 0;
+    }
+    miko_gc_stack_low = base;
+    miko_gc_stack_high = top;
+    return 1;
+#elif defined(__APPLE__)
+    pthread_t self = pthread_self();
+    void* top = pthread_get_stackaddr_np(self);
+    size_t size = pthread_get_stacksize_np(self);
+    if (top == NULL || size == 0) {
+        return 0;
+    }
+    miko_gc_stack_high = (char*)top;
+    miko_gc_stack_low = (char*)top - size;
+    return 1;
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+        return 0;
+    }
+    void* base = NULL;
+    size_t size = 0;
+    int ok = pthread_attr_getstack(&attr, &base, &size) == 0;
+    pthread_attr_destroy(&attr);
+    if (!ok || base == NULL || size == 0) {
+        return 0;
+    }
+    miko_gc_stack_low = (char*)base;
+    miko_gc_stack_high = (char*)base + size;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* Called from miko_set_args, the first thing a generated main() does, so the
+ * bounds are learned before any user code can allocate. */
+static void miko_gc_init(void) {
+    if (miko_gc_ready) {
+        return;
+    }
+    if (miko_gc_stack_low == NULL) {
+        if (!miko_gc_learn_stack_bounds()) {
+            miko_gc_disabled = 1;
+            return;
+        }
+    }
+    const char* stress = getenv("MIKO_GC_STRESS");
+    if (stress != NULL && stress[0] != 0 && stress[0] != '0') {
+        miko_gc_stress = 1;
+    } else {
+        miko_gc_stress = 0;
+    }
+    const char* stats = getenv("MIKO_GC_STATS");
+    if (stats != NULL && stats[0] != 0 && stats[0] != '0') {
+        miko_gc_ready = 1;
+        miko_gc_disabled = 2;   /* report only; never free */
+        return;
+    }
+    miko_gc_threshold = 8u * 1024u * 1024u;
+    if (miko_gc_stress) {
+        miko_gc_threshold = 0;
+    }
+    miko_gc_next_collect = miko_gc_threshold;
+    miko_gc_ready = 1;
+}
+
+/* Prints the collector's counters at exit under MIKO_GC_VERBOSE=1, so a workload
+ * can be measured without a profiler. */
+static void miko_gc_report_at_exit(void) {
+    fprintf(stderr, "[gc] runs=%lld freed=%lld live=%lldKB next=%lldKB\n",
+            miko_gc_runs, miko_gc_freed_blocks,
+            (long long)(miko_gc_live_bytes / 1024), (long long)(miko_gc_next_collect / 1024));
+}
+
+static void miko_gc_install_report(void) {
+    const char* verbose = getenv("MIKO_GC_VERBOSE");
+    if (verbose != NULL && verbose[0] != 0 && verbose[0] != '0') {
+        atexit(miko_gc_report_at_exit);
+    }
+}
+
+/* ---- collect ------------------------------------------------------------- */
+
+static void miko_gc_collect(void) {
+    if (miko_gc_disabled) {
+        return;
+    }
+    jmp_buf registers;
+    /* Spill the register file so a pointer held only in a register is on the
+     * stack when the scan below runs. setjmp/setjmp is the portable way to do
+     * it; the buffer is never longjmp'd to. */
+    if (setjmp(registers) != 0) {
+        return;
+    }
+
+    /* Mark: shallow, because no heap object points at another. */
+    /* The committed span of the stack changes as the program runs: pages below
+     * the starting point only become readable once a deeper frame touches them.
+     * Bounds measured once at startup therefore described the stack as it was at
+     * the first call, and re-measuring at collection time is what keeps the scan
+     * covering every frame that is live right now. */
+    miko_gc_learn_stack_bounds();
+    miko_gc_set_clear();
+    for (MikoGcBlock* each = miko_gc_head.next; each != &miko_gc_head; each = each->next) {
+        miko_gc_set_insert((char*)each + sizeof(MikoGcBlock) + MIKO_HEADER_SIZE);
+    }
+    char* top = (char*)&registers;
+    char* low = miko_gc_stack_low;
+    char* high = miko_gc_stack_high;
+    if (top < low) {
+        low = top;
+    }
+    if (top > high) {
+        high = top;
+    }
+    size_t words = ((size_t)(high - low)) / sizeof(void*);
+    void** cursor = (void**)low;
+    for (size_t i = 0; i < words; i++) {
+        void* candidate = cursor[i];
+        if (candidate == NULL) {
+            continue;
+        }
+        /* The address set is the only filter: a word that is not the start of a
+         * live block does nothing. No range test here - the heap sits above the
+         * stack on most targets, so comparing against the stack bounds would
+         * discard exactly the pointers this is looking for. */
+        if (miko_gc_set_has(candidate)) {
+            MikoGcBlock* block = (MikoGcBlock*)((char*)candidate - MIKO_HEADER_SIZE) - 1;
+            block->marked = 1;
+        }
+    }
+
+    /* Sweep: anything left unmarked is unreachable. */
+    size_t live = 0;
+    long long freed = 0;
+    MikoGcBlock* block = miko_gc_head.next;
+    while (block != &miko_gc_head) {
+        MikoGcBlock* following = block->next;
+        if (block->marked) {
+            block->marked = 0;
+            live = live + block->bytes;
+        } else {
+            block->next->prev = block->prev;
+            block->prev->next = block->next;
+            free(block);
+            freed = freed + 1;
+        }
+        block = following;
+    }
+
+    miko_gc_live_bytes = live;
+    miko_gc_freed_blocks = miko_gc_freed_blocks + freed;
+    miko_gc_runs = miko_gc_runs + 1;
+    /* Grow the next threshold with the live set so a program holding a lot of
+     * data does not collect constantly, and keep a floor so a tiny heap does not
+     * thrash. */
+    size_t next = live * 2;
+    if (next < miko_gc_threshold) {
+        next = miko_gc_threshold;
+    }
+    miko_gc_next_collect = next;
+}
+
+/* Registers a freshly allocated block and returns the string pointer. */
+static char* miko_gc_track(char* raw, size_t capacity) {
+    MikoGcBlock* block = (MikoGcBlock*)raw;
+    block->marked = 0;
+    block->bytes = sizeof(MikoGcBlock) + MIKO_HEADER_SIZE + capacity + 1;
+    block->next = miko_gc_head.next;
+    block->prev = &miko_gc_head;
+    miko_gc_head.next->prev = block;
+    miko_gc_head.next = block;
+    miko_gc_live_bytes = miko_gc_live_bytes + block->bytes;
+    char* text = raw + sizeof(MikoGcBlock) + MIKO_HEADER_SIZE;
+    return text;
+}
+
+/* Called after every allocation: collects when the heap has grown enough. */
+static void miko_gc_step(void) {
+    if (miko_gc_disabled) {
+        return;
+    }
+    if (!miko_gc_ready) {
+        miko_gc_init();
+        if (miko_gc_disabled) {
+            return;
+        }
+    }
+    if (miko_gc_live_bytes >= miko_gc_next_collect) {
+        miko_gc_collect();
+    }
+}
+
 /* Byte length of a managed string. O(1). */
 long long miko_str_len(const char* text) {
     if (text == NULL) {
@@ -82,15 +528,16 @@ static char* miko_str_alloc_cap(size_t length, size_t capacity) {
     if (capacity < length) {
         capacity = length;
     }
-    char* block = (char*)malloc(MIKO_HEADER_SIZE + capacity + 1);
+    miko_gc_step();
+    char* block = (char*)malloc(sizeof(MikoGcBlock) + MIKO_HEADER_SIZE + capacity + 1);
     if (!block) {
         fprintf(stderr, "out of memory allocating string of %zu bytes\n", length);
         exit(1);
     }
-    MikoStringHeader* header = (MikoStringHeader*)block;
+    char* text = miko_gc_track(block, capacity);
+    MikoStringHeader* header = (MikoStringHeader*)(text - MIKO_HEADER_SIZE);
     header->length = length;
     header->capacity = capacity;
-    char* text = block + MIKO_HEADER_SIZE;
     text[length] = 0;
     return text;
 }
@@ -117,6 +564,13 @@ static char* miko_str_adopt(const char* source) {
     return text;
 }
 
+/* Test-facing wrapper: the harness needs a managed string from a C literal, since
+ * only strings built here (or emitted with a header by the code generator) carry
+ * one. */
+char* miko_str_adopt_public(const char* source) {
+    return miko_str_adopt(source);
+}
+
 /* Grow or shrink a managed string. Used by read_file, which reads an unknown
  * number of bytes before it knows the length. */
 static char* miko_str_resize(char* text, size_t length) {
@@ -128,17 +582,26 @@ static char* miko_str_resize(char* text, size_t length) {
         return text;
     }
     char* block = text - MIKO_HEADER_SIZE;
-    char* grown = (char*)realloc(block, MIKO_HEADER_SIZE + length + 1);
+    char* raw = block - sizeof(MikoGcBlock);
+    miko_gc_step();
+    char* grown = (char*)realloc(raw, sizeof(MikoGcBlock) + MIKO_HEADER_SIZE + length + 1);
     if (!grown) {
         fprintf(stderr, "out of memory growing string to %zu bytes\n", length);
         exit(1);
     }
-    MikoStringHeader* grownHeader = (MikoStringHeader*)grown;
+    /* realloc may have moved the block, so the address set has to follow it. The
+     * old address is only reachable as a stale pointer now; dropping it is what
+     * keeps the set from marking a block that no longer exists. */
+    MikoGcBlock* gc = (MikoGcBlock*)grown;
+    size_t previous = gc->bytes;
+    gc->bytes = sizeof(MikoGcBlock) + MIKO_HEADER_SIZE + length + 1;
+    miko_gc_live_bytes = miko_gc_live_bytes - previous + gc->bytes;
+    char* newtext = grown + sizeof(MikoGcBlock) + MIKO_HEADER_SIZE;
+    MikoStringHeader* grownHeader = (MikoStringHeader*)(newtext - MIKO_HEADER_SIZE);
     grownHeader->length = length;
     grownHeader->capacity = length;
-    char* out = grown + MIKO_HEADER_SIZE;
-    out[length] = 0;
-    return out;
+    newtext[length] = 0;
+    return newtext;
 }
 
 /* Append `src` to `dst` and return the string to use afterwards.
@@ -213,6 +676,40 @@ long long miko_mono_ms(void) {
 void miko_set_args(int argc, char** argv) {
     miko_argc_storage = argc;
     miko_argv_storage = argv;
+    /* The first call a generated main makes, so the collector learns the stack
+     * bounds before any user code allocates. */
+    miko_gc_init();
+    miko_gc_install_report();
+}
+
+/* Explicit collection, and the counters the tests read. */
+void miko_gc_collect_now(void) {
+    if (miko_gc_disabled == 2) {
+        return;
+    }
+    miko_gc_collect();
+}
+
+void miko_gc_debug_report(void) {
+    fprintf(stderr, "[gc] ready=%d disabled=%d low=%p high=%p span=%lldKB live=%lld next=%lld runs=%lld\n",
+            miko_gc_ready, miko_gc_disabled,
+            (void*)miko_gc_stack_low, (void*)miko_gc_stack_high,
+            (long long)((miko_gc_stack_high && miko_gc_stack_low)
+                ? (miko_gc_stack_high - miko_gc_stack_low) / 1024 : 0),
+            (long long)miko_gc_live_bytes, (long long)miko_gc_next_collect,
+            miko_gc_runs);
+}
+
+long long miko_gc_run_count(void) {
+    return miko_gc_runs;
+}
+
+long long miko_gc_freed_count(void) {
+    return miko_gc_freed_blocks;
+}
+
+long long miko_gc_live_longs(void) {
+    return (long long)miko_gc_live_bytes;
 }
 
 long long miko_arg_count(void) {

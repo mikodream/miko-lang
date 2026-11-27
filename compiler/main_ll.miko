@@ -148,24 +148,30 @@ fn find_char_in(text: string, start: i64, target: char): i64 {
 // "array index must be an integer, got a string".
 //
 // Returns len(text) when the character does not occur outside a literal.
+// First occurrence of `target` that is not inside a literal.
+//
+// Both quote characters delimit a literal. Tracking only `"` meant a character
+// literal was read as code, so `f("x", 3, ',')` counted as four arguments and was
+// rejected for arity: the comma inside `','` looked like a separator. Escapes are
+// skipped so an escaped quote does not close the literal early.
 fn find_char_outside_quotes(text: string, start: i64, target: char): i64 {
     let i = start;
     let n = len(text);
-    let in_string: bool = false;
+    let quote: char = ' ';
     while i < n {
         let ch = char_at(text, i);
-        if in_string {
+        if quote != ' ' {
             if ch == '\\' {
                 i = i + 2;
             } else {
-                if ch == '"' {
-                    in_string = false;
+                if ch == quote {
+                    quote = ' ';
                 }
                 i = i + 1;
             }
         } else {
-            if ch == '"' {
-                in_string = true;
+            if ch == '"' || ch == '\'' {
+                quote = ch;
                 i = i + 1;
             } else {
                 if ch == target {
@@ -792,22 +798,24 @@ fn nr_arg_count(text: string): i64 {
     let depth: i64 = 0;
     let commas: i64 = 0;
     let seen: bool = false;
-    let in_string: bool = false;
+    // Both quote characters delimit a literal: a comma inside ',' is not an
+    // argument separator.
+    let quote: char = ' ';
     let i = open;
     while i < n {
         let ch = char_at(text, i);
-        if in_string {
+        if quote != ' ' {
             if ch == '\\' {
                 i = i + 2;
             } else {
-                if ch == '"' {
-                    in_string = false;
+                if ch == quote {
+                    quote = ' ';
                 }
                 i = i + 1;
             }
         } else {
-            if ch == '"' {
-                in_string = true;
+            if ch == '"' || ch == '\'' {
+                quote = ch;
                 seen = true;
                 i = i + 1;
             } else {
@@ -1244,6 +1252,12 @@ fn tc_bad_condition(have: string): bool {
     return !tc_is_numeric(have);
 }
 
+// Whether a value of type `have` may be used where `want` is declared.
+//
+// The asymmetry around char is the reference frontend's: a character is an
+// integer, so `let digit: i64 = '7'` and `digit = c - '0'` are fine, while
+// `let back: char = 65` is rejected. Encoding the same direction keeps working
+// programs working and still catches the mistakes that matter.
 fn tc_compatible(have: string, want: string): bool {
     if have == "" || want == "" {
         return true;
@@ -1252,6 +1266,9 @@ fn tc_compatible(have: string, want: string): bool {
         return true;
     }
     if tc_is_numeric(have) && tc_is_numeric(want) {
+        return true;
+    }
+    if have == "char" && tc_is_numeric(want) {
         return true;
     }
     return false;
@@ -1403,21 +1420,28 @@ fn tc_lookup(table: string, key: string): string {
 }
 
 // The declared type of `name` in a flat "name:type\n" table.
+// Type of a local variable, or "" when it is not declared in this function.
+//
+// The last declaration wins. Returning the first match made a name reused with a
+// different type resolve to its earliest type: codegen_ll.miko declares `idx` as
+// a TokResult in one branch and later as the result of struct_field_index, and
+// reading the first one reported a type error on working code.
 fn tc_lookup_local(table: string, key: string): string {
     let n = len(table);
     let start: i64 = 0;
+    let found = "";
     while start < n {
         let e = find_char_in(table, start, '\n');
         let entry = substring(table, start, e - start);
         let colon = find_char_in(entry, 0, ':');
         if colon < len(entry) {
             if substring(entry, 0, colon) == key {
-                return substring(entry, colon + 1, len(entry) - colon - 1);
+                found = substring(entry, colon + 1, len(entry) - colon - 1);
             }
         }
         start = e + 1;
     }
-    return "";
+    return found;
 }
 
 fn tc_field_type(structs: string, struct_name: string, field: string): string {    let fields = tc_lookup(structs, struct_name);
@@ -2031,8 +2055,17 @@ fn check_types(tree: string): string {
                     return at_node("cannot initialize variable '" + name + "' of type '" + want + "' with '" + have + "'", tree, i);
                 }
             }
-            if name != "" && want != "" {
-                locals = locals + name + ":" + want + "\n";
+            if name != "" {
+                // Record the binding even when the type is not written, so a
+                // name reused with a different type shadows the earlier one. An
+                // unannotated `let idx = struct_field_index(...)` whose return
+                // type cannot be inferred was leaving the previous `idx:TokResult`
+                // in place, and the next use of idx was then rejected.
+                let bound = want;
+                if bound == "" && value_text != "" {
+                    bound = tc_type_of(tc_payload(value_text), locals, structs, fns);
+                }
+                locals = locals + name + ":" + bound + "\n";
             }
         }
 
