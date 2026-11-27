@@ -1,0 +1,4 @@
+fn main() {
+    let s: string = 42;
+    print(s);
+}

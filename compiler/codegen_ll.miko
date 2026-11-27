@@ -1,3 +1,4 @@
+import "ast.miko" as ast;
 // LLVM IR text backend: turns the parser's indented text tree into .ll source
 // for clang. The program arrives as text, so this module re-reads that text line
 // by line rather than walking an AST.
@@ -140,7 +141,9 @@ fn line_at(tree: string, index: i64): string {
         return "";
     }
     let line_end = find_char(tree, index, '\n');
-    return trim_indent(substring(tree, index, line_end - index));
+    // strip_pos, so a node that carries @line reads exactly as it did before
+    // positions existed. Every consumer of this helper is unaffected by them.
+    return ast.strip_pos(trim_indent(substring(tree, index, line_end - index)));
 }
 
 // Byte offset of the next line, or len(tree) at the end.
@@ -873,7 +876,7 @@ fn collect_funcs(tree: string, structs: string): string {
     let n = len(tree);
     while i < n {
         let line_end = find_char(tree, i, '\n');
-        let line = trim_indent(substring(tree, i, line_end - i));
+        let line = ast.strip_pos(trim_indent(substring(tree, i, line_end - i)));
         if starts_with_at(line, 0, "Module ") {
             module = substring(line, 7, len(line) - 7);
         } else {
@@ -1035,7 +1038,7 @@ fn collect_enums(tree: string): string {
     let n = len(tree);
     while i < n {
         let line_end = find_char(tree, i, '\n');
-        let line = trim_indent(substring(tree, i, line_end - i));
+        let line = ast.strip_pos(trim_indent(substring(tree, i, line_end - i)));
         if starts_with_at(line, 0, "Enum ") {
             if current != "" {
                 out = append_str(out, current + ":" + members + "\n");
@@ -1095,7 +1098,7 @@ fn collect_structs(tree: string): string {
     let n = len(tree);
     while i < n {
         let line_end = find_char(tree, i, '\n');
-        let line = trim_indent(substring(tree, i, line_end - i));
+        let line = ast.strip_pos(trim_indent(substring(tree, i, line_end - i)));
         if starts_with_at(line, 0, "Struct ") {
             if current != "" {
                 out = append_str(out, current + "|" + fields + "\n");
@@ -1345,7 +1348,7 @@ fn rewrite_enum_types(tree: string, enums: string): string {
     while i < n {
         let line_end = find_char(tree, i, '\n');
         let raw = substring(tree, i, line_end - i);
-        let line = trim_indent(raw);
+        let line = ast.strip_pos(trim_indent(raw));
         let indent = len(raw) - len(line);
         let replacement = "";
         if starts_with_at(line, 0, "Type ") {
@@ -3370,7 +3373,11 @@ pub fn generate_ir(tree_input: string): string {
                 cursor = next_line_index(tree, cursor);
             }
             let value_line = line_at(tree, cursor);
-            let has_value = starts_with_at(value_line, 0, "Expr ") || starts_with_at(value_line, 0, "Call ") || starts_with_at(value_line, 0, "Binary ");
+            // A bare `return;` still gets an Expr child from the parser, with an
+            // empty payload. Treating that as a value lowered an empty
+            // expression to 0 and emitted `ret void 0`, which is not IR. An Expr
+            // node only carries a value when something follows the keyword.
+            let has_value = (starts_with_at(value_line, 0, "Expr ") && len(value_line) > 5) || starts_with_at(value_line, 0, "Call ") || starts_with_at(value_line, 0, "Binary ");
             // A fixed-array initialiser has no scalar value: it is lowered into
             // a slot of its own, so it must bypass the alloca/store path below.
             let value_text_raw = value_line;
@@ -3446,7 +3453,11 @@ pub fn generate_ir(tree_input: string): string {
             }
             let j = next_line_index(tree, i);
             let value_line = line_at(tree, j);
-            let has_value = starts_with_at(value_line, 0, "Expr ") || starts_with_at(value_line, 0, "Call ") || starts_with_at(value_line, 0, "Binary ");
+            // A bare `return;` still gets an Expr child from the parser, with an
+            // empty payload. Treating that as a value lowered an empty
+            // expression to 0 and emitted `ret void 0`, which is not IR. An Expr
+            // node only carries a value when something follows the keyword.
+            let has_value = (starts_with_at(value_line, 0, "Expr ") && len(value_line) > 5) || starts_with_at(value_line, 0, "Call ") || starts_with_at(value_line, 0, "Binary ");
             if has_value {
                 let value: LineResult = lower_line_expr(state, tree, j);
                 let coerced: TokResult = coerce_value(value.state, value.value, value.ty, cur_rt);

@@ -1,0 +1,4 @@
+fn main() {
+    let a: Nope = 1;
+    print(a);
+}

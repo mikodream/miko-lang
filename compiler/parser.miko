@@ -5,6 +5,8 @@ struct Cursor {
     next: i64;
     kind: string;
     text: string;
+    // 1-based source line the token started on, carried through from the lexer.
+    line: i64;
 }
 
 struct ParseResult {
@@ -51,17 +53,20 @@ fn read_cursor(stream: string, start: i64): Cursor {
             index: start,
             next: start,
             kind: "EndOfFile",
-            text: ""
+            text: "",
+            line: 0
         };
     }
 
     let kind_end = find_char(stream, start, '|');
     let len_end = find_char(stream, kind_end + 1, '|');
+    let line_end = find_char(stream, len_end + 1, '|');
     let kind = substring(stream, start, kind_end - start);
     let text_len = parse_dec(substring(stream, kind_end + 1, len_end - kind_end - 1));
-    let text = substring(stream, len_end + 1, text_len);
+    let line = parse_dec(substring(stream, len_end + 1, line_end - len_end - 1));
+    let text = substring(stream, line_end + 1, text_len);
 
-    let next = len_end + 1 + text_len;
+    let next = line_end + 1 + text_len;
     if next < n && char_at(stream, next) == '\n' {
         next = next + 1;
     }
@@ -70,7 +75,8 @@ fn read_cursor(stream: string, start: i64): Cursor {
         index: start,
         next: next,
         kind: kind,
-        text: text
+        text: text,
+        line: line
     };
 }
 
@@ -97,7 +103,8 @@ fn empty_cursor(index: i64): Cursor {
         index: index,
         next: index,
         kind: "EndOfFile",
-        text: ""
+        text: "",
+        line: 0
     };
 }
 
@@ -226,17 +233,36 @@ fn collect_expr(stream: string, index: i64, end1: string, end2: string, end3: st
     return ParseResult { next: cursor.index, text: out };
 }
 
-fn expr_line(indent: i64, prefix: string, text: string): string {
+// @line is appended so a later pass can report where a node came from without
+// re-deriving it. Readers strip it, so the tree a backend walks is unchanged.
+fn expr_line(indent: i64, prefix: string, text: string, line: i64): string {
+    let payload = prefix + text;
+    if line > 0 {
+        payload = payload + " @" + number_text(line);
+    }
     if indent == 1 {
-        return ast.line1(prefix + text);
+        return ast.line1(payload);
     }
     if indent == 2 {
-        return ast.line2(prefix + text);
+        return ast.line2(payload);
     }
     if indent == 3 {
-        return ast.line3(prefix + text);
+        return ast.line3(payload);
     }
-    return ast.line4(prefix + text);
+    return ast.line4(payload);
+}
+
+fn number_text(value: i64): string {
+    if value == 0 {
+        return "0";
+    }
+    let digits = "";
+    let v = value;
+    while v > 0 {
+        digits = substring("0123456789", v % 10, 1) + digits;
+        v = v / 10;
+    }
+    return digits;
 }
 
 fn dump_expr_at(stream: string, index: i64, indent: i64, end1: string, end2: string, end3: string): ParseResult {
@@ -247,7 +273,7 @@ fn dump_expr_at(stream: string, index: i64, indent: i64, end1: string, end2: str
     let op = top_level_binary_op(stream, index, end1, end2, end3);
     let extra = "";
     if op != "" {
-        extra = expr_line(indent + 1, "ExprOp ", op);
+        extra = expr_line(indent + 1, "ExprOp ", op, first.line);
     }
 
     let prefix = "Expr ";
@@ -269,22 +295,22 @@ fn dump_expr_at(stream: string, index: i64, indent: i64, end1: string, end2: str
         }
         let op_after_call: Cursor = read_cursor(stream, scan.next);
         if is_binary_op(op_after_call.kind) {
-            return make_parse_result(expr.next, expr_line(indent, "Expr ", expr.text) + extra);
+            return make_parse_result(expr.next, expr_line(indent, "Expr ", expr.text, first.line) + extra);
         }
         let callee = call_callee_text(stream, index);
         if callee != "" {
-            extra = extra + expr_line(indent + 1, "Callee ", callee);
+            extra = extra + expr_line(indent + 1, "Callee ", callee, first.line);
         }
     }
     if is_binary_op(second.kind) {
         let fourth: Cursor = read_cursor(stream, third.next);
         if !is_expr_end(fourth.kind, end1, end2, end3) {
-            return make_parse_result(expr.next, expr_line(indent, "Expr ", expr.text) + extra);
+            return make_parse_result(expr.next, expr_line(indent, "Expr ", expr.text, first.line) + extra);
         }
-        return make_parse_result(expr.next, expr_line(indent, "Binary ", second.text) + expr_line(indent + 1, "Left ", first.text) + expr_line(indent + 1, "Right ", third.text) + extra);
+        return make_parse_result(expr.next, expr_line(indent, "Binary ", second.text, first.line) + expr_line(indent + 1, "Left ", first.text, first.line) + expr_line(indent + 1, "Right ", third.text, third.line) + extra);
     }
 
-    return make_parse_result(expr.next, expr_line(indent, prefix, expr.text) + extra);
+    return make_parse_result(expr.next, expr_line(indent, prefix, expr.text, first.line) + extra);
 }
 
 fn parse_type_until(stream: string, index: i64, end_kind: string): ParseResult {
@@ -292,11 +318,20 @@ fn parse_type_until(stream: string, index: i64, end_kind: string): ParseResult {
 }
 
 
+// A statement node carries the line it was parsed from, so a static rule can
+// point at it. Expression nodes get the same marker through expr_line.
+fn pos_suffix(line: i64): string {
+    if line <= 0 {
+        return "";
+    }
+    return " @" + number_text(line);
+}
+
 fn parse_let_or_const_stmt(stream: string, index: i64, label: string): ParseResult {
     let kw: Cursor = read_cursor(stream, index);
     let name: Cursor = expect_kind(stream, kw.next, "Identifier");
     let cursor: Cursor = read_cursor(stream, name.next);
-    let out = ast.line2(label + " " + name.text);
+    let out = ast.line2(label + " " + name.text + pos_suffix(kw.line));
 
     if cursor.kind == "Colon" {
         let type_result: ParseResult = parse_type_until(stream, cursor.next, "Equal");
@@ -319,7 +354,7 @@ fn parse_return_stmt(stream: string, index: i64): ParseResult {
     let kw: Cursor = read_cursor(stream, index);
     let value: ParseResult = dump_expr_at(stream, kw.next, 3, "Semicolon", "EndOfFile", "EndOfFile");
     let semi: Cursor = expect_kind(stream, value.next, "Semicolon");
-    return ParseResult { next: semi.next, text: ast.line2("Return") + value.text };
+    return ParseResult { next: semi.next, text: ast.line2("Return" + pos_suffix(kw.line)) + value.text };
 }
 
 fn parse_if_stmt(stream: string, index: i64): ParseResult {
@@ -327,7 +362,7 @@ fn parse_if_stmt(stream: string, index: i64): ParseResult {
     let condition: ParseResult = dump_expr_at(stream, kw.next, 3, "LeftBrace", "EndOfFile", "EndOfFile");
     let lbrace: Cursor = expect_kind(stream, condition.next, "LeftBrace");
     let then_block: ParseResult = parse_block(stream, lbrace.index);
-    let out = ast.line2("If") + ast.line3("Condition") + condition.text + ast.line3("Then") + then_block.text;
+    let out = ast.line2("If" + pos_suffix(kw.line)) + ast.line3("Condition") + condition.text + ast.line3("Then") + then_block.text;
     let next: Cursor = read_cursor(stream, then_block.next);
     if next.kind == "KwElse" {
         let maybe_brace: Cursor = read_cursor(stream, next.next);
@@ -350,7 +385,7 @@ fn parse_while_stmt(stream: string, index: i64): ParseResult {
     let condition: ParseResult = dump_expr_at(stream, kw.next, 3, "LeftBrace", "EndOfFile", "EndOfFile");
     let lbrace: Cursor = expect_kind(stream, condition.next, "LeftBrace");
     let body: ParseResult = parse_block(stream, lbrace.index);
-    return ParseResult { next: body.next, text: ast.line2("While") + ast.line3("Condition") + condition.text + ast.line3("Body") + body.text + ast.line2("EndWhile") };
+    return ParseResult { next: body.next, text: ast.line2("While" + pos_suffix(kw.line)) + ast.line3("Condition") + condition.text + ast.line3("Body") + body.text + ast.line2("EndWhile") };
 }
 
 fn parse_for_stmt(stream: string, index: i64): ParseResult {
@@ -363,7 +398,7 @@ fn parse_for_stmt(stream: string, index: i64): ParseResult {
     let lbrace: Cursor = expect_kind(stream, step.next, "LeftBrace");
     let body: ParseResult = parse_block(stream, lbrace.index);
     let header_text = init.text + "; " + condition.text + "; " + step.text;
-    return ParseResult { next: body.next, text: ast.line2("For") + ast.line3("Header " + header_text) + ast.line3("ForInit " + init.text) + ast.line3("ForCondition " + condition.text) + ast.line3("ForStep " + step.text) + ast.line3("Body") + body.text + ast.line2("EndFor") };
+    return ParseResult { next: body.next, text: ast.line2("For" + pos_suffix(kw.line)) + ast.line3("Header " + header_text) + ast.line3("ForInit " + init.text) + ast.line3("ForCondition " + condition.text) + ast.line3("ForStep " + step.text) + ast.line3("Body") + body.text + ast.line2("EndFor") };
 }
 
 fn parse_simple_stmt(stream: string, index: i64): ParseResult {
@@ -371,8 +406,9 @@ fn parse_simple_stmt(stream: string, index: i64): ParseResult {
     let semi: Cursor = expect_kind(stream, expr.next, "Semicolon");
     let assign: Cursor = find_top_level_kind(stream, index, "Semicolon", "EndOfFile", "EndOfFile", "Equal");
     if assign.kind == "Equal" {
+        let start: Cursor = read_cursor(stream, index);
         let lhs: ParseResult = collect_expr(stream, index, "Equal", "EndOfFile", "EndOfFile");
-        return ParseResult { next: semi.next, text: ast.line2("ExprStmt") + ast.line2("Assign " + lhs.text) + expr.text };
+        return ParseResult { next: semi.next, text: ast.line2("ExprStmt") + ast.line2("Assign " + lhs.text + pos_suffix(start.line)) + expr.text };
     }
     return ParseResult { next: semi.next, text: ast.line2("ExprStmt") + expr.text };
 }
@@ -399,7 +435,7 @@ fn parse_stmt(stream: string, index: i64): ParseResult {
     }
     if cursor.kind == "KwBreak" || cursor.kind == "KwContinue" {
         let semi: Cursor = expect_kind(stream, cursor.next, "Semicolon");
-        return ParseResult { next: semi.next, text: ast.line2(cursor.text) };
+        return ParseResult { next: semi.next, text: ast.line2(cursor.text + pos_suffix(cursor.line)) };
     }
     return parse_simple_stmt(stream, index);
 }
@@ -426,7 +462,7 @@ fn parse_params(stream: string, index: i64): ParseResult {
             let next: Cursor = read_cursor(stream, cursor.next);
             if next.kind == "Colon" {
                 let ty: ParseResult = collect_expr(stream, next.next, "Comma", "RightParen", "EndOfFile");
-                out = append_str(out, ast.line2("Param " + name + ": " + ty.text));
+                out = append_str(out, ast.line2("Param " + name + ": " + ty.text + pos_suffix(cursor.line)));
                 cursor = read_cursor(stream, ty.next);
                 if cursor.kind == "Comma" {
                     cursor = read_cursor(stream, cursor.next);
@@ -446,7 +482,7 @@ fn parse_function(stream: string, index: i64, is_pub: bool): ParseResult {
     let params: ParseResult = parse_params(stream, lparen.next);
     let rparen: Cursor = expect_kind(stream, params.next, "RightParen");
     let cursor: Cursor = read_cursor(stream, rparen.next);
-    let out = ast.line1("Function " + name.text) + params.text;
+    let out = ast.line1("Function " + name.text + pos_suffix(name.line)) + params.text;
 
     if cursor.kind == "Colon" {
         let ty: ParseResult = collect_expr(stream, cursor.next, "LeftBrace", "EndOfFile", "EndOfFile");
@@ -471,7 +507,7 @@ fn parse_struct_decl(stream: string, index: i64): ParseResult {
     let name: Cursor = expect_kind(stream, kw.next, "Identifier");
     let lbrace: Cursor = expect_kind(stream, name.next, "LeftBrace");
     let cursor: Cursor = read_cursor(stream, lbrace.next);
-    let out = ast.line1("Struct " + name.text);
+    let out = ast.line1("Struct " + name.text + pos_suffix(name.line));
     while cursor.kind != "RightBrace" && cursor.kind != "EndOfFile" {
         let field_name: Cursor = expect_kind(stream, cursor.index, "Identifier");
         let colon: Cursor = expect_kind(stream, field_name.next, "Colon");
@@ -495,7 +531,7 @@ fn parse_enum_decl(stream: string, index: i64): ParseResult {
     let name: Cursor = expect_kind(stream, kw.next, "Identifier");
     let lbrace: Cursor = expect_kind(stream, name.next, "LeftBrace");
     let cursor: Cursor = read_cursor(stream, lbrace.next);
-    let out = ast.line1("Enum " + name.text);
+    let out = ast.line1("Enum " + name.text + pos_suffix(name.line));
     while cursor.kind != "RightBrace" && cursor.kind != "EndOfFile" {
         if cursor.kind == "Identifier" {
             out = append_str(out, ast.line2("Member " + cursor.text));

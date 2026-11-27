@@ -1,3 +1,4 @@
+import "ast.miko" as ast;
 // main_ll.miko - driver for the self-hosted miko->LLVM IR compiler.
 //
 // Pipeline: read every module -> lex -> parse -> concatenate into ONE program
@@ -401,7 +402,7 @@ fn check_const_assignments(tree: string): string {
                     let lhs = trim_line(substring(text, 0, eq));
                     let base = assign_target_base(lhs);
                     if imp_loaded(consts, base) {
-                        return "cannot assign to const variable '" + base + "'";
+                        return at_node("cannot assign to const variable '" + base + "'", tree, i);
                     }
                 }
             }
@@ -432,11 +433,11 @@ fn check_index_types(tree: string): string {
             if close < len(line) {
                 let inner = trim_line(substring(line, open + 1, close - open - 1));
                 if inner == "true" || inner == "false" {
-                    return "array index must be an integer, got a bool";
+                    return at_node("array index must be an integer, got a bool", tree, i);
                 }
                 if len(inner) > 0 {
                     if char_at(inner, 0) == '"' {
-                        return "array index must be an integer, got a string";
+                        return at_node("array index must be an integer, got a string", tree, i);
                     }
                 }
             }
@@ -502,8 +503,8 @@ fn check_array_lengths(tree: string): string {
                             let supplied = count_list_items(body);
                             let declared = str_to_i64(count_text);
                             if supplied != declared {
-                                return "array of length " + count_text + " initialised with "
-                                    + digits_of(supplied) + " element(s)";
+                                return at_node("array of length " + count_text + " initialised with "
+                                    + digits_of(supplied) + " element(s)", tree, i);
                             }
                         }
                     }
@@ -619,8 +620,8 @@ fn check_struct_literals(tree: string): string {
                 if declared >= 0 {
                     let supplied = count_char_from(line, brace, ':');
                     if supplied != declared {
-                        return "struct '" + name + "' literal supplies "
-                            + digits_of(supplied) + " of " + digits_of(declared) + " field(s)";
+                        return at_node("struct '" + name + "' literal supplies "
+                            + digits_of(supplied) + " of " + digits_of(declared) + " field(s)", tree, i);
                     }
                 }
             }
@@ -1032,6 +1033,7 @@ fn check_name_resolution(tree: string): string {
         }
 
         let verdict = "";
+        let node_line = imp_line_pos_at(tree, i);
         if imp_starts(line, "Assign ") {
             verdict = nr_check_text(const_line_name(line, 7), locals, globals);
         }
@@ -1060,6 +1062,10 @@ fn check_name_resolution(tree: string): string {
             }
         }
         if verdict != "" {
+            // The line rides along so report_error can point at it.
+            if node_line > 0 {
+                return verdict + " @" + digits_of(node_line);
+            }
             return verdict;
         }
         i = imp_next_line(tree, i);
@@ -1067,9 +1073,1061 @@ fn check_name_resolution(tree: string): string {
     return "";
 }
 
+// ---- diagnostics -----------------------------------------------------------
+//
+// A message alone is nearly useless on a program of any size, and the C++
+// frontend has always printed the location, the source line and a caret. The
+// message now travels with the line it came from (the same "@line" suffix the
+// parser puts on a node), and this renders it the way the other engine does:
+//
+//   error: undefined variable 'missing'
+//    --> prog.miko:2:11
+//     |
+//   2 |     print(missing);
+//     |           ^
+//
+// The column is the offset of the offending text within its own source line,
+// which is exact for the identifier that caused the diagnostic.
+
+// The source line exactly as written, indentation included, because the caret is
+// placed by column and stripping the leading spaces would move it. Only the line
+// terminator is removed.
+fn line_text_of(source: string, line: i64): string {
+    let n = len(source);
+    let current: i64 = 1;
+    let start: i64 = 0;
+    while start < n {
+        let e = find_char_in(source, start, '\n');
+        if current == line {
+            let raw = substring(source, start, e - start);
+            let m = len(raw);
+            if m > 0 && char_at(raw, m - 1) == '\r' {
+                return substring(raw, 0, m - 1);
+            }
+            return raw;
+        }
+        current = current + 1;
+        start = e + 1;
+    }
+    return "";
+}
+
+fn count_lines_upto(source: string, line: i64): string {
+    return "";
+}
+
+// Offset of `needle` inside `line`, or -1.
+fn column_of(name: string, line: string): i64 {
+    let n = len(line);
+    let m = len(name);
+    if m == 0 {
+        return -1;
+    }
+    let i: i64 = 0;
+    while i + m <= n {
+        let ok = true;
+        let j: i64 = 0;
+        while j < m {
+            if char_at(line, i + j) != char_at(name, j) {
+                ok = false;
+                j = m;
+            } else {
+                j = j + 1;
+            }
+        }
+        if ok {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn caret_pad(count: i64): string {
+    let out = "";
+    let i: i64 = 0;
+    while i < count {
+        out = out + " ";
+        i = i + 1;
+    }
+    return out;
+}
+
+// `raw` is "message @line"; prints the message with its location.
+fn report_error(source: string, path: string, raw: string) {
+    let line = ast.line_pos(raw);
+    let msg = ast.strip_pos(raw);
+    eprint("error: " + msg);
+    if line <= 0 {
+        return;
+    }
+    let text = line_text_of(source, line);
+    if text == "" {
+        return;
+    }
+    // The name the message quotes is what the caret points at.
+    let q1 = find_char_in(msg, 0, '\'');
+    let head = " --> " + path + ":" + digits_of(line);
+    if q1 >= len(msg) - 1 {
+        eprint(head);
+        return;
+    }
+    let q2 = find_char_in(msg, q1 + 1, '\'');
+    let name = substring(msg, q1 + 1, q2 - q1 - 1);
+    let col = column_of(name, text);
+    if col < 0 {
+        eprint(head);
+        return;
+    }
+    eprint(head + ":" + digits_of(col + 1));
+    eprint("  |");
+    eprint(digits_of(line) + " | " + text);
+    eprint("  | " + caret_pad(col) + "^");
+}
+
+// ---- type checking ---------------------------------------------------------
+//
+// Name resolution catches typos; it cannot catch a value of the wrong type.
+// `f("s")` against `fn f(a: i64)` compiled to a call passing a pointer where an
+// integer was declared, and the program ran, printed an address and exited 0.
+// LLVM does not object because the IR is well formed - it just means something
+// else. These rules reject that class of mistake before any IR is written.
+//
+// Every rule is written to accept when it is unsure. A type that cannot be
+// inferred comes back as "" and "" is compatible with anything, because a false
+// rejection breaks a working program while a missed one only keeps the old
+// behaviour.
+
+fn tc_is_digit(ch: char): bool {
+    return ch >= '0' && ch <= '9';
+}
+
+fn tc_is_word_char(ch: char): bool {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || tc_is_digit(ch) || ch == '_';
+}
+
+fn tc_is_primitive(name: string): bool {
+    if name == "i8" || name == "i16" || name == "i32" || name == "i64" {
+        return true;
+    }
+    if name == "u8" || name == "u16" || name == "u32" || name == "u64" {
+        return true;
+    }
+    if name == "f32" || name == "f64" {
+        return true;
+    }
+    if name == "bool" || name == "string" || name == "char" || name == "void" {
+        return true;
+    }
+    return false;
+}
+
+fn tc_is_numeric(name: string): bool {
+    if name == "i8" || name == "i16" || name == "i32" || name == "i64" {
+        return true;
+    }
+    if name == "u8" || name == "u16" || name == "u32" || name == "u64" {
+        return true;
+    }
+    return name == "f32" || name == "f64";
+}
+
+// Two types agree when they are equal, when both are numeric, or when either is
+// unknown. Anything else is a real mismatch.
+// Numbers and bools are usable as conditions, the way C treats them; the C++
+// frontend accepts `if 1` and rejects `if "s"` with "bool-compatible". Strings
+// and aggregates are the ones that make no sense as a truth value.
+fn tc_bad_condition(have: string): bool {
+    if have == "" || have == "bool" {
+        return false;
+    }
+    return !tc_is_numeric(have);
+}
+
+fn tc_compatible(have: string, want: string): bool {
+    if have == "" || want == "" {
+        return true;
+    }
+    if have == want {
+        return true;
+    }
+    if tc_is_numeric(have) && tc_is_numeric(want) {
+        return true;
+    }
+    return false;
+}
+
+fn tc_indent_at(tree: string, index: i64): i64 {
+    let n = len(tree);
+    if index >= n {
+        return 0;
+    }
+    let e = find_char_in(tree, index, '\n');
+    let spaces: i64 = 0;
+    let j = index;
+    while j < e && char_at(tree, j) == ' ' {
+        spaces = spaces + 1;
+        j = j + 1;
+    }
+    return spaces;
+}
+
+// "Point|x:i32,y:i32\nVector|x:f64,y:f64\n"
+fn tc_struct_table(tree: string): string {
+    let out = "";
+    let current = "";
+    let fields = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "Struct ") {
+            if current != "" {
+                out = out + current + "|" + fields + "\n";
+            }
+            current = const_line_name(line, 7);
+            fields = "";
+        } else if imp_starts(line, "Field ") {
+            if current != "" {
+                let spec = const_line_name(line, 6);
+                let colon = find_char_in(spec, 0, ':');
+                if colon < len(spec) {
+                    let fname = trim_line(substring(spec, 0, colon));
+                    let ftype = trim_line(substring(spec, colon + 1, len(spec) - colon - 1));
+                    if fields != "" {
+                        fields = fields + ",";
+                    }
+                    fields = fields + fname + ":" + ftype;
+                }
+            }
+        } else if imp_starts(line, "Function ") || imp_starts(line, "Enum ") {
+            if current != "" {
+                out = out + current + "|" + fields + "\n";
+                current = "";
+                fields = "";
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    if current != "" {
+        out = out + current + "|" + fields + "\n";
+    }
+    return out;
+}
+
+// "f|i64|i64,string\n" - name, return type, parameter types.
+fn tc_fn_table(tree: string): string {
+    let out = "";
+    let current = "";
+    let ret = "";
+    let params = "";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "Function ") {
+            if current != "" {
+                out = out + current + "|" + ret + "|" + params + "\n";
+            }
+            current = const_line_name(line, 9);
+            ret = "void";
+            params = "";
+        } else if imp_starts(line, "Param ") {
+            if current != "" {
+                let spec = const_line_name(line, 6);
+                let colon = find_char_in(spec, 0, ':');
+                if colon < len(spec) {
+                    let ptype = trim_line(substring(spec, colon + 1, len(spec) - colon - 1));
+                    if params != "" {
+                        params = params + ",";
+                    }
+                    params = params + ptype;
+                }
+            }
+        } else if imp_starts(line, "ReturnType ") {
+            if current != "" {
+                ret = trim_line(substring(line, 11, len(line) - 11));
+            }
+        } else if imp_starts(line, "Struct ") || imp_starts(line, "Enum ") || imp_starts(line, "Import ") {
+            if current != "" {
+                out = out + current + "|" + ret + "|" + params + "\n";
+                current = "";
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    if current != "" {
+        out = out + current + "|" + ret + "|" + params + "\n";
+    }
+    return out;
+}
+
+// ---- expression typing -----------------------------------------------------
+//
+// Expression nodes hold a flat token text ("p . x + 1"). The first atom decides
+// the type, and a field chain or a call refines it.
+
+fn tc_skip_space(text: string, i: i64): i64 {
+    let n = len(text);
+    let j = i;
+    while j < n && char_at(text, j) == ' ' {
+        j = j + 1;
+    }
+    return j;
+}
+
+fn tc_read_word(text: string, start: i64): string {
+    let n = len(text);
+    let j = start;
+    while j < n && tc_is_word_char(char_at(text, j)) {
+        j = j + 1;
+    }
+    return substring(text, start, j - start);
+}
+
+fn tc_lookup(table: string, key: string): string {
+    let n = len(table);
+    let start: i64 = 0;
+    while start < n {
+        let e = find_char_in(table, start, '\n');
+        let entry = substring(table, start, e - start);
+        let bar = find_char_in(entry, 0, '|');
+        if bar < len(entry) {
+            if substring(entry, 0, bar) == key {
+                return substring(entry, bar + 1, len(entry) - bar - 1);
+            }
+        }
+        start = e + 1;
+    }
+    return "";
+}
+
+// The declared type of `name` in a flat "name:type\n" table.
+fn tc_lookup_local(table: string, key: string): string {
+    let n = len(table);
+    let start: i64 = 0;
+    while start < n {
+        let e = find_char_in(table, start, '\n');
+        let entry = substring(table, start, e - start);
+        let colon = find_char_in(entry, 0, ':');
+        if colon < len(entry) {
+            if substring(entry, 0, colon) == key {
+                return substring(entry, colon + 1, len(entry) - colon - 1);
+            }
+        }
+        start = e + 1;
+    }
+    return "";
+}
+
+fn tc_field_type(structs: string, struct_name: string, field: string): string {    let fields = tc_lookup(structs, struct_name);
+    let n = len(fields);
+    let start: i64 = 0;
+    while start < n {
+        let e = find_char_in(fields, start, ',');
+        let entry = substring(fields, start, e - start);
+        let colon = find_char_in(entry, 0, ':');
+        if colon < len(entry) {
+            if substring(entry, 0, colon) == field {
+                return substring(entry, colon + 1, len(entry) - colon - 1);
+            }
+        }
+        start = e + 1;
+    }
+    return "";
+}
+
+fn tc_nth_param(fns: string, fn_name: string, index: i64): string {
+    let sig = tc_lookup(fns, fn_name);
+    let bar = find_char_in(sig, 0, '|');
+    if bar >= len(sig) {
+        return "";
+    }
+    let params = substring(sig, bar + 1, len(sig) - bar - 1);
+    if params == "" {
+        return "";
+    }
+    let n = len(params);
+    let start: i64 = 0;
+    let k: i64 = 0;
+    while start <= n {
+        let e = find_char_in(params, start, ',');
+        if k == index {
+            return substring(params, start, e - start);
+        }
+        k = k + 1;
+        start = e + 1;
+    }
+    return "";
+}
+
+fn tc_fn_ret(fns: string, fn_name: string): string {
+    let sig = tc_lookup(fns, fn_name);
+    let bar = find_char_in(sig, 0, '|');
+    if bar >= len(sig) {
+        return "";
+    }
+    return substring(sig, 0, bar);
+}
+
+// Type of one atom at the start of `text`, following a `.field` chain.
+fn tc_atom_type(text: string, locals: string, structs: string, fns: string): string {
+    let n = len(text);
+    let i: i64 = tc_skip_space(text, 0);
+    if i >= n {
+        return "";
+    }
+    let ch = char_at(text, i);
+    if ch == '"' {
+        return "string";
+    }
+    if ch == '\'' {
+        return "char";
+    }
+    if ch == '-' || tc_is_digit(ch) {
+        let j: i64 = i + 1;
+        let is_float = false;
+        while j < n {
+            let c = char_at(text, j);
+            if c == '.' {
+                is_float = true;
+                j = j + 1;
+            } else if tc_is_digit(c) || c == '_' {
+                j = j + 1;
+            } else {
+                j = n;
+            }
+        }
+        if is_float {
+            return "f64";
+        }
+        return "i64";
+    }
+    let word = tc_read_word(text, i);
+    if word == "" {
+        return "";
+    }
+    if word == "true" || word == "false" {
+        return "bool";
+    }
+    let j: i64 = tc_skip_space(text, i + len(word));
+    if j < n && char_at(text, j) == '(' {
+        return tc_fn_ret(fns, word);
+    }
+    let current = tc_lookup_local(locals, word);
+    if current == "" {
+        // A bare name matching a struct is the start of a struct literal.
+        if tc_lookup(structs, word) != "" {
+            current = word;
+        } else {
+            return "";
+        }
+    }
+    // Walk the field chain: `p.x` is the type of field x of p's struct.
+    let cursor: i64 = j;
+    while cursor < n && char_at(text, cursor) == '.' {
+        let fstart: i64 = tc_skip_space(text, cursor + 1);
+        let field = tc_read_word(text, fstart);
+        if field == "" {
+            return "";
+        }
+        let next = tc_field_type(structs, current, field);
+        if next == "" {
+            return "";
+        }
+        current = next;
+        cursor = tc_skip_space(text, fstart + len(field));
+    }
+    return current;
+}
+
+// First top-level occurrence of any character in `ops`, or len(text).
+fn tc_find_top_op(text: string, ops: string): i64 {
+    let n = len(text);
+    let i: i64 = 0;
+    let depth: i64 = 0;
+    let quote: char = ' ';
+    while i < n {
+        let ch = char_at(text, i);
+        if quote != ' ' {
+            if ch == quote {
+                quote = ' ';
+            }
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch;
+            i = i + 1;
+            continue;
+        }
+        if ch == '(' || ch == '[' || ch == '{' {
+            depth = depth + 1;
+        } else if ch == ')' || ch == ']' || ch == '}' {
+            depth = depth - 1;
+        } else if depth == 0 {
+            let k: i64 = 0;
+            while k < len(ops) {
+                if ch == char_at(ops, k) {
+                    return i;
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Type of a whole expression: a comparison yields bool, arithmetic keeps the
+// operand type, a single atom is itself. Typing the operands rather than the
+// whole text is what keeps `p.x + p.y` from being read as type `p`.
+fn tc_type_of(text: string, locals: string, structs: string, fns: string): string {
+    if tc_find_top_op(text, "<>") < len(text) {
+        return "bool";
+    }
+    let eq = tc_find_top_op(text, "=");
+    if eq < len(text) && eq + 1 < len(text) && char_at(text, eq + 1) == '=' {
+        return "bool";
+    }
+    let bang = tc_find_top_op(text, "!");
+    if bang < len(text) {
+        return "bool";
+    }
+    let arith = tc_find_top_op(text, "+-*/%");
+    if arith < len(text) {
+        let left = tc_type_of(substring(text, 0, arith), locals, structs, fns);
+        if left != "" {
+            return left;
+        }
+        return tc_type_of(substring(text, arith + 1, len(text) - arith - 1), locals, structs, fns);
+    }
+    return tc_atom_type(text, locals, structs, fns);
+}
+
+// The declared type in a `Type ...` node: "i32", "Point", "[ i32 ; 3 ]".
+fn tc_declared_type(type_text: string): string {
+    let t = trim_line(type_text);
+    if t == "" {
+        return "";
+    }
+    if char_at(t, 0) == '[' {
+        // Element type of an array, so `nums[i]` still types.
+        let close = find_char_in(t, 1, ']');
+        let inner = trim_line(substring(t, 1, close - 1));
+        let semi = find_char_in(inner, 0, ';');
+        if semi < len(inner) {
+            return trim_line(substring(inner, 0, semi));
+        }
+        return inner;
+    }
+    let space = find_char_in(t, 0, ' ');
+    if space < len(t) {
+        return substring(t, 0, space);
+    }
+    return t;
+}
+
+// Index of the ')' matching the '(' at `open`, or len(text).
+fn tc_match_paren(text: string, open: i64): i64 {
+    let n = len(text);
+    let depth: i64 = 0;
+    let i = open;
+    let quote: char = ' ';
+    while i < n {
+        let ch = char_at(text, i);
+        if quote != ' ' {
+            if ch == quote {
+                quote = ' ';
+            }
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch;
+        } else if ch == '(' || ch == '[' || ch == '{' {
+            depth = depth + 1;
+        } else if ch == ')' || ch == ']' || ch == '}' {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Splits at top-level separators, returning "\n"-joined items.
+fn tc_split_top(text: string, sep: char): string {
+    let n = len(text);
+    let out = "";
+    let start: i64 = 0;
+    let depth: i64 = 0;
+    let quote: char = ' ';
+    let i: i64 = 0;
+    while i < n {
+        let ch = char_at(text, i);
+        if quote != ' ' {
+            if ch == quote {
+                quote = ' ';
+            }
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch;
+        } else if ch == '(' || ch == '[' || ch == '{' {
+            depth = depth + 1;
+        } else if ch == ')' || ch == ']' || ch == '}' {
+            depth = depth - 1;
+        } else if ch == sep && depth == 0 {
+            out = out + trim_line(substring(text, start, i - start)) + "\n";
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let tail = trim_line(substring(text, start, n - start));
+    if tail != "" {
+        out = out + tail + "\n";
+    }
+    return out;
+}
+
+fn tc_list_count(list: string): i64 {
+    let n = len(list);
+    if n == 0 {
+        return 0;
+    }
+    let count: i64 = 0;
+    let start: i64 = 0;
+    while start < n {
+        let e = find_char_in(list, start, '\n');
+        if e > start {
+            count = count + 1;
+        }
+        start = e + 1;
+    }
+    return count;
+}
+
+fn tc_list_at(list: string, index: i64): string {
+    let n = len(list);
+    let start: i64 = 0;
+    let k: i64 = 0;
+    while start < n {
+        let e = find_char_in(list, start, '\n');
+        if k == index {
+            return substring(list, start, e - start);
+        }
+        k = k + 1;
+        start = e + 1;
+    }
+    return "";
+}
+
+fn tc_enum_exists(tree: string, name: string): bool {
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let line = imp_line_at(tree, i);
+        if imp_starts(line, "Enum ") {
+            if const_line_name(line, 5) == name {
+                return true;
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return false;
+}
+
+// The members of `enum Name`, comma joined, or "" when there is no such enum.
+fn tc_list_has(list: string, item: string): bool {
+    let n = len(list);
+    let start: i64 = 0;
+    while start <= n {
+        let e = find_char_in(list, start, ',');
+        if substring(list, start, e - start) == item {
+            return true;
+        }
+        start = e + 1;
+    }
+    return false;
+}
+
+fn tc_enum_members(tree: string, name: string): string {
+    let i: i64 = 0;
+    let n = len(tree);
+    let inside = false;
+    let out = "";
+    while i < n {
+        let line = imp_line_at(tree, i);
+        let d: i64 = tc_indent_at(tree, i);
+        if imp_starts(line, "Enum ") {
+            if inside {
+                return out;
+            }
+            inside = const_line_name(line, 5) == name;
+            if inside {
+                i = imp_next_line(tree, i);
+                while i < n {
+                    let inner = imp_line_at(tree, i);
+                    if imp_starts(inner, "Member ") {
+                        if out != "" {
+                            out = out + ",";
+                        }
+                        out = out + const_line_name(inner, 7);
+                    } else if tc_indent_at(tree, i) <= d {
+                        return out;
+                    }
+                    i = imp_next_line(tree, i);
+                }
+                return out;
+            }
+        }
+        i = imp_next_line(tree, i);
+    }
+    return out;
+}
+
+// Field access and enum variants need the tables, and both used to reach LLVM
+// with an internal IR message instead of naming the field the user wrote.
+fn tc_check_members(text: string, locals: string, structs: string, tree: string): string {
+    let n = len(text);
+    let i: i64 = 0;
+    let quote: char = ' ';
+    while i < n {
+        let ch = char_at(text, i);
+        if quote != ' ' {
+            if ch == quote {
+                quote = ' ';
+            }
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch;
+            i = i + 1;
+            continue;
+        }
+        if tc_is_word_char(ch) && (i == 0 || !tc_is_word_char(char_at(text, i - 1))) {
+            let word = tc_read_word(text, i);
+            if word != "" {
+                let after = tc_skip_space(text, i + len(word));
+                if after < n && char_at(text, after) == ':' && after + 1 < n && char_at(text, after + 1) == ':' {
+                    // Enum variant: the enum must exist and list the member.
+                    let mstart = tc_skip_space(text, after + 2);
+                    let member = tc_read_word(text, mstart);
+                    let members = tc_enum_members(tree, word);
+                    if member != "" && members != "" && !tc_list_has(members, member) {
+                        return "enum '" + word + "' has no member '" + member + "'";
+                    }
+                } else if after < n && char_at(text, after) == '.' {
+                    let fstart = tc_skip_space(text, after + 1);
+                    let field = tc_read_word(text, fstart);
+                    let base_ty = tc_lookup_local(locals, word);
+                    if field != "" && base_ty != "" && tc_lookup(structs, base_ty) != "" {
+                        if tc_field_type(structs, base_ty, field) == "" {
+                            return "struct '" + base_ty + "' has no field '" + field + "'";
+                        }
+                    }
+                }
+                i = i + len(word);
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Checks every call site in a node's text against the declared parameter types.
+fn tc_check_calls(text: string, locals: string, structs: string, fns: string): string {
+    let n = len(text);
+    let i: i64 = 0;
+    let quote: char = ' ';
+    while i < n {
+        let ch = char_at(text, i);
+        if quote != ' ' {
+            if ch == quote {
+                quote = ' ';
+            }
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch;
+            i = i + 1;
+            continue;
+        }
+        if tc_is_word_char(ch) && (i == 0 || !tc_is_word_char(char_at(text, i - 1))) {
+            let word = tc_read_word(text, i);
+            if word != "" {
+                let j: i64 = tc_skip_space(text, i + len(word));
+                if j < n && char_at(text, j) == '(' {
+                    if tc_lookup(fns, word) != "" {
+                        let close = tc_match_paren(text, j);
+                        let inner = substring(text, j + 1, close - j - 1);
+                        let args = tc_split_top(inner, ',');
+                        let count: i64 = tc_list_count(args);
+                        let k: i64 = 0;
+                        while k < count {
+                            let want = tc_nth_param(fns, word, k);
+                            let have = tc_type_of(tc_list_at(args, k), locals, structs, fns);
+                            if !tc_compatible(have, want) {
+                                return "argument " + digits_of(k + 1) + " of '" + word + "': expected '" + want + "', got '" + have + "'";
+                            }
+                            k = k + 1;
+                        }
+                    } else if tc_is_primitive(tc_lookup_local(locals, word)) {
+                        // A variable holding an integer is not callable. Only
+                        // claimed for primitive types, so a field holding a
+                        // function value is left alone.
+                        return "'" + word + "' is a variable of type '" + tc_lookup_local(locals, word) + "', not a function";
+                    }
+                }
+                i = i + len(word);
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// The expression text inside a value node, with the node keyword removed.
+fn tc_payload(node_line: string): string {
+    if imp_starts(node_line, "Expr ") {
+        return trim_line(substring(node_line, 5, len(node_line) - 5));
+    }
+    if imp_starts(node_line, "Call ") {
+        return trim_line(substring(node_line, 5, len(node_line) - 5));
+    }
+    if imp_starts(node_line, "Binary ") {
+        return trim_line(substring(node_line, 7, len(node_line) - 7));
+    }
+    return "";
+}
+
+// The condition text of an `If`/`While`: the expression sits beside the
+// `Condition` marker, one level below the header.
+fn tc_condition_text(tree: string, index: i64, indent: i64): string {
+    let n = len(tree);
+    let j: i64 = imp_next_line(tree, index);
+    while j < n {
+        let d: i64 = tc_indent_at(tree, j);
+        if d <= indent {
+            return "";
+        }
+        let line = imp_line_at(tree, j);
+        if d == indent + 2 {
+            if imp_starts(line, "Condition") {
+                let k: i64 = imp_next_line(tree, j);
+                if k < n {
+                    return tc_payload(imp_line_at(tree, k));
+                }
+                return "";
+            }
+        }
+        j = imp_next_line(tree, j);
+    }
+    return "";
+}
+
+fn check_types(tree: string): string {
+    let structs = tc_struct_table(tree);
+    let fns = tc_fn_table(tree);
+    let locals = "";
+    let cur_ret = "void";
+    let loop_depth: i64 = 0;
+    let seen_fns = "\n";
+    let i: i64 = 0;
+    let n = len(tree);
+    while i < n {
+        let indent = tc_indent_at(tree, i);
+        let line = imp_line_at(tree, i);
+
+        if imp_starts(line, "Function ") {
+            let fname = const_line_name(line, 9);
+            if fname != "" && imp_loaded(seen_fns, fname) {
+                return at_node("function '" + fname + "' is defined more than once", tree, i);
+            }
+            seen_fns = seen_fns + fname + "\n";
+            locals = "";
+            cur_ret = "void";
+            loop_depth = 0;
+        }
+
+        if imp_starts(line, "Param ") {
+            let spec = const_line_name(line, 6);
+            let colon = find_char_in(spec, 0, ':');
+            if colon < len(spec) {
+                let pname = trim_line(substring(spec, 0, colon));
+                let ptype = tc_declared_type(substring(spec, colon + 1, len(spec) - colon - 1));
+                if pname != "" && ptype != "" {
+                    locals = locals + pname + ":" + ptype + "\n";
+                }
+            }
+        }
+
+        if imp_starts(line, "ReturnType ") {
+            cur_ret = tc_declared_type(substring(line, 11, len(line) - 11));
+        }
+
+        if imp_starts(line, "While") || imp_starts(line, "For") {
+            loop_depth = loop_depth + 1;
+        }
+        if line == "EndWhile" || line == "EndFor" {
+            loop_depth = loop_depth - 1;
+        }
+
+        if line == "break" || line == "continue" {
+            if loop_depth <= 0 {
+                return at_node("'" + line + "' outside of a loop", tree, i);
+            }
+        }
+
+        if imp_starts(line, "Let ") || imp_starts(line, "Const ") {
+            let offset: i64 = 4;
+            if imp_starts(line, "Const ") {
+                offset = 6;
+            }
+            let name = const_line_name(line, offset);
+            let type_text = "";
+            let value_text = "";
+            let j: i64 = imp_next_line(tree, i);
+            let stop = false;
+            while j < n && !stop {
+                let d = tc_indent_at(tree, j);
+                if d <= indent {
+                    stop = true;
+                } else {
+                    let child = imp_line_at(tree, j);
+                    // The tree indents two spaces per level, so a direct child of
+                    // this node sits at indent + 2.
+                    if d == indent + 2 {
+                        if imp_starts(child, "Type ") && type_text == "" {
+                            type_text = trim_line(substring(child, 5, len(child) - 5));
+                        }
+                        if value_text == "" {
+                            if imp_starts(child, "Expr ") || imp_starts(child, "Call ") || imp_starts(child, "Binary ") {
+                                value_text = child;
+                            }
+                        }
+                    }
+                    j = imp_next_line(tree, j);
+                }
+            }
+            let want = tc_declared_type(type_text);
+            if want != "" && type_text != "" {
+                let known = tc_is_primitive(want) || tc_lookup(structs, want) != "" || tc_enum_exists(tree, want);
+                if !known {
+                    return at_node("unknown type '" + want + "' for variable '" + name + "'", tree, i);
+                }
+            }
+            if want != "" && value_text != "" {
+                let have = tc_type_of(tc_payload(value_text), locals, structs, fns);
+                if !tc_compatible(have, want) {
+                    return at_node("cannot initialize variable '" + name + "' of type '" + want + "' with '" + have + "'", tree, i);
+                }
+            }
+            if name != "" && want != "" {
+                locals = locals + name + ":" + want + "\n";
+            }
+        }
+
+        if imp_starts(line, "Return") {
+            let j: i64 = imp_next_line(tree, i);
+            if j < n && tc_indent_at(tree, j) > indent {
+                let child = imp_line_at(tree, j);
+                if imp_starts(child, "Expr ") || imp_starts(child, "Call ") || imp_starts(child, "Binary ") {
+                    let have = tc_type_of(tc_payload(child), locals, structs, fns);
+                    if cur_ret == "void" {
+                        return at_node("'return' with a value in a function that returns nothing", tree, i);
+                    }
+                    if !tc_compatible(have, cur_ret) {
+                        return at_node("function returns '" + cur_ret + "' but 'return' supplies '" + have + "'", tree, i);
+                    }
+                }
+            }
+        }
+
+        if imp_starts(line, "Assign ") {
+            let name = const_line_name(line, 7);
+            let j: i64 = imp_next_line(tree, i);
+            // The `Expr lhs = rhs` payload is a sibling of the Assign node, not a
+            // child: both sit at the same depth, so `>` would skip it.
+            if j < n && tc_indent_at(tree, j) >= indent {
+                let child = imp_line_at(tree, j);
+                if imp_starts(child, "Expr ") {
+                    let text = trim_line(substring(child, 5, len(child) - 5));
+                    let eq = find_char_in(text, 0, '=');
+                    if eq < len(text) {
+                        let want = tc_lookup_local(locals, name);
+                        let rhs = trim_line(substring(text, eq + 1, len(text) - eq - 1));
+                        let have = tc_type_of(rhs, locals, structs, fns);
+                        if want != "" && !tc_compatible(have, want) {
+                            return at_node("cannot assign '" + have + "' to variable '" + name + "' of type '" + want + "'", tree, i);
+                        }
+                    }
+                }
+            }
+        }
+
+        if imp_starts(line, "If") || imp_starts(line, "While") {
+            let cond = tc_condition_text(tree, i, indent);
+            if cond != "" {
+                let have = tc_type_of(cond, locals, structs, fns);
+                if tc_bad_condition(have) {
+                    return at_node("if condition must be bool-compatible, got '" + have + "'", tree, i);
+                }
+            }
+        }
+
+        if imp_starts(line, "ForCondition ") {
+            let cond = trim_line(substring(line, 13, len(line) - 13));
+            if cond != "" {
+                let have = tc_type_of(cond, locals, structs, fns);
+                if tc_bad_condition(have) {
+                    return at_node("if condition must be bool-compatible, got '" + have + "'", tree, i);
+                }
+            }
+        }
+
+        if imp_starts(line, "Expr ") || imp_starts(line, "Call ") || imp_starts(line, "Binary ") || imp_starts(line, "Left ") || imp_starts(line, "Right ") {
+            let payload = tc_payload(line);
+            let verdict = tc_check_calls(payload, locals, structs, fns);
+            if verdict != "" {
+                return at_node(verdict, tree, i);
+            }
+            let member = tc_check_members(payload, locals, structs, tree);
+            if member != "" {
+                return at_node(member, tree, i);
+            }
+        }
+
+        i = imp_next_line(tree, i);
+    }
+    return "";
+}
+
+// Binds a message to the node that caused it, so report_error can point at the
+// line the user wrote rather than only naming the problem.
+fn at_node(message: string, tree: string, index: i64): string {
+    let line = imp_line_pos_at(tree, index);
+    if line <= 0 {
+        return message;
+    }
+    return message + " @" + digits_of(line);
+}
+
 // Runs every static rule and returns the first violation, or "".
 fn check_static_rules(tree: string): string {
     let error = check_name_resolution(tree);
+    if error != "" {
+        return error;
+    }
+    error = check_types(tree);
     if error != "" {
         return error;
     }
@@ -1126,13 +2184,24 @@ fn imp_next_line(text: string, index: i64): i64 {
     return e + 1;
 }
 
+// The source line of the node starting at `index`, or 0 when it has none. Read
+// from the raw line because imp_line_at strips the position on the way out.
+fn imp_line_pos_at(text: string, index: i64): i64 {
+    let n = len(text);
+    if index >= n {
+        return 0;
+    }
+    let e = find_char_in(text, index, '\n');
+    return ast.line_pos(substring(text, index, e - index));
+}
+
 fn imp_line_at(text: string, index: i64): string {
     let n = len(text);
     if index >= n {
         return "";
     }
     let e = find_char_in(text, index, '\n');
-    return trim_line(substring(text, index, e - index));
+    return ast.strip_pos(trim_line(substring(text, index, e - index)));
 }
 
 // "core.math" -> "<root>/core/math.miko"
@@ -1246,7 +2315,7 @@ fn compile_file(source_path: string, output_prefix: string, want_exe: bool): i32
     write_file(output_prefix + ".sema", checked);
     let error = check_static_rules(tree);
     if error != "" {
-        eprint("error: " + error);
+        report_error(source, source_path, error);
         print("failed");
         return 1;
     }

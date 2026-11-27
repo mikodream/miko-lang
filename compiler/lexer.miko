@@ -125,11 +125,18 @@ pub fn lex(source: string): string {
     let length = len(source);
     let i = 0;
     let stream = "";
+    // Tokens carry the line they started on, so a diagnostic can point at the
+    // line the user wrote. A newline is whitespace here and is consumed by the
+    // branch below, which is the only place the count can advance.
+    let line = 1;
 
     while i < length {
         let ch = char_at(source, i);
 
         if is_space(ch) {
+            if ch == '\n' {
+                line = line + 1;
+            }
             i = i + 1;
             continue;
         }
@@ -141,7 +148,7 @@ pub fn lex(source: string): string {
                 i = i + 1;
             }
             let text = substring(source, start, i - start);
-            stream = token.append_token(stream, keyword_kind(text), text);
+            stream = token.append_token(stream, keyword_kind(text), text, line);
             continue;
         }
 
@@ -157,7 +164,7 @@ pub fn lex(source: string): string {
                     while i < length && is_radix_digit(char_at(source, i), hex) {
                         i = i + 1;
                     }
-                    stream = token.append_token(stream, "IntegerLiteral", substring(source, start, i - start));
+                    stream = token.append_token(stream, "IntegerLiteral", substring(source, start, i - start), line);
                     continue;
                 }
             }
@@ -183,15 +190,15 @@ pub fn lex(source: string): string {
                     while i < length && is_digit_or_separator(char_at(source, i)) {
                         i = i + 1;
                     }
-                    stream = token.append_token(stream, "FloatLiteral", substring(source, start, i - start));
+                    stream = token.append_token(stream, "FloatLiteral", substring(source, start, i - start), line);
                     continue;
                 }
             }
             let text = substring(source, start, i - start);
             if contains_char(text, '.') {
-                stream = token.append_token(stream, "FloatLiteral", text);
+                stream = token.append_token(stream, "FloatLiteral", text, line);
             } else {
-                stream = token.append_token(stream, "IntegerLiteral", text);
+                stream = token.append_token(stream, "IntegerLiteral", text, line);
             }
             continue;
         }
@@ -208,7 +215,7 @@ pub fn lex(source: string): string {
             if i < length {
                 i = i + 1;
             }
-            stream = token.append_token(stream, "StringLiteral", substring(source, start, i - start));
+            stream = token.append_token(stream, "StringLiteral", substring(source, start, i - start), line);
             continue;
         }
 
@@ -224,7 +231,7 @@ pub fn lex(source: string): string {
             if i < length && char_at(source, i) == '\'' {
                 i = i + 1;
             }
-            stream = token.append_token(stream, "CharLiteral", substring(source, start, i - start));
+            stream = token.append_token(stream, "CharLiteral", substring(source, start, i - start), line);
             continue;
         }
 
@@ -237,146 +244,146 @@ pub fn lex(source: string): string {
         }
 
         if ch == '=' && i + 1 < length && char_at(source, i + 1) == '=' {
-            stream = token.append_token(stream, "EqualEqual", "==");
+            stream = token.append_token(stream, "EqualEqual", "==", line);
             i = i + 2;
             continue;
         }
         if ch == '!' && i + 1 < length && char_at(source, i + 1) == '=' {
-            stream = token.append_token(stream, "BangEqual", "!=");
+            stream = token.append_token(stream, "BangEqual", "!=", line);
             i = i + 2;
             continue;
         }
         if ch == '<' && i + 1 < length && char_at(source, i + 1) == '=' {
-            stream = token.append_token(stream, "LessEqual", "<=");
+            stream = token.append_token(stream, "LessEqual", "<=", line);
             i = i + 2;
             continue;
         }
         if ch == '>' && i + 1 < length && char_at(source, i + 1) == '=' {
-            stream = token.append_token(stream, "GreaterEqual", ">=");
+            stream = token.append_token(stream, "GreaterEqual", ">=", line);
             i = i + 2;
             continue;
         }
         if ch == '&' && i + 1 < length && char_at(source, i + 1) == '&' {
-            stream = token.append_token(stream, "AndAnd", "&&");
+            stream = token.append_token(stream, "AndAnd", "&&", line);
             i = i + 2;
             continue;
         }
         if ch == '|' && i + 1 < length && char_at(source, i + 1) == '|' {
-            stream = token.append_token(stream, "OrOr", "||");
+            stream = token.append_token(stream, "OrOr", "||", line);
             i = i + 2;
             continue;
         }
         if ch == '-' && i + 1 < length && char_at(source, i + 1) == '>' {
-            stream = token.append_token(stream, "Arrow", "->");
+            stream = token.append_token(stream, "Arrow", "->", line);
             i = i + 2;
             continue;
         }
 
         if ch == '+' {
-            stream = token.append_token(stream, "Plus", "+");
+            stream = token.append_token(stream, "Plus", "+", line);
             i = i + 1;
             continue;
         }
         if ch == '-' {
-            stream = token.append_token(stream, "Minus", "-");
+            stream = token.append_token(stream, "Minus", "-", line);
             i = i + 1;
             continue;
         }
         if ch == '*' {
-            stream = token.append_token(stream, "Star", "*");
+            stream = token.append_token(stream, "Star", "*", line);
             i = i + 1;
             continue;
         }
         if ch == '/' {
-            stream = token.append_token(stream, "Slash", "/");
+            stream = token.append_token(stream, "Slash", "/", line);
             i = i + 1;
             continue;
         }
         if ch == '%' {
-            stream = token.append_token(stream, "Percent", "%");
+            stream = token.append_token(stream, "Percent", "%", line);
             i = i + 1;
             continue;
         }
         if ch == '=' {
-            stream = token.append_token(stream, "Equal", "=");
+            stream = token.append_token(stream, "Equal", "=", line);
             i = i + 1;
             continue;
         }
         if ch == '!' {
-            stream = token.append_token(stream, "Bang", "!");
+            stream = token.append_token(stream, "Bang", "!", line);
             i = i + 1;
             continue;
         }
         if ch == '<' {
-            stream = token.append_token(stream, "Less", "<");
+            stream = token.append_token(stream, "Less", "<", line);
             i = i + 1;
             continue;
         }
         if ch == '>' {
-            stream = token.append_token(stream, "Greater", ">");
+            stream = token.append_token(stream, "Greater", ">", line);
             i = i + 1;
             continue;
         }
         if ch == '(' {
-            stream = token.append_token(stream, "LeftParen", "(");
+            stream = token.append_token(stream, "LeftParen", "(", line);
             i = i + 1;
             continue;
         }
         if ch == ')' {
-            stream = token.append_token(stream, "RightParen", ")");
+            stream = token.append_token(stream, "RightParen", ")", line);
             i = i + 1;
             continue;
         }
         if ch == '{' {
-            stream = token.append_token(stream, "LeftBrace", "{");
+            stream = token.append_token(stream, "LeftBrace", "{", line);
             i = i + 1;
             continue;
         }
         if ch == '}' {
-            stream = token.append_token(stream, "RightBrace", "}");
+            stream = token.append_token(stream, "RightBrace", "}", line);
             i = i + 1;
             continue;
         }
         if ch == '[' {
-            stream = token.append_token(stream, "LeftBracket", "[");
+            stream = token.append_token(stream, "LeftBracket", "[", line);
             i = i + 1;
             continue;
         }
         if ch == ']' {
-            stream = token.append_token(stream, "RightBracket", "]");
+            stream = token.append_token(stream, "RightBracket", "]", line);
             i = i + 1;
             continue;
         }
         if ch == ',' {
-            stream = token.append_token(stream, "Comma", ",");
+            stream = token.append_token(stream, "Comma", ",", line);
             i = i + 1;
             continue;
         }
         if ch == '.' {
-            stream = token.append_token(stream, "Dot", ".");
+            stream = token.append_token(stream, "Dot", ".", line);
             i = i + 1;
             continue;
         }
         if ch == ':' && i + 1 < length && char_at(source, i + 1) == ':' {
-            stream = token.append_token(stream, "DoubleColon", "::");
+            stream = token.append_token(stream, "DoubleColon", "::", line);
             i = i + 2;
             continue;
         }
         if ch == ':' {
-            stream = token.append_token(stream, "Colon", ":");
+            stream = token.append_token(stream, "Colon", ":", line);
             i = i + 1;
             continue;
         }
         if ch == ';' {
-            stream = token.append_token(stream, "Semicolon", ";");
+            stream = token.append_token(stream, "Semicolon", ";", line);
             i = i + 1;
             continue;
         }
 
-        stream = token.append_char_token(stream, "Invalid", ch);
+        stream = token.append_char_token(stream, "Invalid", ch, line);
         i = i + 1;
     }
 
-    return token.append_token(stream, "EndOfFile", "");
+    return token.append_token(stream, "EndOfFile", "", line);
 }
 

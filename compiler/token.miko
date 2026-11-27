@@ -60,17 +60,21 @@ fn encode_text(text: string): string {
     return out;
 }
 
-pub fn append_token(stream: string, kind: string, text: string): string {
+// The source line is carried so a diagnostic can point at the line the user
+// wrote. It sits between the length and the text: the reader still consumes
+// exactly `len` bytes for the text, so a token whose text contains '|' or any
+// other delimiter stays unambiguous.
+pub fn append_token(stream: string, kind: string, text: string, line: i64): string {
     // append_str, not stream + ...: the stream grows to megabytes, so rebuilding
     // it for every token made lexing quadratic. On a 94 KB source that was 47 of
     // the compiler's 55 seconds; the token stream is now appended in place.
     let encoded = encode_text(text);
-    let piece = kind + "|" + number_to_text(len(encoded)) + "|" + encoded + "\n";
+    let piece = kind + "|" + number_to_text(len(encoded)) + "|" + number_to_text(line) + "|" + encoded + "\n";
     return append_str(stream, piece);
 }
 
-pub fn append_char_token(stream: string, kind: string, value: char): string {
+pub fn append_char_token(stream: string, kind: string, value: char, line: i64): string {
     // Only reached for characters no grammar rule accepts; the payload carries
     // no meaning past "this byte was rejected", so the rendering is fixed.
-    return append_token(stream, kind, "<char>");
+    return append_token(stream, kind, "<char>", line);
 }
