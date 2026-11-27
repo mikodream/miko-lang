@@ -1,19 +1,32 @@
 name: release
 
-# Every push to main produces a tag and a release with native binaries for each
-# supported platform. The tag carries the build number so that two releases can
-# never collide on the same name, while the version still comes from
-# CMakeLists.txt - one place to bump.
+# Every push to main produces a tag and a release.
 #
-# Why native builds instead of cross-compiling: the compiler is bootstrapped in
-# two stages, and stage 0 is a C++ program linked against LLVM. Cross-building
-# that for four platforms means four LLVM installs plus four sysroots, and it
-# still would not prove the result runs. Each job here builds on the machine the
-# binary is for, so a broken binary fails its own job instead of a user's machine.
+# Two ways to build, chosen per platform for a reason rather than for symmetry:
 #
-# The released compiler is stage 1, the self-hosted one. It emits portable LLVM IR
-# with no target triple, so the same source produces the right code everywhere;
-# the platform only enters at link time, through the link script in the package.
+#   Linux and macOS are built on the machine the binary is for. Stage 0 is a C++
+#   program linked against LLVM, so it needs a compiler and an LLVM that agree with
+#   each other, and the cheapest way to get that is to use the platform's own.
+#
+#   Windows is cross-compiled on Linux with llvm-mingw. This is deliberate: the only
+#   LLVM builds for Windows are MSVC ABI, and using them forces MSVC into the build,
+#   which then cannot be reproduced anywhere else. llvm-mingw is a clang that targets
+#   x86_64-w64-mingw32 and aarch64-w64-mingw32 from a Linux host with its own C
+#   runtime and headers, so no Visual Studio, no Windows SDK and no Windows runner is
+#   needed to produce the binaries - which is also what makes windows-arm64 possible,
+#   since the arm64 Windows image has no Visual Studio at all.
+#
+# The thing that makes cross-compiling work at all: the self-hosted compiler emits
+# LLVM IR text with no target triple and no data layout. The target enters only when
+# something links that IR. So the same `miko.ll` becomes a Linux binary, a Windows
+# x64 binary or a Windows arm64 binary depending on which clang links it, and there
+# is no per-platform code generation to keep in sync.
+#
+# Cross-compiling does not get to skip verification. The Windows jobs build the
+# package on Linux and then a separate job on a real Windows runner unpacks it, runs
+# the compiler, and runs programs that were cross-linked from IR produced by the
+# Linux gate - so a Windows binary that cannot execute fails in CI, not on a user's
+# machine.
 
 on:
   push:
@@ -28,6 +41,11 @@ concurrency:
 
 permissions:
   contents: write
+
+env:
+  # The version of this backend, not of LLVM: 23 removed IRBuilder::CreateGlobalStringPtr
+  # and rejects the IR this backend emits, so everything that links LLVM is pinned.
+  LLVM_MINGW_TAG: "20261117"
 
 jobs:
   version:
@@ -53,93 +71,98 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "releasing $version as $tag"
 
+  # ---------------------------------------------------------------------------
+  # Linux and macOS, built natively.
+  # ---------------------------------------------------------------------------
   build:
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
     strategy:
-      # One platform failing must not cancel the others: a release missing only
-      # the arm64 Mac is still worth shipping, and the failure is visible in the
-      # run summary either way.
+      # One platform failing must not cancel the others: a release missing only one
+      # archive is still worth shipping, and the gap is visible in the run summary.
       fail-fast: false
       matrix:
         include:
           - name: linux-x64
             os: ubuntu-latest
-            arch: x64
             target: linux-x64
             archive: miko-${{ needs.version.outputs.version }}-linux-x64.tar.gz
           - name: linux-arm64
             os: ubuntu-24.04-arm
-            arch: arm64
             target: linux-arm64
             archive: miko-${{ needs.version.outputs.version }}-linux-arm64.tar.gz
           - name: macos-x64
             os: macos-15-intel
-            arch: x64
             target: macos-x64
             archive: miko-${{ needs.version.outputs.version }}-macos-x64.tar.gz
-          # macos-arm64 is not built, and the reason is not a lack of interest.
-          #
-          # A release needs LLVM 22: LLVM 23 removed IRBuilder::CreateGlobalStringPtr
-          # and rejects this backend's output outright. On the arm64 macOS image
-          # Homebrew's llvm is 23.1.5, so Brew is out. The official
-          # LLVM-22.1.8-macOS-ARM64 archive is the only 22 available, and it cannot be
-          # linked against with Apple's toolchain: its static libraries are LLVM
-          # bitcode, which Xcode's LLVM 17 linker refuses with "Unknown attribute kind
-          # (102) (Producer: 'LLVM22.1.8' Reader: 'LLVM APPLE_1_1700.0.13.5_0')".
-          # Building with the archive's own clang fixes that and then fails on
-          # __hash_memory, because that clang's libc++ expects a newer libc++ than
-          # Xcode ships. Both halves of that pairing have to match and only one of them
-          # can be chosen from here.
-          #
-          # Four platforms build and are published. This gap is stated rather than
-          # hidden: it needs either a Homebrew formula for LLVM 22 on arm64 or an
-          # LLVM built from source for that target.
-          - name: windows-x64
-            os: windows-latest
-            arch: x64
-            target: windows-x64
-            archive: miko-${{ needs.version.outputs.version }}-windows-x64.zip
-          # windows-arm64 is not in this matrix on purpose. windows-11-arm has no
-          # Visual Studio at all - vswhere.exe is absent - so stage 0, which is a C++
-          # program built by MSVC, cannot be built there. Shipping that job as
-          # "experimental" only produced a red run every time without ever producing
-          # a package, which is worse than saying plainly that the platform is not
-          # covered.
+          - name: macos-arm64
+            os: macos-15
+            target: macos-arm64
+            archive: miko-${{ needs.version.outputs.version }}-macos-arm64.tar.gz
 
     steps:
       - uses: actions/checkout@v4
-
-      # ---- LLVM ------------------------------------------------------------
-      # Stage 0 is a C++ program that links against LLVM's C++ API, so the
-      # development package with LLVMConfig.cmake is required, not just clang.
 
       - name: Install LLVM (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # Pinned to 18, the version this compiler is verified against, rather than
-          # whatever `llvm-dev` happens to point at: 23.x removed
-          # IRBuilder::CreateGlobalStringPtr and rejects the IR this backend emits,
-          # so an unpinned install breaks the build the day the runner updates.
+          # Pinned to 18 rather than whatever `llvm-dev` points at: 23.x removed
+          # IRBuilder::CreateGlobalStringPtr and rejects this backend's IR, so an
+          # unpinned install breaks the build the day the runner updates.
           #
           # libtinfo-dev, zlib1g-dev and libzstd-dev are not optional extras: LLVM's
-          # own archives call into terminfo and zstd, and without the -dev packages
-          # there is no libtinfo.so for the linker to resolve set_curterm against.
+          # archives call into terminfo and zstd, and without the -dev packages the
+          # linker has no libtinfo.so to resolve set_curterm against.
           sudo apt-get install -y llvm-18 llvm-18-dev clang-18 libclang-18-dev gcc \
             libtinfo-dev zlib1g-dev libzstd-dev
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
-      # macOS x64 only. Brew's llvm resolved to 22.1.8_2 on the Intel image and built
-      # and linked, while the same formula on the arm64 image is 23.1.5, which is a
-      # version this backend cannot target. See the matrix note for why arm64 is absent.
+      # macOS needs LLVM 22 and gets it two different ways, because only one of them
+      # exists for each architecture.
       #
-      # zstd and zlib are what Homebrew's LLVM build links against and does not
-      # re-export; without them the link stops on undefined ZSTD symbols.
-      - name: Install LLVM (macOS)
-        if: runner.os == 'macOS'
+      # On macos-15-intel Homebrew's llvm resolved to 22.1.8_2, which builds and links
+      # this backend. On macos-15 (arm64) the same formula is 23.1.5, which rejects its
+      # IR, and the official 22.1.8 release has no x64 macOS asset - only
+      # LLVM-22.1.8-macOS-ARM64.tar.xz - so the two architectures cannot share a path.
+      #
+      # The archive brings two problems that are really one. Its static libraries are
+      # LLVM bitcode, which Xcode's linker (LLVM 17) refuses with "Unknown attribute
+      # kind (102)"; building with the archive's own clang fixes that. Then that clang
+      # uses the archive's libc++ headers, which declare __hash_memory as
+      # _LIBCPP_EXPORTED_FROM_ABI at version 220108, while Apple's libc++.1.dylib does
+      # not export it. Headers and library have to come from the same build, so the
+      # archive's libc++, libc++abi and libunwind are linked statically: the binary
+      # then carries its own C++ runtime instead of depending on Apple's vintage.
+      - name: Install LLVM (macOS arm64)
+        if: runner.os == 'macOS' && matrix.target == 'macos-arm64'
+        run: |
+          set -euo pipefail
+          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-ARM64.tar.xz"
+          curl -fsSL "$url" -o llvm.tar.xz
+          mkdir -p llvm-dist
+          tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
+          rm -f llvm.tar.xz
+          # The archive does not carry libzstd but its LLVMSupport is built against
+          # it, so without this the link stops at "ld: library 'zstd' not found".
+          brew install zstd
+          echo "LIBRARY_PATH=$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+          echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "$PWD/llvm-dist/bin" >> "$GITHUB_PATH"
+          # Producer and reader of the bitcode have to be the same LLVM, and only the
+          # archive's clang is 22.
+          echo "CC=$PWD/llvm-dist/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=$PWD/llvm-dist/bin/clang++" >> "$GITHUB_ENV"
+          # -nostdlib++ stops the driver adding -lc++, then the archive's static
+          # libraries are named directly so the linker takes those and not Apple's.
+          libs="$PWD/llvm-dist/lib"
+          echo "CMAKE_EXE_LINKER_FLAGS=-nostdlib++ $libs/libc++.a $libs/libc++abi.a $libs/libunwind.a" >> "$GITHUB_ENV"
+          ./llvm-dist/bin/llvm-config --version
+
+      - name: Install LLVM (macOS x64)
+        if: runner.os == 'macOS' && matrix.target == 'macos-x64'
         run: |
           set -euo pipefail
           brew install llvm zstd zlib
@@ -152,127 +175,33 @@ jobs:
           echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
           "$prefix/bin/llvm-config" --version
 
-      # Windows needs the LLVM release archive, not the LLVM installer: neither
-      # `choco install llvm` nor the official LLVM-*-win64.exe publishes
-      # LLVMConfig.cmake, so find_package(LLVM) fails whichever directory is pointed
-      # at it. 22.1.8 is pinned deliberately - 23.x is built with zlib and zstd, so
-      # its exported targets demand both at link time, and it also drops
-      # IRBuilder::CreateGlobalStringPtr and rejects miko's generated IR. The
-      # 22.1.8 archive needs neither dependency. Cached because it is ~800 MB.
-      - name: Cache LLVM (Windows)
-        if: runner.os == 'Windows'
-        id: llvm-cache
-        uses: actions/cache@v4
-        with:
-          path: C:\llvm
-          key: llvm-22.1.8-${{ matrix.target }}
-
-      - name: Install LLVM 22.1.8 from the release archive (Windows)
-        if: runner.os == 'Windows' && steps.llvm-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        env:
-          MIKO_ARCH: ${{ matrix.arch }}
-        run: |
-          $triple = if ($env:MIKO_ARCH -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-$triple.tar.xz"
-          $archive = Join-Path $env:RUNNER_TEMP "llvm.tar.xz"
-          Write-Host "downloading $url"
-          curl.exe -L --fail --retry 3 --output $archive $url
-          if ($LASTEXITCODE -ne 0) { throw "LLVM download failed: $LASTEXITCODE" }
-          New-Item -ItemType Directory -Force -Path C:\llvm | Out-Null
-          # .tar.xz, not .tar.zst: the zstd archives use a window size bsdtar
-          # refuses by default, verified locally.
-          tar -xf $archive -C C:\llvm --strip-components=1
-          if ($LASTEXITCODE -ne 0) { throw "LLVM extraction failed: $LASTEXITCODE" }
-          Remove-Item $archive -Force
-
-      - name: Locate LLVM and MinGW (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $found = "C:\llvm\lib\cmake\llvm"
-          if (-not (Test-Path (Join-Path $found "LLVMConfig.cmake"))) { throw "LLVMConfig.cmake missing from the archive layout" }
-          Write-Host "LLVM_DIR=$found"
-          "LLVM_DIR=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "C:\llvm\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-
-          # difftest links the emitted IR with gcc, which LLVM does not provide.
-          choco install mingw --yes --no-progress
-          "C:\ProgramData\chocolatey\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-
       - name: Report the toolchain
-        shell: bash
         run: |
           cmake --version
           clang --version || true
           echo "LLVM_DIR=${LLVM_DIR:-unset}"
 
       # ---- stage 0: the C++ compiler ---------------------------------------
-
-      - name: Configure and build stage 0 (Unix)
-        if: runner.os != 'Windows'
+      - name: Configure and build stage 0
         run: |
+          set -euo pipefail
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DMIKO_ENABLE_LLVM=ON \
             -DLLVM_DIR="$LLVM_DIR"
           cmake --build build --target miko
 
-      # The Visual Studio generator is required on Windows: the LLVM chocolatey
-      # package is built with MSVC and its import libraries do not match MinGW.
-      # Which Visual Studio is installed is not something this workflow should have
-      # to know - the runner image moves, and a hard-coded "Visual Studio 17 2022"
-      # simply fails once it does. vswhere ships with every VS 2017+ install, so the
-      # generator is discovered instead of assumed. The architecture arrives through
-      # the environment rather than an inline ${{ }} expression, which PowerShell
-      # would try to read as a variable.
-      - name: Configure and build stage 0 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          MIKO_ARCH: ${{ matrix.arch }}
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe" }
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - no Visual Studio on this runner" }
-
-          # Newest first. CMake's own default is not usable here: it picks Ninja when
-          # ninja is on PATH, and Ninja has no -A platform and would build with MinGW,
-          # which cannot link against the MSVC-built LLVM.
-          $generator = $null
-          foreach ($candidate in @(
-            @{ Major = 18; Name = "Visual Studio 18 2026" },
-            @{ Major = 17; Name = "Visual Studio 17 2022" }
-          )) {
-            $range = "[$($candidate.Major).0,$($candidate.Major + 1).0)"
-            $found = & $vswhere -latest -products * -version $range -property installationPath 2>$null
-            if ($found) {
-              if (-not $generator) { $generator = $candidate.Name }
-              Write-Host "found $($candidate.Name) at $found"
-            }
-          }
-          if (-not $generator) { throw "no Visual Studio with a C++ toolset found" }
-          Write-Host "using generator: $generator"
-
-          cmake -S . -B build -G $generator -A $env:MIKO_ARCH -DMIKO_ENABLE_LLVM=ON
-          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
-          cmake --build build --config Release --target miko
-          if ($LASTEXITCODE -ne 0) { throw "stage 0 build failed" }
-
       # ---- stage 1: the self-hosted compiler -------------------------------
-      # This is what ships. Building it here rather than trusting a committed
-      # binary is the only way the release proves the compiler can compile itself
-      # on this platform.
-
-      - name: Build stage 1 (Unix)
-        if: runner.os != 'Windows'
+      # This is what ships. Building it here rather than trusting a committed binary
+      # is the only way the release proves the compiler can compile itself here.
+      - name: Build stage 1
         run: |
           set -euo pipefail
           stage0="$PWD/build/miko"
-          # The compiler looks for miko.toolchain in the working directory first,
-          # so writing it here decides how its output gets linked. The POSIX entry
-          # needs the ./ prefix: system() resolves the command through the shell,
-          # which does not search the current directory without it.
+          # The compiler looks for miko.toolchain in the working directory first, so
+          # writing it here decides how its output gets linked. The POSIX entry needs
+          # the ./ prefix: system() resolves through the shell, which does not search
+          # the current directory without it.
           chmod +x dist/miko-link.sh
           printf './dist/miko-link.sh\n' > miko.toolchain
           mkdir -p stage1
@@ -280,43 +209,20 @@ jobs:
           ./dist/miko-link.sh stage1/miko.ll stage1/miko
           ./stage1/miko --version
 
-      - name: Build stage 1 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $stage0 = "build\Release\miko.exe"
-          if (-not (Test-Path $stage0)) { throw "stage 0 binary missing: $stage0" }
-          New-Item -ItemType Directory -Force -Path stage1 | Out-Null
-          "dist\miko-link.bat" | Out-File -Encoding ascii -NoNewline miko.toolchain
-          & $stage0 compiler\main_ll.miko --compile --emit-ir -o stage1\miko.ll
-          if ($LASTEXITCODE -ne 0) { throw "stage 1 IR emission failed" }
-          cmd /c "dist\miko-link.bat stage1\miko.ll stage1\miko.exe"
-          if (-not (Test-Path stage1\miko.exe)) { throw "stage 1 link failed" }
-          & stage1\miko.exe --version
-
       # ---- prove the shipped compiler works --------------------------------
-      # A release that cannot run its own test suite is not a release. The
-      # differential harness needs PowerShell, which every GitHub runner has.
-
+      # A release that cannot run its own test suite is not a release.
       - name: Run the differential suite against the shipped compiler
         shell: pwsh
         run: |
-          # The harness takes explicit paths rather than guessing, because a build
-          # directory differs per platform and a wrong guess would silently test
-          # the wrong compiler.
-          $stage0 = if ($env:RUNNER_OS -eq "Windows") { "build\Release\miko.exe" } else { "build/miko" }
-          $stage1 = if ($env:RUNNER_OS -eq "Windows") { "stage1\miko.exe" } else { "stage1/miko" }
-          pwsh -NoProfile -File tools/difftest.ps1 -RepoRoot . -CppCompiler $stage0 -SelfCompiler $stage1
+          pwsh -NoProfile -File tools/difftest.ps1 -RepoRoot . -CppCompiler build/miko -SelfCompiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "difftest failed: $LASTEXITCODE case(s) disagreed" }
 
       # ---- assemble the package --------------------------------------------
-      # The layout is flat on purpose. miko_str/read_file aside, the compiler
-      # resolves two things by relative path: runtime/miko_runtime.c for linking
-      # and stdlib/core/math.miko for imports. Both have to sit beside the binary,
-      # so the archive root is the directory the user works in.
-
-      - name: Assemble the package (Unix)
-        if: runner.os != 'Windows'
+      # The layout is flat on purpose. The compiler resolves two things by relative
+      # path: runtime/miko_runtime.c for linking and stdlib/core/math.miko for
+      # imports. Both have to sit beside the binary, so the archive root is the
+      # directory the user works in.
+      - name: Assemble the package
         run: |
           set -euo pipefail
           root="stage/miko"
@@ -334,37 +240,11 @@ jobs:
           tar -czf "${{ matrix.archive }}" -C stage miko
           ls -l "${{ matrix.archive }}"
 
-      - name: Assemble the package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          MIKO_ARCHIVE: ${{ matrix.archive }}
-        run: |
-          $root = "stage\miko"
-          Remove-Item -Recurse -Force stage -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path "$root\runtime","$root\stdlib","$root\compiler" | Out-Null
-          Copy-Item stage1\miko.exe "$root\miko.exe"
-          Copy-Item dist\miko-link.bat "$root\miko-link.bat"
-          "miko-link.bat" | Out-File -Encoding ascii -NoNewline "$root\miko.toolchain"
-          Copy-Item runtime\miko_runtime.c "$root\runtime\"
-          Copy-Item -Recurse stdlib\core "$root\stdlib\core"
-          Copy-Item compiler\*.miko "$root\compiler\"
-          Copy-Item README.md,BUILD.md,TUTORIAL.md,BOOTSTRAP.md,ROADMAP.md "$root\"
-          Copy-Item -Recurse tests "$root\tests"
-          # Compress the containing directory, not its contents: the archive then
-          # has a single miko/ root, which is what tar produces on the other
-          # platforms. Compressing "$root\*" instead sprayed the files into the
-          # user's working directory on extraction.
-          Compress-Archive -Path $root -DestinationPath $env:MIKO_ARCHIVE -Force
-          Get-Item $env:MIKO_ARCHIVE | ForEach-Object { Write-Host ($_.Name + " " + $_.Length + " bytes") }
-
       # ---- prove the package is self-contained -----------------------------
       # Unpack it somewhere else and compile a program with nothing but what is
       # inside, from the package root. This is the check that would have caught
       # shipping a binary whose runtime/ was left behind.
-
-      - name: Smoke test the package (Unix)
-        if: runner.os != 'Windows'
+      - name: Smoke test the package
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
@@ -374,24 +254,6 @@ jobs:
           ./miko smoke.miko smoke
           ./smoke
 
-      - name: Smoke test the package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          MIKO_ARCHIVE: ${{ matrix.archive }}
-        run: |
-          $work = Join-Path $env:RUNNER_TEMP "pkgtest"
-          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
-          Expand-Archive -Path $env:MIKO_ARCHIVE -DestinationPath $work
-          Push-Location (Join-Path $work "miko")
-          try {
-            'fn main() {' + "`n" + '    print("package ok");' + "`n" + '}' | Out-File -Encoding ascii smoke.miko
-            & .\miko.exe smoke.miko smoke
-            if ($LASTEXITCODE -ne 0) { throw "package could not compile a program" }
-            & .\smoke.exe
-            if ($LASTEXITCODE -ne 0) { throw "package produced a binary that failed" }
-          } finally { Pop-Location }
-
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -399,18 +261,262 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ---------------------------------------------------------------------------
+  # Windows, built on Linux. No MSVC, no Windows runner, no Windows SDK.
+  # ---------------------------------------------------------------------------
+  cross-windows:
+    name: windows, cross-compiled
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 llvm-18-dev clang-18 libclang-18-dev gcc \
+            libtinfo-dev zlib1g-dev libzstd-dev
+          echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+
+      # Only stage 0 needs LLVM, and it is built here for this runner. From stage 1
+      # onwards everything is IR text, which is what makes the cross build possible.
+      - name: Build stage 0 and stage 1
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DMIKO_ENABLE_LLVM=ON -DLLVM_DIR="$LLVM_DIR"
+          cmake --build build --target miko
+          chmod +x dist/miko-link.sh
+          printf './dist/miko-link.sh\n' > miko.toolchain
+          mkdir -p stage1
+          ./build/miko compiler/main_ll.miko --compile --emit-ir -o stage1/miko.ll
+          ./dist/miko-link.sh stage1/miko.ll stage1/miko
+          ./stage1/miko --version
+
+      # The self-hosted compiler compiling itself is the IR that becomes every
+      # Windows binary below. Emitting it with the self-hosted compiler rather than
+      # with stage 0 is the point: stage 0 writes a target triple into the module,
+      # this emits none, so the same text is valid for x64 and for arm64.
+      - name: Emit the compiler's own IR
+        run: |
+          set -euo pipefail
+          ./stage1/miko --self out/compiler
+          ls -l out/compiler.ll
+          if grep -qE '^target (triple|datalayout)' out/compiler.ll; then
+            echo "the IR carries a target: the cross build is no longer portable" >&2
+            exit 1
+          fi
+          echo "IR is target-neutral, $(wc -c < out/compiler.ll) bytes"
+
+      - name: Install llvm-mingw
+        run: |
+          set -euo pipefail
+          # A clang plus the MinGW-w64 C runtime and headers for both Windows
+          # architectures, packaged for a Linux host. Nothing here needs Windows.
+          base="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}"
+          name="llvm-mingw-${LLVM_MINGW_TAG}-ucrt-ubuntu-22.04-x86_64"
+          curl -fsSL "$base/$name.tar.xz" -o mingw.tar.xz
+          mkdir -p /opt/llvm-mingw
+          tar -xf mingw.tar.xz --strip-components=1 -C /opt/llvm-mingw
+          rm -f mingw.tar.xz
+          /opt/llvm-mingw/bin/clang --version
+          /opt/llvm-mingw/bin/clang --target=x86_64-w64-mingw32 --print-target-triple
+          /opt/llvm-mingw/bin/clang --target=aarch64-w64-mingw32 --print-target-triple
+          echo "/opt/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      # ---- the two packages -------------------------------------------------
+      - name: Cross-link and package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          clang=/opt/llvm-mingw/bin/clang
+          for pair in "x86_64-w64-mingw32 windows-x64" "aarch64-w64-mingw32 windows-arm64"; do
+            set -- $pair
+            triple="$1"; target="$2"
+            echo "=== $target ($triple) ==="
+            mkdir -p "stage-$target/miko/runtime" "stage-$target/miko/stdlib" "stage-$target/miko/compiler"
+            root="stage-$target/miko"
+            # -static so the archive does not need the MinGW runtime DLLs on the
+            # user's machine. -Wno-override-module is a guard, not a workaround: the
+            # IR has no triple, and if that ever changes this flag keeps the link
+            # honest instead of silently compiling for the host.
+            "$clang" --target="$triple" -O2 -Wno-override-module \
+              out/compiler.ll runtime/miko_runtime.c \
+              -o "$root/miko.exe" -static -fuse-ld=lld
+            "$clang" --target="$triple" -print-file-name=libc++.a > /dev/null
+            cp dist/miko-link.bat "$root/miko-link.bat"
+            printf 'miko-link.bat\n' > "$root/miko.toolchain"
+            cp runtime/miko_runtime.c "$root/runtime/"
+            cp -r stdlib/core "$root/stdlib/"
+            cp compiler/*.miko "$root/compiler/"
+            cp README.md BUILD.md TUTORIAL.md BOOTSTRAP.md ROADMAP.md "$root/"
+            cp -r tests "$root/"
+            ( cd "stage-$target" && zip -qr "../miko-$VERSION-$target.zip" miko )
+            ls -l "miko-$VERSION-$target.zip"
+          done
+
+      # ---- programs to run on Windows --------------------------------------
+      # These are the differential suite, cross-linked. They cannot be run here, so
+      # they travel with their expected output to a Windows runner: that is what
+      # turns "the cross build compiled" into "the cross build runs".
+      - name: Cross-link the differential suite
+        run: |
+          set -euo pipefail
+          clang=/opt/llvm-mingw/bin/clang
+          for pair in "x86_64-w64-mingw32 windows-x64" "aarch64-w64-mingw32 windows-arm64"; do
+            set -- $pair
+            triple="$1"; target="$2"
+            mkdir -p "verify-$target"
+            count=0
+            for src in tests/diff/*.miko; do
+              case "$src" in *_error.miko) continue ;; esac
+              expected="${src%.miko}.expected"
+              [ -f "$expected" ] || continue
+              name="$(basename "${src%.miko}")"
+              # IR from the Linux self-hosted compiler: no triple, so it is as valid
+              # for this target as for the host it was produced on.
+              ./stage1/miko --emit-ir "$src" "verify-$target/$name" > /dev/null 2>&1 || {
+                echo "IR emission failed for $src" >&2; exit 1; }
+              "$clang" --target="$triple" -O2 -Wno-override-module \
+                "verify-$target/$name.ll" runtime/miko_runtime.c \
+                -o "verify-$target/$name.exe" -static -fuse-ld=lld
+              cp "$expected" "verify-$target/$name.expected"
+              rm -f "verify-$target/$name.ll"
+              count=$((count + 1))
+            done
+            echo "$target: $count cases cross-linked"
+            [ "$count" -gt 0 ] || { echo "no cases were cross-linked" >&2; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: miko-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          path: miko-*-windows-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verify-windows-x64
+          path: verify-windows-x64/
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verify-windows-arm64
+          path: verify-windows-arm64/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Windows, verified on Windows. Runs the cross-built binaries on the architecture
+  # they were built for; nothing is compiled here.
+  # ---------------------------------------------------------------------------
+  verify-windows:
+    name: verify ${{ matrix.target }}
+    needs: [version, cross-windows]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+          - os: windows-11-arm
+            target: windows-arm64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: pkg
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: verify-${{ matrix.target }}
+          path: tests
+
+      - name: Unpack and run the compiler
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem pkg -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "no package artifact" }
+          Expand-Archive -Path $zip.FullName -DestinationPath work
+          Write-Host "processor: $env:PROCESSOR_ARCHITECTURE"
+          $miko = "work\miko\miko.exe"
+          if (-not (Test-Path $miko)) { throw "miko.exe missing from the package" }
+          & $miko --version
+          if ($LASTEXITCODE -ne 0) { throw "the cross-built compiler will not run here" }
+
+      # --self writes IR and links nothing, so it exercises the compiler on sources
+      # it has to read, parse, typecheck and lower - without needing a linker here.
+      - name: Compile the compiler on Windows
+        shell: pwsh
+        run: |
+          Push-Location work\miko
+          try {
+            New-Item -ItemType Directory -Force -Path out | Out-Null
+            & .\miko.exe --self out\self
+            if ($LASTEXITCODE -ne 0) { throw "--self failed on Windows" }
+            $size = (Get-Item out\self.ll).Length
+            Write-Host "self IR: $size bytes"
+            if ($size -lt 1000000) { throw "the IR is too small to be the whole compiler" }
+          } finally { Pop-Location }
+
+      # The behavioural check: programs cross-linked from IR on Linux, executed here.
+      - name: Run the cross-linked differential suite
+        shell: pwsh
+        run: |
+          $fail = 0
+          $pass = 0
+          foreach ($exe in (Get-ChildItem tests -Filter *.exe | Sort-Object Name)) {
+            $expected = $exe.FullName -replace '\.exe$', '.expected'
+            if (-not (Test-Path $expected)) { continue }
+            $actual = & $exe.FullName 2>&1 | Out-String
+            $want = Get-Content $expected -Raw
+            if ($actual.Trim() -eq $want.Trim()) { $pass++ }
+            else {
+              $fail++
+              Write-Host "FAIL $($exe.Name)"
+              Write-Host "  want: $($want.Trim())"
+              Write-Host "  got:  $($actual.Trim())"
+            }
+          }
+          Write-Host "$pass passed, $fail failed"
+          if ($fail -ne 0) { throw "$fail cross-linked case(s) disagreed" }
+          if ($pass -eq 0) { throw "no cases ran" }
+
+  # ---------------------------------------------------------------------------
+  # Publish: the tag and the release, only after every platform above succeeded.
+  # ---------------------------------------------------------------------------
   publish:
     name: tag and release
-    needs: [version, build]
+    needs: [version, build, cross-windows, verify-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true
 
-      - name: List what is being published
-        run: ls -l artifacts
+      # Verification artifacts are inputs, not products: only archives are published.
+      - name: Collect the archives
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} release/ \;
+          ls -l release
+          count=$(find release -type f | wc -l)
+          echo "publishing $count archives"
+          [ "$count" -ge 6 ] || { echo "expected six archives, got $count" >&2; exit 1; }
 
       # The tag is created here rather than by a separate step so that a tag never
       # exists without a release behind it.
@@ -419,14 +525,20 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: miko ${{ needs.version.outputs.version }} (build ${{ github.run_number }})
           target_commitish: ${{ github.sha }}
-          files: artifacts/*
+          files: release/*
           generate_release_notes: true
           body: |
             miko ${{ needs.version.outputs.version }}, built from ${{ github.sha }}.
 
-            Each archive contains the self-hosted compiler plus everything it needs
-            at run time: the link script, `runtime/miko_runtime.c`, the standard
-            library and the compiler's own sources (used by `--self`).
+            Six archives: Linux x64 and arm64, macOS x64 and arm64, Windows x64 and
+            arm64. Each contains the self-hosted compiler plus everything it needs at
+            run time: the link script, `runtime/miko_runtime.c`, the standard library
+            and the compiler's own sources, which `--self` reads.
+
+            The Windows builds are cross-compiled with llvm-mingw on Linux and are
+            statically linked, so they need no Visual Studio and no runtime DLLs. The
+            macOS arm64 build carries its own C++ runtime for the same reason: it is
+            linked against LLVM 22, and Apple's libc++ is not the same vintage.
 
             Unpack an archive and work from the directory it creates:
 
