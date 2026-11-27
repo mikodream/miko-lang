@@ -476,19 +476,30 @@ jobs:
       - name: Run the cross-linked differential suite
         shell: pwsh
         run: |
+          # Line endings are normalised before comparing. The .expected files are
+          # stored with LF, while a Windows process writing through PowerShell gives
+          # CRLF, so comparing raw strings reported sixteen correct programs as
+          # failures on the first run of this job. Trailing blank lines are dropped
+          # for the same reason: they are an artefact of capture, not of the program.
+          function Normalize([string]$text) {
+            if ($null -eq $text) { return "" }
+            $t = $text -replace "`r`n", "`n"
+            $t = $t -replace "`r", "`n"
+            return $t.Trim()
+          }
           $fail = 0
           $pass = 0
           foreach ($exe in (Get-ChildItem tests -Filter *.exe | Sort-Object Name)) {
             $expected = $exe.FullName -replace '\.exe$', '.expected'
             if (-not (Test-Path $expected)) { continue }
-            $actual = & $exe.FullName 2>&1 | Out-String
-            $want = Get-Content $expected -Raw
-            if ($actual.Trim() -eq $want.Trim()) { $pass++ }
+            $actual = Normalize (& $exe.FullName 2>&1 | Out-String)
+            $want = Normalize (Get-Content $expected -Raw)
+            if ($actual -eq $want) { $pass++ }
             else {
               $fail++
               Write-Host "FAIL $($exe.Name)"
-              Write-Host "  want: $($want.Trim())"
-              Write-Host "  got:  $($actual.Trim())"
+              Write-Host "  want: $want"
+              Write-Host "  got:  $actual"
             }
           }
           Write-Host "$pass passed, $fail failed"
