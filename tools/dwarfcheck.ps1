@@ -98,55 +98,85 @@ if ((Test-Path $ll)) {
         }
     }
 }
-if ($IROnly) {
-    $script:dwarfSkipped = "exe assertions skipped on request (-IROnly): the compiler's output is the IR"
-} elseif ($DwarfDump -eq "" -or -not (Test-Path $DwarfDump)) {
-    $script:dwarfSkipped = "exe assertions skipped: no llvm-dwarfdump available to read the debug info"
-} elseif ((Test-Path $exe)) {
-    # One tool decides this. llvm-dwarfdump reads ELF, COFF and Mach-O alike and
-    # names the file in each, so there is no section-naming or objdump-flag to get
-    # wrong per platform: earlier versions of this script asked llvm-objdump -h and
-    # got "none" on macOS for debug info that was present, twice, for two different
-    # reasons (the __debug_ prefix, then the output format).
-    $dump = & $DwarfDump --debug-line $exe 2>&1 | Out-String
-    $info = & $DwarfDump --debug-info $exe 2>&1 | Out-String
-    $named = ($dump -match "linecheck\.miko") -or ($info -match "linecheck\.miko")
+# Where debug info has to survive depends on what the platform's linker does with
+# it, and that was measured rather than assumed:
+#
+#   ELF (Linux)                 .debug_* sections survive into the executable
+#   COFF linked by llvm-mingw   survive
+#   COFF linked by the MSVC one do not, and neither does CodeView
+#   Mach-O (macOS)              __debug_* reaches the object, ld64 drops it from the
+#                               linked image - the object carries "linecheck.miko",
+#                               the executable does not, with or without -g
+#
+# So the assertion follows the artifact that can hold it: the IR always, the object
+# on Mach-O, the executable everywhere else. Checking something the platform throws
+# away would fail for a reason that says nothing about the compiler.
 
-    if (-not $named) {
-        # Say what the debug info does contain. "does not name linecheck.miko" is
-        # true of a binary with no debug info at all and of one whose compile unit
-        # is present under another name, and those need different fixes.
-        $cunames = @()
-        foreach ($m in [regex]::Matches($info, '(?m)^\s*DW_AT_name\s+\("([^"]*)"\)')) {
-            if ($cunames -notcontains $m.Groups[1].Value) { $cunames += $m.Groups[1].Value }
-        }
-        if ($cunames.Count -gt 0) {
-            Write-Host ("dwarf-check: names in the debug info: " + (($cunames | Select-Object -First 6) -join ", "))
-        } else {
-            Write-Host "dwarf-check: the debug info holds no names at all"
-        }
-        Write-Host ("dwarf-check: dwarfdump reported " + $info.Length + " bytes of --debug-info for " + (Split-Path $exe -Leaf))
-        $failures.Add("the executable's debug info does not name linecheck.miko")
+function Test-DebugNames {
+    param([string]$Path)
+    $info = & $DwarfDump --debug-info $Path 2>&1 | Out-String
+    $line = & $DwarfDump --debug-line $Path 2>&1 | Out-String
+    return @{ Named = (($info -match "linecheck\.miko") -or ($line -match "linecheck\.miko")); Info = $info; Line = $line }
+}
+
+if ($IROnly) {
+    $script:dwarfSkipped = "artifact assertions skipped on request (-IROnly): the compiler's output is the IR"
+} elseif ($DwarfDump -eq "" -or -not (Test-Path $DwarfDump)) {
+    $script:dwarfSkipped = "artifact assertions skipped: no llvm-dwarfdump available to read the debug info"
+} else {
+    $target = $exe
+    $what = "the executable"
+    if ($IsMacOS) {
+        # Compile the same IR to an object with the same driver the link step uses.
+        $obj = "$prefix.o"
+        $cc = $env:MIKO_CC
+        if ([string]::IsNullOrEmpty($cc)) { $cc = "clang" }
+        & $cc -c -O2 -g -w -Wno-override-module "$ll" -o $obj 2>&1 | Out-Null
+        if (Test-Path $obj) { $target = $obj; $what = "the object file (ld64 drops DWARF from the linked image)" }
+    }
+
+    if (-not (Test-Path $target)) {
+        $failures.Add("nothing to read debug info from: $target is missing")
     } else {
-        # The file name is the decisive part: a binary carrying only the runtime's
-        # debug info has "linecheck.miko" nowhere in it, so this cannot pass for the
-        # wrong reason.
-        #
-        # The line count is softer on purpose. -O2 folds the assignments away and
-        # their locations with them, and how much it folds differs by target, so
-        # asking for a particular line or for many of them would fail for reasons
-        # that have nothing to do with the compiler. Two distinct lines means the
-        # table maps code, not just a file name.
-        $seen = @{}
-        foreach ($m in [regex]::Matches($dump, "(?m)^\s*0x[0-9a-fA-F]+\s+(\d+)\s")) {
-            $n = [int]$m.Groups[1].Value
-            if ($n -gt 0) { $seen[$n] = $true }
-        }
-        if ($seen.Count -lt 2) {
-            $failures.Add("line table maps code to $($seen.Count) source line(s); expected at least 2")
+        $r = Test-DebugNames -Path $target
+        if (-not $r.Named) {
+            # Say what the debug info does contain. "does not name linecheck.miko" is
+            # true of a binary with no debug info at all and of one whose compile unit
+            # is present under another name, and those need different fixes.
+            $cunames = @()
+            foreach ($m in [regex]::Matches($r.Info, '(?m)^\s*DW_AT_name\s+\("([^"]*)"\)')) {
+                if ($cunames -notcontains $m.Groups[1].Value) { $cunames += $m.Groups[1].Value }
+            }
+            if ($cunames.Count -gt 0) {
+                Write-Host ("dwarf-check: names in the debug info: " + (($cunames | Select-Object -First 6) -join ", "))
+            } else {
+                Write-Host "dwarf-check: the debug info holds no names at all"
+            }
+            Write-Host ("dwarf-check: dwarfdump reported " + $r.Info.Length + " bytes of --debug-info for " + (Split-Path $target -Leaf))
+            $failures.Add("the debug info in $what does not name linecheck.miko")
+        } else {
+            # The file name is the decisive part: an artifact carrying only the
+            # runtime's debug info has "linecheck.miko" nowhere in it.
+            #
+            # The line count is softer on purpose. -O2 folds assignments away and
+            # their locations with them, and how much it folds differs by target, so
+            # asking for a particular line or for many of them would fail for reasons
+            # that have nothing to do with the compiler. Two distinct lines means the
+            # table maps code, not just a file name.
+            $seen = @{}
+            foreach ($m in [regex]::Matches($r.Line, "(?m)^\s*0x[0-9a-fA-F]+\s+(\d+)\s")) {
+                $n = [int]$m.Groups[1].Value
+                if ($n -gt 0) { $seen[$n] = $true }
+            }
+            if ($seen.Count -lt 2) {
+                $failures.Add("line table maps code to $($seen.Count) source line(s); expected at least 2")
+            } else {
+                $script:dwarfWhere = $what
+            }
         }
     }
 }
+
 if ($failures.Count -gt 0) {
     Write-Host "dwarf-check: FAILED"
     foreach ($f in $failures) { Write-Host ("  - " + $f) }
@@ -157,6 +187,6 @@ if ($script:dwarfSkipped) {
     Write-Host "dwarf-check: IR carries compile unit, subprograms and locations"
     Write-Host ("dwarf-check: " + $script:dwarfSkipped)
 } else {
-    Write-Host "dwarf-check: compile unit, subprograms and line mappings all present in the executable"
+    Write-Host ("dwarf-check: compile unit, subprograms and line mappings present in " + $script:dwarfWhere)
 }
 exit 0
