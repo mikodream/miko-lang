@@ -16,6 +16,12 @@
 #                         50M-iteration loop).
 #   -lm                   sqrt/floor/ceil/round come from the C math library,
 #                         which clang does not link by default on glibc systems.
+#   -g                    keeps debug information. The IR carries DWARF metadata on
+#                         its own and some clang builds turn that into .debug_*
+#                         sections regardless, but Apple's clang does not, which is
+#                         why the macOS release jobs produced executables with no
+#                         debug info while Linux did not. Costs about 10% binary
+#                         size (261632 to 289280 bytes on a small sample program).
 set -e
 
 if [ "$#" -lt 2 ]; then
@@ -44,4 +50,4 @@ fi
 
 : "${CC:=clang}"
 
-"$CC" "$MIKO_OPT" -w -Wno-override-module "$ir" "$runtime" -o "$out" -lm
+"$CC" "$MIKO_OPT" -g -w -Wno-override-module "$ir" "$runtime" -o "$out" -lm

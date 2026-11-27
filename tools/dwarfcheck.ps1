@@ -113,6 +113,19 @@ if ($IROnly) {
     $named = ($dump -match "linecheck\.miko") -or ($info -match "linecheck\.miko")
 
     if (-not $named) {
+        # Say what the debug info does contain. "does not name linecheck.miko" is
+        # true of a binary with no debug info at all and of one whose compile unit
+        # is present under another name, and those need different fixes.
+        $cunames = @()
+        foreach ($m in [regex]::Matches($info, '(?m)^\s*DW_AT_name\s+\("([^"]*)"\)')) {
+            if ($cunames -notcontains $m.Groups[1].Value) { $cunames += $m.Groups[1].Value }
+        }
+        if ($cunames.Count -gt 0) {
+            Write-Host ("dwarf-check: names in the debug info: " + (($cunames | Select-Object -First 6) -join ", "))
+        } else {
+            Write-Host "dwarf-check: the debug info holds no names at all"
+        }
+        Write-Host ("dwarf-check: dwarfdump reported " + $info.Length + " bytes of --debug-info for " + (Split-Path $exe -Leaf))
         $failures.Add("the executable's debug info does not name linecheck.miko")
     } else {
         # The file name is the decisive part: a binary carrying only the runtime's
