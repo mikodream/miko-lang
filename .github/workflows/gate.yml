@@ -151,6 +151,15 @@ jobs:
           pwsh -NoProfile -File tools\bootstrap.ps1 -RepoRoot . -Generations 2
           if ($LASTEXITCODE -ne 0) { throw "bootstrap failed: generations diverged" }
 
+      - name: Debug information reaches the executable
+        shell: pwsh
+        run: |
+          # Debug info is easy to lose without noticing: difftest compares stdout,
+          # so a program that runs correctly but carries no DWARF passes everything
+          # above. This asserts the line table actually names the source file.
+          pwsh -NoProfile -File tools\dwarfcheck.ps1 -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "dwarf check failed" }
+
       - name: Keep the artefacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

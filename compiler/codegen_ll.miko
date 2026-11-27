@@ -146,6 +146,18 @@ fn line_at(tree: string, index: i64): string {
     return ast.strip_pos(trim_indent(substring(tree, index, line_end - index)));
 }
 
+// The line with its ` @line` suffix still attached. The DWARF pass needs the
+// position, and every other reader wants it gone, so this is a separate helper
+// rather than a change to line_at.
+fn line_at_raw(tree: string, index: i64): string {
+    let n = len(tree);
+    if index >= n {
+        return "";
+    }
+    let line_end = find_char(tree, index, '\n');
+    return trim_indent(substring(tree, index, line_end - index));
+}
+
 // Byte offset of the next line, or len(tree) at the end.
 fn next_line_index(tree: string, index: i64): i64 {
     let n = len(tree);
@@ -3263,7 +3275,236 @@ fn st_open_function(state: GenState, name: string, ret_ty: string, params: strin
     return s;
 }
 
-pub fn generate_ir(tree_input: string): string {
+// ---- DWARF debug information -----------------------------------------------
+//
+// The compiler emits IR text and hands linking to clang, so debug info has to
+// travel inside the .ll: clang turns !dbg metadata into .debug_* sections on its
+// own, with no -g flag. Verified before writing any of this - a hand-written .ll
+// carrying a DICompileUnit and DILocations produced .debug_line, .debug_info and
+// .debug_abbrev in the executable, and llvm-dwarfdump mapped main's address back
+// to a source line. That is the whole mechanism, so what remains here is producing
+// the metadata.
+//
+// What gets described:
+//
+//   !0  DICompileUnit    the source file, language, emission kind
+//   !1  DIFile           filename + directory
+//   !2  DIBasicType      int
+//   !3  DISubroutineType
+//   4+  DISubprogram     one per function
+//       DILocation       one per marked instruction
+//
+// A location names its subprogram as the scope, so ids are assigned while walking
+// the finished IR. That is why this is a pass over the text rather than something
+// the emitter does: the emitter would have to thread a line number through every
+// one of its write sites, while the text pass needs only the markers the statement
+// loop already leaves behind.
+
+fn dwarf_escape(text: string): string {
+    // DWARF strings are inside IR metadata strings, so one backslash has to be
+    // written as two for the IR parser to see one. Windows paths are full of them.
+    let n = len(text);
+    let out = "";
+    let i: i64 = 0;
+    while i < n {
+        let ch = char_at(text, i);
+        if ch == '\\' {
+            out = out + "\\\\";
+        } else {
+            // substring(text, i, 1) is the character as a one-character string.
+            // to_string_char would be the direct route, but it misbehaves here: a
+            // length read back as 0 and then an allocation of a garbage size, on a
+            // call that is correct in a small program. Slicing the input instead
+            // stays on the path the rest of this backend already relies on.
+            out = out + substring(text, i, 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Last path separator, or -1 when the path has none.
+//
+// find_char_rev starts at the index it is given and reads it, so the last
+// character is len - 1; passing len read one past the end and panicked on a bare
+// filename with no separator at all.
+fn dwarf_last_sep(path: string): i64 {
+    let n = len(path);
+    if n == 0 {
+        return 0 - 1;
+    }
+    let slash = find_char_rev(path, n - 1, '/');
+    let backslash = find_char_rev(path, n - 1, '\\');
+    let at = slash;
+    if backslash > at {
+        at = backslash;
+    }
+    return at;
+}
+
+fn dwarf_dir_of(path: string): string {
+    let at = dwarf_last_sep(path);
+    if at < 0 {
+        return "";
+    }
+    return dwarf_escape(substring(path, 0, at));
+}
+
+fn dwarf_name_of(path: string): string {
+    let at = dwarf_last_sep(path);
+    if at < 0 {
+        return dwarf_escape(path);
+    }
+    return dwarf_escape(substring(path, at + 1, len(path) - at - 1));
+}
+
+// Labels, comments, declarations and the function header cannot carry !dbg. alloca
+// is skipped because the emitter moves those lines into the prologue after the
+// fact, so attaching a statement's line to one would misreport the prologue.
+fn dwarf_takes_dbg(text: string): bool {
+    let body = trim_spaces(text);
+    if len(body) == 0 {
+        return false;
+    }
+    if starts_with_at(body, 0, ";") {
+        return false;
+    }
+    // A label is `name:` and carries no !dbg. The emitter's own labels are things
+    // like `while.cond.0:`, which do not start with @, so testing for the trailing
+    // colon is the only reliable way: missing this produced
+    // `while.cond.0:, !dbg !7`, which clang rejected and which then linked into a
+    // binary that printed garbage.
+    let last = len(body) - 1;
+    if last >= 0 && char_at(body, last) == ':' {
+        return false;
+    }
+    if starts_with_at(body, 0, "declare ") || starts_with_at(body, 0, "define ") {
+        return false;
+    }
+    if starts_with_at(body, 0, "@") {
+        return false;
+    }
+    if starts_with_at(body, 0, "alloca ") || starts_with_at(body, 0, "phi ") {
+        return false;
+    }
+    return true;
+}
+
+// Rewrites `ir` so that every instruction reachable from a source marker carries a
+// !dbg pointing at a DILocation for that line, and appends the metadata tail.
+// Returns `ir` untouched when it holds no function definition, so a caller that
+// has nothing to describe gets byte-identical output.
+pub fn dwarf_finish(ir: string, source_path: string): string {
+    let n = len(ir);
+    let dir = dwarf_dir_of(source_path);
+    let name = dwarf_name_of(source_path);
+
+    let body_text = "";
+    let subprograms = "";
+    let locations = "";
+    let next_meta: i64 = 4;
+    let current_scope: i64 = 0;
+    let pending_line: i64 = 0;
+    let body_open = false;
+    let any_function = false;
+
+    let i: i64 = 0;
+    while i < n {
+        let line_end = find_char(ir, i, '\n');
+
+        let line = substring(ir, i, line_end - i);
+        let body = trim_spaces(line);
+
+
+        if starts_with_at(body, 0, "define ") {
+            let at = find_char(body, 0, '@');
+            let after = at + 1;
+            let name_end = after;
+            while name_end < len(body) && char_at(body, name_end) != '(' {
+                name_end = name_end + 1;
+            }
+            let fname = substring(body, after, name_end - after);
+            current_scope = next_meta;
+            next_meta = next_meta + 1;
+            // The definition line is not known until the first marker in the body
+            // says so, and stating 1 keeps scopeLine a valid non-zero line rather
+            // than inventing one from the IR.
+            subprograms = subprograms + "!" + number_to_text(current_scope)
+                + " = distinct !DISubprogram(name: \"" + dwarf_escape(fname)
+                + "\", scope: !1, file: !1, line: 1, type: !3, scopeLine: 1"
+                + ", spFlags: DISPFlagDefinition, unit: !0)\n";
+            body_open = true;
+            any_function = true;
+            // The definition line itself has to name the subprogram. Clang drops
+            // metadata nothing references, so without this the DISubprogram is
+            // unreferenced, and the whole compile unit with it: the executable got
+            // .debug_* sections from the C runtime and nothing from miko.
+            // !dbg on a definition goes before the opening brace, not after: the
+            // attribute list ends before the body starts.
+            let brace = find_char_rev(line, len(line) - 1, '{');
+            let head = substring(line, 0, brace);
+            let tail_part = substring(line, brace, len(line) - brace);
+            body_text = body_text + head + " !dbg !" + number_to_text(current_scope) + " " + tail_part + "\n";
+            i = line_end + 1;
+            continue;
+        }
+
+        if starts_with_at(body, 0, ";@miko ") {
+            // A marker names the source line the instructions that follow came from.
+            // It is a comment so the IR stays valid, and it is dropped here.
+            pending_line = text_to_number(substring(body, 7, len(body) - 7));
+            i = line_end + 1;
+            continue;
+        }
+
+        if body_open && body == "}" {
+            body_open = false;
+            pending_line = 0;
+        }
+
+        if body_open && pending_line > 0 && dwarf_takes_dbg(body) {
+            // A location per instruction rather than one shared per line: sharing
+            // would need a dedup table, and duplicate DILocations are legal, only
+            // slightly larger.
+            let id = next_meta;
+            next_meta = next_meta + 1;
+            locations = locations + "!" + number_to_text(id)
+                + " = !DILocation(line: " + number_to_text(pending_line)
+                + ", column: 0, scope: !" + number_to_text(current_scope) + ")\n";
+            body_text = body_text + line + ", !dbg !" + number_to_text(id) + "\n";
+            i = line_end + 1;
+            continue;
+        }
+
+        body_text = body_text + line + "\n";
+        i = line_end + 1;
+    }
+
+
+    if !any_function {
+        return ir;
+    }
+
+    let dwarf_version = next_meta;
+    let debug_version = next_meta + 1;
+    let ident = next_meta + 2;
+    let out = body_text + "\n";
+    let out2 = out + "!llvm.dbg.cu = !{!0}\n";
+    let out3 = out2 + "!llvm.module.flags = !{!" + number_to_text(dwarf_version)
+        + ", !" + number_to_text(debug_version) + "}\n";
+    let out4 = out3 + "!llvm.ident = !{!" + number_to_text(ident) + "}\n\n";
+    let out5 = out4 + "!0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1, producer: \"miko\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)\n";
+    let out6 = out5 + "!1 = !DIFile(filename: \"" + name + "\", directory: \"" + dir + "\")\n";
+    let out7 = out6 + "!2 = !DIBasicType(name: \"int\", size: 32, encoding: DW_ATE_signed)\n";
+    let out8 = out7 + "!3 = !DISubroutineType(types: !{!2})\n";
+    let out9 = out8 + subprograms + locations;
+    let out10 = out9 + "!" + number_to_text(dwarf_version) + " = !{i32 2, !\"Dwarf Version\", i32 5}\n";
+    let out11 = out10 + "!" + number_to_text(debug_version) + " = !{i32 2, !\"Debug Info Version\", i32 3}\n";
+    let out12 = out11 + "!" + number_to_text(ident) + " = !{!\"miko\"}\n";
+    return out12;
+}
+
+pub fn generate_ir(tree_input: string, source_path: string): string {
     let enums = collect_enums(tree_input);
     let tree = rewrite_enum_types(tree_input, enums);
     let structs_table = collect_structs(tree);
@@ -3294,7 +3535,25 @@ pub fn generate_ir(tree_input: string): string {
     let i: i64 = 0;
     let n = len(tree);
     while i < n {
+        let raw_line = line_at_raw(tree, i);
         let line = line_at(tree, i);
+
+        // header_open is already true exactly while a function body is open, which
+        // is the only place a marker means anything.
+        if header_open {
+            // A marker records which source line the instructions that follow came
+            // from. It is written as a comment so the IR stays valid, and the
+            // DWARF pass replaces it with `!dbg` metadata before the file is
+            // written. Positioning markers here, at the top of the statement loop,
+            // is what makes every statement covered without threading a line
+            // number through the hundreds of emit sites below.
+            let src = ast.line_pos(raw_line);
+            if src > 0 {
+                // st_emit, not st_emit_raw: raw lines end CRLF, which left a stray
+                // \r in the marker text and made text_to_number read "3\r" as 30.
+                state = st_emit(state, ";@miko " + number_to_text(src));
+            }
+        }
 
         if starts_with_at(line, 0, "Module ") {
             state = GenState {
@@ -3732,5 +3991,9 @@ pub fn generate_ir(tree_input: string): string {
         final_state = st_close_function(final_state, cur_rt);
     }
 
-    return final_state.globals + "\n" + final_state.out;
+    // Debug info is added last, as a pass over the finished text, because a
+    // DILocation needs its subprogram as scope and subprogram ids are only settled
+    // once every function is known.
+    let assembled = final_state.globals + "\n" + final_state.out;
+    return dwarf_finish(assembled, source_path);
 }

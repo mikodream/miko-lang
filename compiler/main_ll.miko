@@ -2353,7 +2353,7 @@ fn compile_file(source_path: string, output_prefix: string, want_exe: bool): i32
         return 1;
     }
     let imported = imp_gather(tree, "");
-    let ir = codegen_ll.generate_ir(imported + "Module " + "program" + "\n" + tree);
+    let ir = codegen_ll.generate_ir(imported + "Module " + "program" + "\n" + tree, source_path);
     write_file(output_prefix + ".ll", ir);
     if want_exe {
         let status = link_executable(output_prefix);
@@ -2377,7 +2377,12 @@ fn compile_self_to(prefix: string) {
     write_file(prefix + ".ast", tree);
     let checked = sema.check_program(tree);
     write_file(prefix + ".sema", checked);
-    let ir = codegen_ll.generate_ir(tree);
+    // "miko-self", not prefix + ".miko": the self-hosted build concatenates several
+    // modules, so no single file holds this code, and naming the output prefix made
+    // the debug info depend on where the caller writes its output - which broke the
+    // bootstrap fixed point, since gen1.miko and gen2.miko then differed by that one
+    // string and nothing else.
+    let ir = codegen_ll.generate_ir(tree, "miko-self");
     write_file(prefix + ".ll", ir);
     print("success");
 }
