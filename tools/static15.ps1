@@ -45,12 +45,23 @@ $bad = @()
 foreach ($name in $cases.Keys) {
     $src = Join-Path $work "$name.miko"
     Set-Content -Path $src -Value $cases[$name] -Encoding ascii
-    $out = & $compiler $src (Join-Path $work $name) 2>&1 | Out-String
-    $hasError = $out -match "error:"
-    # file:line:col - a colon, digits, colon, digits at the end of the --> line
-    $hasPos = $out -match " --> .*:\d+:\d+"
-    $hasCaret = $out -match "(?m)^\s*\d+\s+\|.*\r?\n\s*\|?\s*\^"
+    # stdout and stderr are captured separately, and only stderr is inspected. The
+    # compiler prints "failed" on stdout and the diagnostic on stderr, so merging the
+    # two streams lets "failed" land between the source line and its caret line, and
+    # a check that looks for those two lines adjacent then reports a missing caret
+    # for a diagnostic that has one. That is how this failed in CI for two cases
+    # whose output was correct.
+    $so = Join-Path $work "$name.out"
+    $se = Join-Path $work "$name.err"
+    $proc = Start-Process -FilePath $compiler -ArgumentList @($src, (Join-Path $work $name)) -PassThru -NoNewWindow -RedirectStandardOutput $so -RedirectStandardError $se
+    $proc.WaitForExit()
+    $out = ((Get-Content $se -Raw -ErrorAction SilentlyContinue) + "")
     $status = "MISSING"
+    $hasError = $out -match "error:"
+    # file:line:col - the ' --> ' line ends in :digits:digits
+    $hasPos = $out -match " --> .*:\d+:\d+"
+    # A gutter line '  |' followed by a caret somewhere after it.
+    $hasCaret = $out -match "(?m)^\s*\|?\s*\^|\|\s+\^"
     if ($hasError -and $hasPos -and $hasCaret) { $status = "ok"; $ok++ }
     elseif ($hasError -and $hasPos) { $status = "no-caret" }
     elseif ($hasError) { $status = "no-position" }
