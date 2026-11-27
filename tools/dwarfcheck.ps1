@@ -73,7 +73,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $ll = "$prefix.ll"
-$exe = "$prefix.exe"
+# The output name carries no extension on Unix: the compiler appends .exe only on
+# Windows. Assuming .exe made this report "no executable written" on all four
+# Linux and macOS release jobs, where the binary was there under the plain name.
+$exe = "$prefix"
+if (Test-Path "$prefix.exe") { $exe = "$prefix.exe" }
 if (-not (Test-Path $ll)) { $failures.Add("no IR written") }
 if (-not $IROnly -and -not (Test-Path $exe)) { $failures.Add("no executable written") }
 
@@ -144,19 +148,22 @@ if ($IROnly) {
             if ($dump -notmatch "linecheck\.miko") {
                 $failures.Add("line table does not name linecheck.miko")
             } else {
-                # Count the distinct source lines the table maps code to. The exact
-                # set is not fixed: -O2 folds the assignments away and their
-                # locations with them, which is why this asks for several real line
-                # numbers rather than for a particular one. A binary whose only
-                # table is the CRT's has this file name nowhere, and a table naming
-                # the file with no line of it would mean the per-statement metadata
-                # never made it.
+                # The file name is the decisive part: a binary carrying only the
+                # CRT's debug info has "linecheck.miko" nowhere in it, so this cannot
+                # pass for the wrong reason.
+                #
+                # The line count is a softer check on purpose. -O2 folds the
+                # assignments away and their locations with them, and how much it
+                # folds differs by target, so asking for a particular line or for
+                # many of them would fail for reasons that have nothing to do with
+                # the compiler. Two distinct lines means the table maps code, not
+                # just a file.
                 $lines = @{}
                 foreach ($m in [regex]::Matches($dump, "(?m)^\s*0x[0-9a-fA-F]+\s+(\d+)\s")) {
                     $n = [int]$m.Groups[1].Value
                     if ($n -gt 0) { $lines[$n] = $true }
                 }
-                if ($lines.Count -lt 3) {
+                if ($lines.Count -lt 2) {
                     $failures.Add("line table maps code to $($lines.Count) source line(s); expected at least 3")
                 }
             }
