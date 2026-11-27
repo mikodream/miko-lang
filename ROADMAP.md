@@ -711,6 +711,43 @@ error: undefined variable 'missing'
 - **结构体最后一个字段必须带尾逗号**。`struct P { x: i64, y: i64 }` 解析失败（`expected Colon, got RightBrace`），加个逗号就正常。其他语言两种都允许，这是个 wart。
 - **`examples/` 有 11 个程序编译不过**，与本次改动无关（改前改后同样失败）：`modules`、`std_math` 等卡在 `%t50 defined with type double but expected i64`，`vec_basics`、`std_collections` 卡在 vec 无运行期支持，`module_struct_types` 卡在模块路径解析。`examples/` 不在门禁的正例集合里，所以一直没暴露。
 
+### 9.14.1 诊断补完：15 个典型静态错误，全部带位置和插入符
+
+9.13 交付时检查规则能用，但诊断本身有两个缺口，量出来才发现：
+
+```
+改前   9 / 15 带 file:line:col 和插入符
+改后  15 / 15
+```
+
+**四条只有行号没有列。** 全是消息里引用类型名的那类：`cannot assign 'string' to variable 'x' of type 'i64'` 开头引的是 `'string'`，它在出错那行里根本不存在，所以插入符无处可指，位置就停在行。现在 `report_error` 遍历消息里**每一个**被引用的名字，取第一个能在行内找到的。只有两条消息完全只引用类型（bool 条件和数组下标），这两条把插入符落在语句第一个 token 上——因为消息文本在三个引擎之间必须逐字相同，不能改。另外把行号栏宽度改成跟随行号位数，两位数行号不再让插入符错一格。
+
+**三条根本没被前端抓到**，都是 LLVM 用 IR 措辞报出来的：
+
+| 程序 | 改前 LLVM 报的 | 现在前端报的 |
+| --- | --- | --- |
+| `P { y: 1 }`（P 只有 x） | `expected value token` | `struct 'P' has no field 'y'` |
+| `P { x: "s" }`（x 是 i64） | `'%t2' defined with type 'ptr' but expected 'i64'` | `field 'x' of struct 'P' expects 'i64', got 'string'` |
+| `a[i]`（i 是 string） | `'%t6' defined with type 'ptr' but expected 'i64'` | `array index must be an integer, got 'string'` |
+
+`check_struct_literals` 只数字段**个数**，不看名字也不看类型，所以名字错的通过个数检查、类型错的把指针存进 i64 槽。`check_index_types` 只看字面量，索引是**变量**就漏了。第三个需要变量的类型，那只有 `check_types` 有，所以两个新检查都挂在它的 payload 分支上。
+
+十五个消息里十个与 C++ 前端逐字相同；五个措辞不同，是**有意保留**的，因为这五个自举版本说得更多：`'n' is a variable of type 'i64', not a function` 对 `unknown function 'n'`，`unknown type 'NoEnum' for variable 'e'` 对 `unknown enum 'NoEnum'`。为了统一而把信息删掉不值得——difftest 比对的是 stdout，不是诊断文本。
+
+`tools/static15.ps1` 跑这十五个，已接进 `gate.yml` 和 `release.yml`，下次这块退化会直接失败，而不是悄悄退回 LLVM 措辞。
+
+发布包实测（`v0.2.0-51`，windows-x64）：
+
+```
+$ miko.exe p.miko p
+error: field 'x' of struct 'P' expects 'i64', got 'string'
+ --> p.miko:5:20
+  |
+5 |     let p: P = P { x: "s" };
+  |                    ^
+```
+
+`failed` 走 stdout，诊断走 stderr，退出码 1。
 ### 9.15 第 2 项：让内存真的被回收
 
 先量。改动之前，运行时里 `free()` 的调用次数是 **0**——程序创建过的每一个字符串都留在堆上，直到进程退出。
@@ -787,11 +824,23 @@ name: "hello.miko"
 | 项 | 值 |
 | --- | --- |
 | difftest | `44 / 44`（33 用例 + 11 个 `.reject`） |
-| bootstrap 定点 | `5DA42A1AEF52B962`，两代一致，`3491411` 字节，`19 / 19` |
-| dwarf check | 通过（编译单元、子程序、段、行映射） |
+| bootstrap 定点 | `F873D37296DBC1A1`，两代一致，`3554991` 字节，`19 / 19` |
+| dwarf check | 通过（编译单元、子程序、行映射） |
+| static15 | `15 / 15` 带 `file:line:col` 和插入符 |
 | 编译自身峰值 | 16.2 MB（GC 前 640.6 MB） |
 
 `MIKO_GC_STRESS=1` 下 difftest 同样 `44 / 44`。
+
+再用发布包（`v0.2.0-51`，windows-x64）独立复测一遍，因为这才是用户拿到的东西：
+
+| 负载 | 峰值工作集 |
+| --- | --- |
+| 编译 400 万个字符串分配的程序 | **5.5 MB** |
+| 同样代码，分配量降到 1/16 | 5.5 MB |
+| 编译编译器自身（`--self`，3.55 MB IR） | 155.7 MB |
+| 生成程序跑 200 万次循环 | 16.3 MB，输出 `32000000` |
+
+前两行是回收器起作用的关键证据：**峰值与分配总量无关**。没有 `free()` 的时候，400 万个字符串光数据就是 68 MB 起，而且没有上界。
 
 ### 9.16.1 让六个平台都同意：-g，以及各平台把 DWARF 放在哪
 
