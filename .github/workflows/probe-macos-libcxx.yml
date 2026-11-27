@@ -1,0 +1,90 @@
+name: probe macos libcxx pairing
+
+# Temporary. Two ways to make the archive's clang agree with a C++ runtime on
+# macos-arm64, tried in order. Deleted once one of them holds.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pairing:
+    name: macos arm64 libc++ pairing
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 22.1.8 for arm64
+        run: |
+          set -euo pipefail
+          url='https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-ARM64.tar.xz'
+          curl -fsSL "$url" -o llvm.tar.xz
+          mkdir -p llvm-dist
+          tar -xf llvm.tar.xz --strip-components=1 -C llvm-dist
+          rm -f llvm.tar.xz
+          brew install zstd
+          {
+            echo "LIBRARY_PATH=$(brew --prefix zstd)/lib"
+            echo "LLVM_DIR=$PWD/llvm-dist/lib/cmake/llvm"
+            echo "LLVM_LIB=$PWD/llvm-dist/lib"
+            echo "LLVM_BIN=$PWD/llvm-dist/bin"
+          } >> "$GITHUB_ENV"
+          ./llvm-dist/bin/llvm-config --version
+
+      # Building is not the bar. The bar is compiling the whole compiler, because the
+      # static-libc++ variant linked, printed its version, and then aborted the moment
+      # a real workload reached operator new.
+      - name: Attempt A - static libc++.a only
+        run: |
+          set -uo pipefail
+          echo "=== A: static libc++.a ==="
+          rm -rf build-a
+          CC="$LLVM_BIN/clang" CXX="$LLVM_BIN/clang++" cmake -S . -B build-a -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMIKO_ENABLE_LLVM=ON -DLLVM_DIR="$LLVM_DIR" \
+            -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ $LLVM_LIB/libc++.a" > /dev/null 2>&1
+          echo "configure: $?"
+          cmake --build build-a --target miko 2>&1 | tail -8
+          if [ -f build-a/miko ]; then
+            ./build-a/miko --version && ./build-a/miko compiler/main_ll.miko --compile --emit-ir -o /tmp/a.ll && echo "A_OK $(wc -c < /tmp/a.ll)" || echo "A_FAILED_RUNTIME"
+          else
+            echo "A_NO_BINARY"
+          fi
+
+      - name: Attempt B - the SDK's own libc++ headers, nothing static
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "=== B: SDK headers ==="
+          sdk="$(xcrun --show-sdk-path)"
+          hdr="$sdk/usr/include/c++/v1"
+          ls "$hdr/__functional/hash.h" || echo "no hash.h in SDK"
+          grep -c hash_memory "$hdr/__functional/hash.h" || echo "0 in SDK header"
+          rm -rf build-b
+          CC="$LLVM_BIN/clang" CXX="$LLVM_BIN/clang++" cmake -S . -B build-b -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMIKO_ENABLE_LLVM=ON -DLLVM_DIR="$LLVM_DIR" \
+            -DCMAKE_CXX_FLAGS="-nostdinc++ -isystem $hdr" > /dev/null 2>&1
+          echo "configure: $?"
+          cmake --build build-b --target miko 2>&1 | tail -8
+          if [ -f build-b/miko ]; then
+            ./build-b/miko --version && ./build-b/miko compiler/main_ll.miko --compile --emit-ir -o /tmp/b.ll && echo "B_OK $(wc -c < /tmp/b.ll)" || echo "B_FAILED_RUNTIME"
+          else
+            echo "B_NO_BINARY"
+          fi
+
+      - name: Attempt C - archive libc++ headers with Apple's dylib
+        if: always()
+        run: |
+          set -uo pipefail
+          echo "=== C: archive headers, system libc++ ==="
+          # Only interesting if A and B both fail: it isolates whether the archive's
+          # headers or its library is what the abort comes from.
+          rm -rf build-c
+          CC="$LLVM_BIN/clang" CXX="$LLVM_BIN/clang++" cmake -S . -B build-c -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMIKO_ENABLE_LLVM=ON -DLLVM_DIR="$LLVM_DIR" > /dev/null 2>&1
+          echo "configure: $?"
+          cmake --build build-c --target miko 2>&1 | tail -6
+          if [ -f build-c/miko ]; then
+            ./build-c/miko --version && ./build-c/miko compiler/main_ll.miko --compile --emit-ir -o /tmp/c.ll && echo "C_OK $(wc -c < /tmp/c.ll)" || echo "C_FAILED_RUNTIME"
+          else
+            echo "C_NO_BINARY"
+          fi

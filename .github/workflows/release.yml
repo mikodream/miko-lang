@@ -163,7 +163,7 @@ jobs:
           # CMAKE_EXE_LINKER_FLAGS in the environment is silently ignored, and the
           # link then fails on __hash_memory exactly as if the flag were never set.
           libs="$PWD/llvm-dist/lib"
-          echo "MIKO_EXE_LINKER_FLAGS=-nostdlib++ $libs/libc++.a $libs/libc++abi.a $libs/libunwind.a" >> "$GITHUB_ENV"
+          echo "MIKO_EXE_LINKER_FLAGS=-nostdlib++ $libs/libc++.a" >> "$GITHUB_ENV"
           ./llvm-dist/bin/llvm-config --version
 
       - name: Install LLVM (macOS x64)
@@ -192,15 +192,17 @@ jobs:
           set -euo pipefail
           # MIKO_EXE_LINKER_FLAGS is only set by the macOS arm64 job, where the C++
           # runtime has to come from the LLVM archive to match the archive's headers.
-          extra=()
+          # A plain string rather than an array: macOS ships bash 3.2, where an empty
+          # array counts as unset under `set -u` and `${extra[@]}` aborts the script.
+          extra=""
           if [ -n "${MIKO_EXE_LINKER_FLAGS:-}" ]; then
-            extra+=("-DCMAKE_EXE_LINKER_FLAGS=$MIKO_EXE_LINKER_FLAGS")
+            extra="-DCMAKE_EXE_LINKER_FLAGS=$MIKO_EXE_LINKER_FLAGS"
           fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DMIKO_ENABLE_LLVM=ON \
             -DLLVM_DIR="$LLVM_DIR" \
-            "${extra[@]}"
+            ${extra:+"$extra"}
           cmake --build build --target miko
 
       # ---- stage 1: the self-hosted compiler -------------------------------
@@ -518,7 +520,9 @@ jobs:
             return $t.Trim()
           }
           New-Item -ItemType Directory -Force -Path tests\diff | Out-Null
-          Copy-Item tests\* -Destination tests\diff -Recurse -Force
+          # -File, because tests\* would also match the tests\diff directory that
+          # was just created and try to copy it into itself.
+          Get-ChildItem tests -File | Copy-Item -Destination tests\diff -Force
           $fail = 0
           $pass = 0
           foreach ($exe in (Get-ChildItem tests\diff -Filter *.exe | Sort-Object Name)) {
