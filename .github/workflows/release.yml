@@ -255,6 +255,13 @@ jobs:
         run: |
           pwsh -NoProfile -File tools/dwarfcheck.ps1 -RepoRoot . -Compiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "dwarf check failed" }
+      # The diagnostics are checked here as well as in the gate because the shipped
+      # compiler is the one users run, and its output is what they read.
+      - name: Static errors carry file:line:col and a caret
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools\static15.ps1 . -Compiler stage1/miko
+          if ($LASTEXITCODE -ne 0) { throw "static error diagnostics are incomplete" }
 
       # ---- assemble the package --------------------------------------------
       # The layout is flat on purpose. The compiler resolves two things by relative

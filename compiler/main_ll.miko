@@ -1173,24 +1173,66 @@ fn report_error(source: string, path: string, raw: string) {
     if text == "" {
         return;
     }
-    // The name the message quotes is what the caret points at.
-    let q1 = find_char_in(msg, 0, '\'');
-    let head = " --> " + path + ":" + digits_of(line);
-    if q1 >= len(msg) - 1 {
-        eprint(head);
-        return;
+    // The caret points at whatever the message quotes that is actually on the line.
+    //
+    // Trying only the first quoted name was wrong for every message that quotes a
+    // type: "cannot assign 'string' to variable 'x' of type 'i64'" leads with
+    // 'string', which appears nowhere on the offending line, so those diagnostics
+    // printed a line number with no column and no caret. Four of the fifteen typical
+    // static errors came out that way.
+    let line_no = digits_of(line);
+    let head = " --> " + path + ":" + line_no;
+    let col: i64 = 0 - 1;
+    let scan = find_char_in(msg, 0, '\'');
+    while scan < len(msg) - 1 && col < 0 {
+        let qa = find_char_in(msg, scan, '\'');
+        if qa >= len(msg) - 1 {
+            scan = len(msg);
+        } else {
+            let qb = find_char_in(msg, qa + 1, '\'');
+            if qb >= len(msg) {
+                scan = len(msg);
+            } else {
+                let name = substring(msg, qa + 1, qb - qa - 1);
+                let found = column_of(name, text);
+                if found >= 0 {
+                    col = found;
+                } else {
+                    scan = qb + 1;
+                }
+            }
+        }
     }
-    let q2 = find_char_in(msg, q1 + 1, '\'');
-    let name = substring(msg, q1 + 1, q2 - q1 - 1);
-    let col = column_of(name, text);
     if col < 0 {
-        eprint(head);
-        return;
+        // Nothing quoted is on the line. Two messages are like this: "if condition
+        // must be bool-compatible, got 'string'" quotes only the type, and
+        // "array index must be an integer, got 'string'" likewise, so neither names
+        // the identifier the user should look at. Point at the first token of the
+        // statement instead of leaving the caret off: the column is then still
+        // honest about where the offending statement begins. The message text stays
+        // as it is, because all three engines are required to word it identically.
+        let lead: i64 = 0;
+        let scanning = true;
+        while lead < len(text) && scanning {
+            let ch = char_at(text, lead);
+            if ch == ' ' || ch == '\t' {
+                lead = lead + 1;
+            } else {
+                scanning = false;
+            }
+        }
+        if lead >= len(text) {
+            lead = 0;
+        }
+        col = lead;
     }
     eprint(head + ":" + digits_of(col + 1));
-    eprint("  |");
-    eprint(digits_of(line) + " | " + text);
-    eprint("  | " + caret_pad(col) + "^");
+    // The gutter is as wide as the line number, so a two-digit line does not shift
+    // the caret by one.
+    let gutter = caret_pad(len(line_no)) + " | ";
+    eprint(caret_pad(len(line_no)) + " |");
+    eprint(line_no + " | " + text);
+    eprint(gutter + caret_pad(col) + "^");
 }
 
 // ---- type checking ---------------------------------------------------------
@@ -1865,6 +1907,121 @@ fn tc_check_members(text: string, locals: string, structs: string, tree: string)
     return "";
 }
 
+// A struct literal has to name fields the struct declares, with values of the
+// declared types.
+//
+// check_struct_literals only counted them, so `P { y: 1 }` for a struct declaring
+// `x` passed the count and reached LLVM, which complained "expected value token" in
+// terms of IR. `P { x: "s" }` for `x: i64` got through as well and became a store of
+// a pointer into an i64 slot. Both are the user's mistake in miko terms, so they are
+// reported in miko terms.
+fn tc_check_struct_literal(text: string, locals: string, structs: string, fns: string): string {
+    let n = len(text);
+    let brace = find_char_outside_quotes(text, 0, '{');
+    if brace >= n {
+        return "";
+    }
+    let name = tc_read_word_back(text, brace);
+    if name == "" || tc_lookup(structs, name) == "" {
+        return "";
+    }
+    let close = find_char_outside_quotes(text, brace + 1, '}');
+    if close >= n {
+        return "";
+    }
+    let inside = substring(text, brace + 1, close - brace - 1);
+    let entries = tc_split_top(inside, ',');
+    let count = tc_list_count(entries);
+    let k: i64 = 0;
+    while k < count {
+        let entry = trim_line(tc_list_at(entries, k));
+        if entry != "" {
+            let colon = find_char_outside_quotes(entry, 0, ':');
+            if colon < len(entry) {
+                let field = trim_line(substring(entry, 0, colon));
+                let value = trim_line(substring(entry, colon + 1, len(entry) - colon - 1));
+                let want = tc_field_type(structs, name, field);
+                if want == "" {
+                    return "struct '" + name + "' has no field '" + field + "'";
+                }
+                if value != "" {
+                    let have = tc_type_of(value, locals, structs, fns);
+                    if !tc_compatible(have, want) {
+                        return "field '" + field + "' of struct '" + name + "' expects '" + want + "', got '" + have + "'";
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
+// The word immediately before `stop`, stepping back over spaces.
+fn tc_read_word_back(text: string, stop: i64): string {
+    let e = stop;
+    let b: i64 = 0 - 1;
+    while e > 0 && b < 0 {
+        let ch = char_at(text, e - 1);
+        if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+            e = e - 1;
+        } else {
+            b = e;
+            while b > 0 && tc_is_word_char(char_at(text, b - 1)) {
+                b = b - 1;
+            }
+        }
+    }
+    if b < 0 {
+        return "";
+    }
+    return substring(text, b, e - b);
+}
+
+// An index has to be an integer. Literal cases (`a["s"]`, `a[true]`) are caught by
+// check_index_types, which never sees the type of a variable, so `a[i]` with
+// `let i: string` passed the front end and failed inside LLVM with "'%t6' defined
+// with type 'ptr' but expected 'i64'".
+fn tc_check_index(text: string, locals: string, structs: string, fns: string): string {
+    let n = len(text);
+    let i: i64 = 0;
+    let quote: char = ' ';
+    while i < n {
+        let ch = char_at(text, i);
+        if quote != ' ' {
+            if ch == quote {
+                quote = ' ';
+            }
+            i = i + 1;
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch;
+            i = i + 1;
+            continue;
+        }
+        if ch == '[' {
+            let close = find_char_outside_quotes(text, i + 1, ']');
+            if close < n {
+                let inner = trim_line(substring(text, i + 1, close - i - 1));
+                if inner != "" && tc_is_word_char(char_at(inner, 0)) {
+                    let word = tc_read_word(inner, 0);
+                    if word == inner {
+                        let itype = tc_lookup_local(locals, word);
+                        if itype != "" && !tc_is_numeric(itype) {
+                            return "array index must be an integer, got '" + itype + "'";
+                        }
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
 // Checks every call site in a node's text against the declared parameter types.
 fn tc_check_calls(text: string, locals: string, structs: string, fns: string): string {
     let n = len(text);
@@ -2136,6 +2293,14 @@ fn check_types(tree: string): string {
             let member = tc_check_members(payload, locals, structs, tree);
             if member != "" {
                 return at_node(member, tree, i);
+            }
+            let literal = tc_check_struct_literal(payload, locals, structs, fns);
+            if literal != "" {
+                return at_node(literal, tree, i);
+            }
+            let subscript = tc_check_index(payload, locals, structs, fns);
+            if subscript != "" {
+                return at_node(subscript, tree, i);
             }
         }
 
