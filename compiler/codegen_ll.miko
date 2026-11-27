@@ -1691,7 +1691,7 @@ fn is_identifier(tok: string): bool {
     return (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_';
 }
 
-fn is_builtin_name(name: string): bool {
+pub fn is_builtin_name(name: string): bool {
     return name == "print" || name == "len" || name == "input" || name == "arg_count"
         || name == "arg_at" || name == "char_at" || name == "substring" || name == "read_file"
         || name == "write_file" || name == "exit" || name == "eprint"

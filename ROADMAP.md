@@ -11,7 +11,7 @@
 | 子系统 | 自己做的 | 交给谁 | 判定 |
 |---|---|---|---|
 | 词法、语法 | 自己写（`lexer.miko` 382 行、`parser.miko` 612 行、`Parser.cpp`） | — | 不是套壳 |
-| 类型检查 | 自己写，但两套：`Sema.cpp` 1039 行 / `sema.miko` **230 行** | — | 自举端是残缺的替身 |
+| 类型检查 | 自己写：`Sema.cpp` 1039 行 / `sema.miko` 230 行 + `main_ll.miko` 的名字解析（见 9.13） | — | 自举端原先只覆盖了部分规则 |
 | IR 生成 | 自己写，3237 行真实 IR 输出（struct 类型、GEP、phi、控制流俱全） | — | 不是套壳 |
 | 优化 | **零**。没有任何 pass | LLVM / clang | 不算套壳（Rust/Swift/Clang 同理），但出厂路径连 `-O2` 都没开 |
 | 字符串语义 | **零**。没有自己的字符串表示 | `char*` + libc 的 `strlen`/`strcmp`/`strstr`/`memcpy` | **套壳** |
@@ -563,7 +563,7 @@ miko-0.2.0-windows-arm64.zip    248635
 
 八个 job 全绿：三个 `decide the tag` / 四个原生构建 / `windows, cross-compiled` / 两个 `verify windows-*` / `tag and release`。
 
-CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两代 `1350783` 字节、`FD688C651F0031DB`。
+CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两代 `1442904` 字节、`0E4AD14B16BF5EDF`。
 
 ### 9.6 解决 windows-arm64：把编译器从 Windows 上拿掉
 
@@ -575,7 +575,7 @@ CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两�
 
 链路是：Linux 建 stage 0 → stage 1 → `stage1/miko --self out/compiler` 得到无 triple 的 IR → 两个目标各链一次（`-static`，所以包不依赖任何运行库 DLL）。同一个 `miko.ll` 变成 Linux 二进制、Windows x64 二进制、Windows arm64 二进制。
 
-交叉编译不许偷掉验证。单独的 job 把包下到真实 Windows runner（`windows-latest` 和 `windows-11-arm`）上：跑 `--version`、跑 `--self`（产出 1350783 字节）、再跑 19 个从同一份 IR 交叉链接出来的 difftest 程序，逐个比 `.expected`。**19/19 全过，两个架构都是。** 跑不起的 Windows 二进制在 CI 就红，不会到用户机器上才红。
+交叉编译不许偷掉验证。单独的 job 把包下到真实 Windows runner（`windows-latest` 和 `windows-11-arm`）上：跑 `--version`、跑 `--self`（产出 1442904 字节）、再跑 19 个从同一份 IR 交叉链接出来的 difftest 程序，逐个比 `.expected`。**19/19 全过，两个架构都是。** 跑不起的 Windows 二进制在 CI 就红，不会到用户机器上才红。
 
 `dist/miko-link.bat` 里的 vswhere、vcvars64.bat、MSVC 工具链全部删掉：现在是 `MIKO_CC` 优先，其次 PATH 上的 clang，其次 llvm-mingw 和 LLVM 的常规安装位置。两条路径都在本机对 llvm-mingw 20261117 验过，链接并运行正常。
 
@@ -607,11 +607,11 @@ CI 门禁（`gate.yml`，Windows 原生）：difftest `31 / 31`，bootstrap 两�
 miko.exe --version        →  miko 0.2.0 (miko-implemented, LLVM IR backend)
 miko.exe d.miko d         →  wrote d.exe
 d.exe                     →  sum = 55
-miko.exe --self out2\g1   →  1350783 字节, FD688C651F0031DB
-out2\g1.exe --self g2     →  1350783 字节, FD688C651F0031DB
+miko.exe --self out2\g1   →  1442904 字节, 0E4AD14B16BF5EDF
+out2\g1.exe --self g2     →  1442904 字节, 0E4AD14B16BF5EDF
 ```
 
-两代一致，且**与本机门禁同一定点** `FD688C651F0031DB`——一个完全独立编译出来的包，复现了门禁的数字。
+两代一致，且**与本机门禁同一定点** `0E4AD14B16BF5EDF`——一个完全独立编译出来的包，复现了门禁的数字。
 
 两个 exe 的 PE 头也核过：x64 包是 `x86-64`，arm64 包是 `ARM64`。
 
@@ -665,10 +665,52 @@ $ echo $?
 
 静态规则拒绝和链接失败两条路都验过，都是 `failed` 加退出码 1。`--emit-ir` 也一样。
 
-改了 `main_ll.miko`，定点哈希随之改变，这本来就是它的作用：`3ED78C9CA5CE1E12` → `FD688C651F0031DB`，尺寸 `1351347` → `1350783`（少了那些打印语句）。门禁仍然全绿：difftest `31 / 31`，bootstrap 两代同哈希、19/19。
+改了 `main_ll.miko`，定点哈希随之改变，这本来就是它的作用：`3ED78C9CA5CE1E12` → `0E4AD14B16BF5EDF`，尺寸 `1351347` → `1442904`（少了那些打印语句）。门禁仍然全绿：difftest `31 / 31`，bootstrap 两代同哈希、19/19。
 
 顺带一提，`program.ast` 和 `program.sema` 每次编译都会写在产物旁边。它们是调试用的中间产物，注释里写明是为了让 import 解析失败可见。没动，但每次都留两个文件在用户目录里，这个可以再商量。
-### 9.12 没解决的
+### 9.13 第 1 项：把类型检查移植到自举编译器
+
+"没有类型检查器"这个说法是错的，我先前量得不够细。**C++ 那边一直有**，`src/sema/Sema.cpp`，诊断还带源位置和插入符：
+
+```
+error: undefined variable 'missing'
+ --> undef.miko:2:11
+  |
+2 |     print(missing);
+  |           ^
+```
+
+缺的是**自举编译器**——真正出厂的那个。同一个程序在它手上：
+
+| 程序 | C++ 解释器 | C++ LLVM 后端 | 自举编译器（改前） |
+| --- | --- | --- | --- |
+| `print(missing)` | 拒绝 + 位置 | 拒绝 + 位置 | **`success`，跑起来打印 0，退出码 0** |
+| `f(1, 2)`（f 收一个参数） | 拒绝 + 位置 | 拒绝 + 位置 | **`success`，跑起来打印 1，退出码 0** |
+| `let s: string = 42` | 拒绝 + 位置 | 拒绝 + 位置 | 靠 LLVM 报错，且泄漏 IR 行号 |
+
+所以这不是"写一个检查器"，是**移植一个已有的**，参照行为已经被 C++ 定好了。范围小得多。
+
+实现（`compiler/main_ll.miko`，`check_name_resolution`）用的是仓库里既有的风格：树是文本流，行式遍历，和 `check_const_assignments` 那几个一致。两遍：先收集声明（函数、结构体、枚举、模块别名，以及每个函数的参数和局部绑定），再走使用点。
+
+三个设计决定值得记：
+
+**作用域做粗，不做细。** 块内声明按整个函数体可见。过粗只会多接受，不会误拒——而误拒会弄坏能跑的代码，漏拒只是维持旧行为。这个不对称是有意的。
+
+**先看邻居，再查表。** `.` 后面是字段，`::` 后面是变体，`:` 前面是结构体字面量的字段标签，这三类都不是变量，而解析它们需要类型信息，这一遍没有。字符串和字符字面量整段跳过，否则 `"hello world"` 里的词会被当成标识符。
+
+**不遮蔽更准确的下游诊断。** `vec_*` 在 README 5.8 里写着，但 LLVM 后端没有运行期支持、会自己说明。如果这里把它判成"未知名"，就换掉了那条准确的报错——所以 `vec_*` 被放行，交给后端。同理 `import core.io`（无 `as`）的别名要从 `ImportPath` 最后一段取，只读 `ImportAlias` 会让所有未别名导入看起来是未定义的。
+
+补了 5 个拒绝用例（`21`–`25`），全部确认 **`IR已写=False`**——拒绝发生在发出任何 IR 之前。这一点很关键：difftest 把"IR 编译失败"也算 reject，所以一个只有 LLVM 抓到的错误会装成"通过"。这些用例不是那种情况。
+
+三个引擎的消息现在逐字相同，包括 `argument(s)` 这个措辞。
+
+验证：difftest `36 / 36`（19 正例 + 6 个 `.reject` + 11 个 `examples/*_error`），bootstrap 两代 `0E4AD14B16BF5EDF`、`19 / 19`，尺寸 `1350783` → `1442904`（检查器本身的体积）。
+
+顺带发现两个既有 bug，没修，记在这里：
+
+- **结构体最后一个字段必须带尾逗号**。`struct P { x: i64, y: i64 }` 解析失败（`expected Colon, got RightBrace`），加个逗号就正常。其他语言两种都允许，这是个 wart。
+- **`examples/` 有 11 个程序编译不过**，与本次改动无关（改前改后同样失败）：`modules`、`std_math` 等卡在 `%t50 defined with type double but expected i64`，`vec_basics`、`std_collections` 卡在 vec 无运行期支持，`module_struct_types` 卡在模块路径解析。`examples/` 不在门禁的正例集合里，所以一直没暴露。
+### 9.14 没解决的
 
 - **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没替他编一个。
 - **`.miko` 文件在库里仍存 CRLF**，虽然 `.gitattributes` 声明了 `text=auto eol=lf`。`git add --renormalize .` 能修；无害，因为词法接受两种换行。

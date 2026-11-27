@@ -1,0 +1,7 @@
+fn one(): i64 {
+    let hidden: i64 = 7;
+    return hidden;
+}
+fn main() {
+    print(hidden);
+}

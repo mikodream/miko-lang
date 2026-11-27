@@ -1,0 +1,6 @@
+fn f(a: i64): i64 {
+    return a;
+}
+fn main() {
+    print(f(1, 2));
+}
