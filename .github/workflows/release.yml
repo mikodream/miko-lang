@@ -247,6 +247,15 @@ jobs:
           pwsh -NoProfile -File tools/difftest.ps1 -RepoRoot . -CppCompiler build/miko -SelfCompiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "difftest failed: $LASTEXITCODE case(s) disagreed" }
 
+      # Debug info is checked here rather than in gate.yml alone because this job
+      # links with the toolchain that ships, and it is the linker that decides
+      # whether the metadata in the IR survives into the executable.
+      - name: Check that debug information reaches the executable
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/dwarfcheck.ps1 -RepoRoot . -Compiler stage1/miko
+          if ($LASTEXITCODE -ne 0) { throw "dwarf check failed" }
+
       # ---- assemble the package --------------------------------------------
       # The layout is flat on purpose. The compiler resolves two things by relative
       # path: runtime/miko_runtime.c for linking and stdlib/core/math.miko for

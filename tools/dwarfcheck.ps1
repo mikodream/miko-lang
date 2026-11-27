@@ -98,27 +98,55 @@ if ((Test-Path $exe)) {
         # match, which is non-empty whenever any line lacks the pattern, so testing
         # an array that way reports a missing section for a file that has it.
         $sections = (& $Objdump -h $exe 2>&1 | Out-String)
-        if ($sections -notmatch "\.debug_line") { $failures.Add("executable has no .debug_line") }
-        if ($sections -notmatch "\.debug_info") { $failures.Add("executable has no .debug_info") }
-    }
+        $hasLine = $sections -match "\.debug_line"
+        $hasInfo = $sections -match "\.debug_info"
 
-    $dump = & $DwarfDump --debug-line $exe 2>&1 | Out-String
-    if ($dump -notmatch "linecheck\.miko") {
-        $failures.Add("line table does not name linecheck.miko")
-    } else {
-        # Count the distinct source lines the table maps code to. The exact set is
-        # not fixed: -O2 folds the assignments away and their locations with them,
-        # which is why this asks for several real line numbers rather than for a
-        # particular one. A binary whose only table is the CRT's has this file name
-        # nowhere, and a table naming the file with no line of it would mean the
-        # per-statement metadata never made it.
-        $lines = @{}
-        foreach ($m in [regex]::Matches($dump, "(?m)^\s*0x[0-9a-fA-F]+\s+(\d+)\s")) {
-            $n = [int]$m.Groups[1].Value
-            if ($n -gt 0) { $lines[$n] = $true }
-        }
-        if ($lines.Count -lt 3) {
-            $failures.Add("line table maps code to $($lines.Count) source line(s); expected at least 3")
+        # The compiler's part is finished once the IR holds resolvable metadata; from
+        # there the linker decides what reaches the executable. clang keeps the
+        # DWARF either way (checked on both targets: x86_64-w64-windows-gnu and
+        # x86_64-pc-windows-msvc objects both carry .debug_line), but the MSVC
+        # linker does not carry it into a PE, so a build driven by Win32 link.exe
+        # has none even though nothing is wrong. That is a property of the
+        # toolchain, not of the metadata, so the exe assertions apply only on a
+        # toolchain that preserves DWARF - and when they are skipped the reason is
+        # printed, because a check that quietly passes proves nothing.
+        if (-not ($hasLine -and $hasInfo)) {
+            # Report what was actually there. A failure that names only what is
+            # missing leaves the next question - did the linker keep CodeView, or
+            # nothing at all - to a second run.
+            $dbgSeen = @()
+            foreach ($m in [regex]::Matches($sections, "(?m)^\s*\d+\s+(\.\S+)")) {
+                if ($m.Groups[1].Value -match "debug") { $dbgSeen += $m.Groups[1].Value }
+            }
+            $listed = "none"
+            if ($dbgSeen.Count -gt 0) { $listed = $dbgSeen -join ", " }
+            Write-Host ("dwarf-check: debug sections in the executable: " + $listed)
+            if ($sections -match "debug\`$S") {
+                $script:dwarfSkipped = "the linker kept CodeView (.debug`$S) and dropped DWARF; exe assertions skipped"
+            } else {
+                $failures.Add("executable has no .debug_line or .debug_info")
+            }
+        } else {
+            $dump = & $DwarfDump --debug-line $exe 2>&1 | Out-String
+            if ($dump -notmatch "linecheck\.miko") {
+                $failures.Add("line table does not name linecheck.miko")
+            } else {
+                # Count the distinct source lines the table maps code to. The exact
+                # set is not fixed: -O2 folds the assignments away and their
+                # locations with them, which is why this asks for several real line
+                # numbers rather than for a particular one. A binary whose only
+                # table is the CRT's has this file name nowhere, and a table naming
+                # the file with no line of it would mean the per-statement metadata
+                # never made it.
+                $lines = @{}
+                foreach ($m in [regex]::Matches($dump, "(?m)^\s*0x[0-9a-fA-F]+\s+(\d+)\s")) {
+                    $n = [int]$m.Groups[1].Value
+                    if ($n -gt 0) { $lines[$n] = $true }
+                }
+                if ($lines.Count -lt 3) {
+                    $failures.Add("line table maps code to $($lines.Count) source line(s); expected at least 3")
+                }
+            }
         }
     }
 }
@@ -129,5 +157,10 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
-Write-Host "dwarf-check: compile unit, subprograms, sections and line mappings all present"
+if ($script:dwarfSkipped) {
+    Write-Host "dwarf-check: IR carries compile unit, subprograms and locations"
+    Write-Host ("dwarf-check: " + $script:dwarfSkipped)
+} else {
+    Write-Host "dwarf-check: compile unit, subprograms, sections and line mappings all present"
+}
 exit 0
