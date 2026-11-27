@@ -157,8 +157,13 @@ jobs:
           echo "CXX=$PWD/llvm-dist/bin/clang++" >> "$GITHUB_ENV"
           # -nostdlib++ stops the driver adding -lc++, then the archive's static
           # libraries are named directly so the linker takes those and not Apple's.
+          #
+          # Exported under a private name and passed to cmake as -D below, because
+          # CMake initialises its flags from the _INIT environment variables: setting
+          # CMAKE_EXE_LINKER_FLAGS in the environment is silently ignored, and the
+          # link then fails on __hash_memory exactly as if the flag were never set.
           libs="$PWD/llvm-dist/lib"
-          echo "CMAKE_EXE_LINKER_FLAGS=-nostdlib++ $libs/libc++.a $libs/libc++abi.a $libs/libunwind.a" >> "$GITHUB_ENV"
+          echo "MIKO_EXE_LINKER_FLAGS=-nostdlib++ $libs/libc++.a $libs/libc++abi.a $libs/libunwind.a" >> "$GITHUB_ENV"
           ./llvm-dist/bin/llvm-config --version
 
       - name: Install LLVM (macOS x64)
@@ -185,10 +190,17 @@ jobs:
       - name: Configure and build stage 0
         run: |
           set -euo pipefail
+          # MIKO_EXE_LINKER_FLAGS is only set by the macOS arm64 job, where the C++
+          # runtime has to come from the LLVM archive to match the archive's headers.
+          extra=()
+          if [ -n "${MIKO_EXE_LINKER_FLAGS:-}" ]; then
+            extra+=("-DCMAKE_EXE_LINKER_FLAGS=$MIKO_EXE_LINKER_FLAGS")
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DMIKO_ENABLE_LLVM=ON \
-            -DLLVM_DIR="$LLVM_DIR"
+            -DLLVM_DIR="$LLVM_DIR" \
+            "${extra[@]}"
           cmake --build build --target miko
 
       # ---- stage 1: the self-hosted compiler -------------------------------
@@ -388,6 +400,19 @@ jobs:
             done
             echo "$target: $count cases cross-linked"
             [ "$count" -gt 0 ] || { echo "no cases were cross-linked" >&2; exit 1; }
+            # Some cases read a data file beside them - the embedded-NUL case opens
+            # tests/diff/19_embedded_nul.bin - so anything in the directory that is
+            # not a source file or an expected output travels too. Without this the
+            # programs run but report "failed to open file" instead of their result,
+            # which looks like a compiler bug and is a missing fixture.
+            for extra in tests/diff/*; do
+              case "$extra" in
+                *.miko|*.expected) continue ;;
+              esac
+              [ -f "$extra" ] || continue
+              cp "$extra" "verify-$target/"
+            done
+            ls "verify-$target" | wc -l
           done
 
       - uses: actions/upload-artifact@v4
@@ -473,6 +498,11 @@ jobs:
           } finally { Pop-Location }
 
       # The behavioural check: programs cross-linked from IR on Linux, executed here.
+      #
+      # They are placed back under tests/diff/ rather than run wherever they happen to
+      # be unpacked, because a case that reads a data file names it by path relative
+      # to the working directory - 19_embedded_nul opens tests/diff/19_embedded_nul.bin
+      # - and that path is part of what the case asserts.
       - name: Run the cross-linked differential suite
         shell: pwsh
         run: |
@@ -487,9 +517,11 @@ jobs:
             $t = $t -replace "`r", "`n"
             return $t.Trim()
           }
+          New-Item -ItemType Directory -Force -Path tests\diff | Out-Null
+          Copy-Item tests\* -Destination tests\diff -Recurse -Force
           $fail = 0
           $pass = 0
-          foreach ($exe in (Get-ChildItem tests -Filter *.exe | Sort-Object Name)) {
+          foreach ($exe in (Get-ChildItem tests\diff -Filter *.exe | Sort-Object Name)) {
             $expected = $exe.FullName -replace '\.exe$', '.expected'
             if (-not (Test-Path $expected)) { continue }
             $actual = Normalize (& $exe.FullName 2>&1 | Out-String)
