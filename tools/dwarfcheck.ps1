@@ -1,4 +1,4 @@
-# varfdwarf.ps1 - checks that compiled programs carry DWARF line information.
+# dwarfcheck.ps1 - checks that compiled programs carry DWARF line information.
 #
 # The type checker, the GC and DWARF were all added without a test that fails when
 # they stop working, and DWARF is the easiest of the three to lose silently: the
@@ -13,12 +13,19 @@
 #
 # The third check is the one that matters. .debug_* sections alone prove nothing:
 # the mingw CRT ships its own, so a binary with no miko metadata still has them.
+#
+# -IROnly stops after the first group. Use it on a toolchain that cannot carry debug
+# info into the executable at all: the Windows gate links through the MSVC
+# toolchain, and the executable it produces there has no debug sections of any kind,
+# so asserting that DWARF arrived would report a fact about the linker rather than
+# about the compiler. The release job links with llvm-mingw and checks everything.
 
 param(
     [string]$RepoRoot = ".",
     [string]$Compiler = "",
     [string]$DwarfDump = "",
-    [string]$Objdump = ""
+    [string]$Objdump = "",
+    [switch]$IROnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,10 +37,9 @@ if ($DwarfDump -eq "") {
         if ($found) { $DwarfDump = $found.Source; break }
     }
 }
-if ($DwarfDump -eq "" -or -not (Test-Path $DwarfDump)) {
-    Write-Host "dwarf-check: no llvm-dwarfdump found; skipping"
-    exit 0
-}
+# No early exit when dwarfdump is missing: the IR assertions do not need it, and
+# returning here would skip them on a machine that happens not to have the tool.
+# The exe part checks for it where it is used.
 
 $work = Join-Path $RepoRoot "out/dwarf-check"
 if (Test-Path $work) { Remove-Item $work -Recurse -Force }
@@ -56,7 +62,10 @@ fn main() {
 
 $failures = [System.Collections.Generic.List[string]]::new()
 $prefix = Join-Path $work "linecheck"
-$emit = & $Compiler $src $prefix 2>&1
+# With -IROnly the compile stops at the IR, so no linker and no C runtime are
+# involved: the assertions there are about what the compiler emits, and linking
+# would only add ways for the run to fail over something that is not being checked.
+if ($IROnly) { $emit = & $Compiler --emit-ir $src $prefix 2>&1 } else { $emit = & $Compiler $src $prefix 2>&1 }
 if ($LASTEXITCODE -ne 0) {
     Write-Host "dwarf-check: compile FAILED"
     Write-Host ($emit | Out-String).Trim()
@@ -66,7 +75,7 @@ if ($LASTEXITCODE -ne 0) {
 $ll = "$prefix.ll"
 $exe = "$prefix.exe"
 if (-not (Test-Path $ll)) { $failures.Add("no IR written") }
-if (-not (Test-Path $exe)) { $failures.Add("no executable written") }
+if (-not $IROnly -and -not (Test-Path $exe)) { $failures.Add("no executable written") }
 
 if ((Test-Path $ll)) {
     $ir = Get-Content $ll -Raw
@@ -86,7 +95,11 @@ if ((Test-Path $ll)) {
     }
 }
 
-if ((Test-Path $exe)) {
+if ($IROnly) {
+    $script:dwarfSkipped = "exe assertions skipped on request (-IROnly): this toolchain cannot carry debug info into the executable"
+} elseif ($DwarfDump -eq "" -or -not (Test-Path $DwarfDump)) {
+    $script:dwarfSkipped = "exe assertions skipped: no llvm-dwarfdump available to read the line table"
+} elseif ((Test-Path $exe)) {
     if ($Objdump -eq "") {
         foreach ($candidate in @("llvm-objdump", "llvm-objdump.exe")) {
             $found = Get-Command $candidate -ErrorAction SilentlyContinue
