@@ -29,6 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Require LF in Miko sources
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools\check-line-endings.ps1 -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "tracked .miko sources contain CRLF" }
+
       # Windows needs the LLVM release archive, not the LLVM installer. Neither
       # `choco install llvm` nor the official LLVM-*-win64.exe publishes
       # LLVMConfig.cmake - both install a clang-only tree whose lib/cmake/llvm holds

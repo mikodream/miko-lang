@@ -904,7 +904,7 @@ define i32 @main(...)  !dbg !7 {
 ### 9.17 没解决的
 
 - **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没替他编一个。
-- **`.miko` 文件在库里仍存 CRLF**，虽然 `.gitattributes` 声明了 `text=auto eol=lf`。`git add --renormalize .` 能修；无害，因为词法接受两种换行。
+- **`.miko` 文件的换行已统一为 LF**。此前 24 个受版本控制的源码文件含 CRLF，已统一规范化，并在 gate 中加入 `tools/check-line-endings.ps1`，防止跨平台提交重新引入 CRLF。
 - **LLVM 版本上限是 22**（Linux 钉 18）。23 删了 `IRBuilder::CreateGlobalStringPtr`、并且对 miko 生成的 IR 一律验证失败。现在 macos-x64 靠 brew 恰好还是 22.1.8_2——**这条是运气，不是保证**：brew 一升到 23，macos-x64 会和之前的 macos-arm64 一样卡在版本上。macos-arm64 用的是钉死的官方归档，不受影响。这是这份流水线最脆的一处。
 - **macOS 的 `-nostdinc++` 意味着 miko 的 C++ 代码只能用 SDK 那代 libc++ 头**。如果哪天表达式用到更新的东西，会先失败在编译，而不是在链接——失败点更清楚，但这个约束真实存在。
 - **`verify-windows` 只跑 19 个 difftest 用例**，不是全量 31 个：`tests/diff` 里带 `.expected` 的那些才交叉链接。另外 12 个是拒绝用例，靠 `gate.yml` 的三端一致覆盖。
