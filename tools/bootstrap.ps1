@@ -26,15 +26,35 @@ param(
 $ErrorActionPreference = 'Stop'
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
 
+# The linker is a .bat on Windows and a .sh everywhere else, and an executable has
+# no suffix on Unix. Without this the script only ran on the one Windows gate, so
+# the fixed point was only ever proven there; running it on the release platforms is
+# what shows the property holds per target rather than on a single machine.
+$onWindows = $true
+if ($env:OS -ne 'Windows_NT') { $onWindows = $false }
+$exeSuffix = ''
+if ($onWindows) { $exeSuffix = '.exe' }
+$linkScript = Join-Path $RepoRoot 'dist/miko-link.bat'
+if (-not $onWindows) { $linkScript = Join-Path $RepoRoot 'dist/miko-link.sh' }
+
+# Runs the linker on an IR file, returning the artifact path it should have written.
+function Invoke-Link {
+    param([string]$Ir, [string]$Prefix, [string]$WorkingDir)
+    $out = "$Prefix$exeSuffix"
+    if ($onWindows) {
+        return Invoke-Tool -Exe 'cmd.exe' -Arguments @('/c', $linkScript, $Ir, $out) -WorkingDir $WorkingDir
+    }
+    return Invoke-Tool -Exe 'bash' -Arguments @($linkScript, $Ir, $out) -WorkingDir $WorkingDir
+}
+
 if (-not $StartCompiler) {
-    $StartCompiler = Join-Path $RepoRoot 'dist/miko.exe'
+    $StartCompiler = Join-Path $RepoRoot "dist/miko$exeSuffix"
 }
 if (-not $WorkDir) {
     $WorkDir = Join-Path $RepoRoot 'out/bootstrap-check'
 }
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
-$linkScript = Join-Path $RepoRoot 'dist/miko-link.bat'
 if (-not (Test-Path $linkScript)) {
     Write-Host "bootstrap: missing $linkScript"
     exit 2
@@ -102,8 +122,8 @@ for ($g = 1; $g -le $Generations; $g++) {
     $hash = (Get-FileHash "$prefix.ll" -Algorithm SHA256).Hash
     $hashes += [pscustomobject]@{ Gen = $g; Hash = $hash }
 
-    $exe = "$prefix.exe"
-    $link = Invoke-Tool -Exe 'cmd.exe' -Arguments @('/c', $linkScript, "$prefix.ll", $exe) -WorkingDir $RepoRoot
+    $exe = "$prefix$exeSuffix"
+    $link = Invoke-Link -Ir "$prefix.ll" -Prefix $prefix -WorkingDir $RepoRoot
     if ($link.ExitCode -ne 0 -or -not (Test-Path $exe)) {
         $failures += "gen${g}: linking own IR failed (exit $($link.ExitCode))"
         Write-Host "bootstrap: gen$g link FAILED (exit $($link.ExitCode))"
@@ -116,11 +136,11 @@ for ($g = 1; $g -le $Generations; $g++) {
     foreach ($case in $cases) {
         $stem = Join-Path $WorkDir ("gen{0}_{1}" -f $g, $case.Name)
         $res = Invoke-Tool -Exe $exe -Arguments @($case.Source, $stem) -WorkingDir $RepoRoot
-        if ($res.ExitCode -ne 0 -or -not (Test-Path "$stem.exe")) {
+        if ($res.ExitCode -ne 0 -or -not (Test-Path "$stem$exeSuffix")) {
             $bad += "$($case.Name): compile exit $($res.ExitCode)"
             continue
         }
-        $run = Invoke-Tool -Exe "$stem.exe" -Arguments @() -WorkingDir $RepoRoot
+        $run = Invoke-Tool -Exe "$stem$exeSuffix" -Arguments @() -WorkingDir $RepoRoot
         $want = Get-Normalized (Get-Content $case.Expected -Raw)
         $got = Get-Normalized $run.Stdout
         if ($case.IsError) {

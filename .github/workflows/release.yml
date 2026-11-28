@@ -255,6 +255,7 @@ jobs:
         run: |
           pwsh -NoProfile -File tools/dwarfcheck.ps1 -RepoRoot . -Compiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "dwarf check failed" }
+
       # The diagnostics are checked here as well as in the gate because the shipped
       # compiler is the one users run, and its output is what they read.
       - name: Static errors carry file:line:col and a caret
@@ -262,6 +263,16 @@ jobs:
         run: |
           pwsh -NoProfile -File tools\static15.ps1 . -Compiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "static error diagnostics are incomplete" }
+
+      # The fixed point was only ever proven on the gate's one machine. The hash is
+      # per target - the IR names the triple - so proving it here proves it for the
+      # platform that ships, which is the claim that matters to whoever downloads
+      # this archive.
+      - name: Self-hosting reaches a fixed point here too
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/bootstrap.ps1 -RepoRoot . -StartCompiler stage1/miko
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap fixed point did not hold" }
 
       # ---- assemble the package --------------------------------------------
       # The layout is flat on purpose. The compiler resolves two things by relative
