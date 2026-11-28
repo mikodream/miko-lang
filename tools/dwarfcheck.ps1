@@ -97,6 +97,32 @@ if ((Test-Path $ll)) {
             break
         }
     }
+
+    # Every call inside a `define` that carries !dbg must carry one too, or LLVM
+    # discards the compile unit instead of the call. The symptom is not local: the
+    # executable keeps .debug_* from the C runtime, gets an empty line table for the
+    # language being compiled, and names no subprogram of it. That is what the
+    # Windows package shipped, and every check here passed because none of them
+    # looked at this and no Windows job ran them anyway.
+    #
+    # The assertion is on the IR rather than on the artifact because it does not need
+    # a linker, so it holds equally on a machine that cannot link for the target.
+    $inDbgFn = $false
+    $lineNo = 0
+    foreach ($line in ($ir -split "`r?`n")) {
+        $lineNo++
+        $t = $line.Trim()
+        if ($t -match '^define\b') {
+            $inDbgFn = $t -match '!dbg !\d+'
+            continue
+        }
+        if ($inDbgFn -and $t -eq '}') { $inDbgFn = $false; continue }
+        if (-not $inDbgFn) { continue }
+        if ($t -match '(^|\s)call\s' -and $t -notmatch '!dbg !\d+') {
+            $failures.Add("IR line ${lineNo}: call without !dbg inside a function that has one - $t")
+            if ($failures.Count -ge 4) { break }
+        }
+    }
 }
 # Where debug info has to survive depends on what the platform's linker does with
 # it, and that was measured rather than assumed:

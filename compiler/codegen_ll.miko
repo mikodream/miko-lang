@@ -3390,6 +3390,158 @@ fn dwarf_takes_dbg(text: string): bool {
     return true;
 }
 
+// Whether `text` contains `target` anywhere.
+fn dwarf_has_text(text: string, target: string): bool {
+    let n = len(text);
+    let m = len(target);
+    if m == 0 || m > n {
+        return false;
+    }
+    let i: i64 = 0;
+    while i + m <= n {
+        if substring(text, i, m) == target {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Whether a call instruction still needs a !dbg location.
+//
+// A `define` that carries !dbg puts its whole body under debug information, and from
+// then on every inlinable call inside it must name a location. When one does not,
+// clang does not merely ignore that call: it prints
+//
+//   inlinable function call in a function with debug info must have a !dbg location
+//   warning: ignoring invalid debug info
+//
+// and discards the compile unit, so the executable ends up with .debug_* from the C
+// runtime and none from miko - a line table with no entries and no subprogram names.
+// That is what the Windows package did for every program that called a user
+// function, and nothing caught it because no Windows job ran dwarfcheck.
+//
+// The cause is in the emitter: a function's first statement is lowered while the
+// function header is still closed, and its marker is only emitted once the header
+// opens, so that statement's instructions - including any call it makes - land
+// before the marker. The prologue's call to miko_set_args lands before every marker.
+fn dwarf_needs_pending(text: string): bool {
+    let body = trim_spaces(text);
+    if len(body) == 0 || dwarf_has_text(body, "!dbg") {
+        return false;
+    }
+    if starts_with_at(body, 0, "call ") {
+        return true;
+    }
+    if char_at(body, 0) == '%' {
+        let eq = find_char(body, 0, '=');
+        if eq < len(body) {
+            let rhs = trim_spaces(substring(body, eq + 1, len(body) - eq - 1));
+            return starts_with_at(rhs, 0, "call ");
+        }
+    }
+    return false;
+}
+
+// The !dbg id of the next instruction at or after `from` that has one, stopping at
+// the end of the enclosing function. "" when there is none.
+fn dwarf_next_dbg(text: string, from: i64): string {
+    let n = len(text);
+    let scan = from;
+    let found = "";
+    let stop = false;
+    while scan < n && !stop && found == "" {
+        let send = find_char(text, scan, '\n');
+        let sbody = trim_spaces(substring(text, scan, send - scan));
+        if sbody == "}" || starts_with_at(sbody, 0, "define ") {
+            stop = true;
+        } else {
+            // Every `!` in the line is visited once: `hit` advances on both branches.
+            // An earlier version advanced it only when the `!` did not start `!dbg `,
+            // so a `!dbg ` with no digits after it left `hit` where it was - the
+            // compiler then spun on that line until it was killed, having burned
+            // nineteen minutes of CPU on a twelve-line program.
+            let hit = find_char(sbody, 0, '!');
+            let m = len(sbody);
+            while hit < m && found == "" {
+                let is_dbg = false;
+                if hit + 5 <= m && substring(sbody, hit, 5) == "!dbg " {
+                    is_dbg = true;
+                }
+                if is_dbg {
+                    let digits = "";
+                    let k = hit + 5;
+                    // The reference is written `!dbg !6`: the id is a metadata
+                    // reference, so a `!` comes before the number. Reading digits
+                    // straight after `!dbg ` found none and dropped every
+                    // placeholder, which left the IR exactly as broken as before.
+                    if k < m && char_at(sbody, k) == '!' {
+                        k = k + 1;
+                    }
+                    while k < m && char_at(sbody, k) >= '0' && char_at(sbody, k) <= '9' {
+                        digits = digits + substring(sbody, k, 1);
+                        k = k + 1;
+                    }
+                    if digits != "" {
+                        found = digits;
+                    } else {
+                        hit = k;
+                    }
+                } else {
+                    let nxt = find_char(sbody, hit + 1, '!');
+                    if nxt >= m {
+                        hit = m;
+                    } else {
+                        hit = nxt;
+                    }
+                }
+            }
+            if found == "" {
+                scan = send + 1;
+            }
+        }
+    }
+    return found;
+}
+
+// Resolves the `;@pend` placeholder left on a call that had no marker, by copying
+// the location of the next instruction in the same function that has one: a call and
+// the statement it belongs to share a source line, so the next location in the body
+// is that line. If the function has no later location, the placeholder is dropped and
+// the instruction stays as it was - valid IR without a location, which is the
+// behaviour being replaced, not something worse. The placeholder is a comment so that
+// failing to resolve it cannot produce invalid IR.
+fn dwarf_resolve_pending(text: string): string {
+    if !dwarf_has_text(text, ";@pend") {
+        return text;
+    }
+    let out = "";
+    let n = len(text);
+    let i: i64 = 0;
+    while i < n {
+        let line_end = find_char(text, i, '\n');
+        let line = substring(text, i, line_end - i);
+        let body = trim_spaces(line);
+        let is_pend = false;
+        if len(body) >= 6 && substring(body, len(body) - 6, 6) == ";@pend" {
+            is_pend = true;
+        }
+        if is_pend {
+            let id = dwarf_next_dbg(text, line_end + 1);
+            let kept = substring(line, 0, len(line) - 6);
+            if id != "" {
+                out = out + kept + ", !dbg !" + id + "\n";
+            } else {
+                out = out + kept + "\n";
+            }
+        } else {
+            out = out + line + "\n";
+        }
+        i = line_end + 1;
+    }
+    return out;
+}
+
 // Rewrites `ir` so that every instruction reachable from a source marker carries a
 // !dbg pointing at a DILocation for that line, and appends the metadata tail.
 // Returns `ir` untouched when it holds no function definition, so a caller that
@@ -3476,6 +3628,17 @@ pub fn dwarf_finish(ir: string, source_path: string): string {
             continue;
         }
 
+        // A call that arrives before any marker in its function - the prologue's
+        // miko_set_args, and whatever the first statement lowers - has no line to
+        // point at yet. Marking it here and resolving it after the whole file is
+        // walked, instead of guessing a line now, is what keeps this a single pass
+        // over the IR.
+        if body_open && pending_line == 0 && dwarf_needs_pending(body) {
+            body_text = body_text + line + " ;@pend\n";
+            i = line_end + 1;
+            continue;
+        }
+
         body_text = body_text + line + "\n";
         i = line_end + 1;
     }
@@ -3488,7 +3651,9 @@ pub fn dwarf_finish(ir: string, source_path: string): string {
     let dwarf_version = next_meta;
     let debug_version = next_meta + 1;
     let ident = next_meta + 2;
-    let out = body_text + "\n";
+    // Any call that arrived before its function's first marker is still carrying a
+    // placeholder; give it the location of the next instruction in its function.
+    let out = dwarf_resolve_pending(body_text) + "\n";
     let out2 = out + "!llvm.dbg.cu = !{!0}\n";
     let out3 = out2 + "!llvm.module.flags = !{!" + number_to_text(dwarf_version)
         + ", !" + number_to_text(debug_version) + "}\n";
@@ -3995,5 +4160,4 @@ pub fn generate_ir(tree_input: string, source_path: string): string {
     // DILocation needs its subprogram as scope and subprogram ids are only settled
     // once every function is known.
     let assembled = final_state.globals + "\n" + final_state.out;
-    return dwarf_finish(assembled, source_path);
-}
+    return dwarf_finish(assembled, source_path);}
