@@ -636,11 +636,8 @@ jobs:
           # for the same reason: they are an artefact of capture, not of the program.
           function Normalize([string]$text) {
             if ($null -eq $text) { return "" }
-            $t = $text -replace "`r
-", "
-"
-            $t = $t -replace "`r", "
-"
+            $t = $text -replace "`r`n", "`n"
+            $t = $t -replace "`r", "`n"
             return $t.Trim()
           }
           New-Item -ItemType Directory -Force -Path tests\diff | Out-Null
