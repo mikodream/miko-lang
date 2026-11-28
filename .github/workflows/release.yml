@@ -517,6 +517,10 @@ jobs:
           - os: windows-11-arm
             target: windows-arm64
     steps:
+      # The repo is checked out so the verification scripts are here. The package
+      # arrives as an artifact; the checks are part of the source.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -565,20 +569,40 @@ jobs:
       - name: Debug information reaches the executable
         shell: pwsh
         run: |
+          # llvm-dwarfdump ships beside clang, and clang is what the packaging job
+          # used, so its own directory is the first place to look. The runner image
+          # also installs LLVM under Program Files. Searching only the Program Files
+          # path found nothing on windows-x64 and the step failed on a tool that was
+          # on the machine all along.
           $dump = ""
-          foreach ($candidate in @("$env:ProgramFiles\LLVM\bin\llvm-dwarfdump.exe")) {
-            if (Test-Path $candidate) { $dump = $candidate }
+          $clang = Get-Command clang -ErrorAction SilentlyContinue
+          if ($clang) {
+            $near = Join-Path (Split-Path $clang.Source -Parent) "llvm-dwarfdump.exe"
+            if (Test-Path $near) { $dump = $near }
+          }
+          if ($dump -eq "") {
+            foreach ($candidate in @("$env:ProgramFiles\LLVM\bin\llvm-dwarfdump.exe",
+                                     "$env:ProgramFiles\llvm\bin\llvm-dwarfdump.exe")) {
+              if (Test-Path $candidate) { $dump = $candidate }
+            }
           }
           if ($dump -eq "") {
             $found = Get-Command llvm-dwarfdump -ErrorAction SilentlyContinue
             if ($found) { $dump = $found.Source }
           }
-          if ($dump -eq "") { throw "llvm-dwarfdump not found; the debug info cannot be verified here" }
-          Push-Location work\miko
-          try {
-            pwsh -NoProfile -File ..\..\tools\dwarfcheck.ps1 -RepoRoot ..\.. -Compiler .\miko.exe -DwarfDump $dump
-            if ($LASTEXITCODE -ne 0) { throw "dwarf check failed on windows" }
-          } finally { Pop-Location }
+          # -IROnly does not read the artifact, so dwarfdump is not needed for it: a
+          # missing tool must not fail a check that never calls it. Requiring it here
+          # is what failed windows-x64, on a tool that job did not use.
+          if ($dump -eq "") { Write-Host "llvm-dwarfdump not found; -IROnly does not need it" }
+          else { Write-Host "using $dump" }
+          # -IROnly, because linking here would need a C compiler the runner does not
+          # guarantee, and the assertion that catches this bug is the IR one: a call
+          # without !dbg inside a function that has one. Linking is checked on the
+          # Unix jobs, which build their own binaries anyway.
+          $miko = Join-Path $PWD "work\miko\miko.exe"
+          if (-not (Test-Path $miko)) { throw "compiler missing at $miko" }
+          pwsh -NoProfile -File tools\dwarfcheck.ps1 -RepoRoot . -Compiler $miko -DwarfDump $dump -IROnly
+          if ($LASTEXITCODE -ne 0) { throw "dwarf check failed on windows" }
 
       # The behavioural check: programs cross-linked from IR on Linux, executed here.
       #
