@@ -264,15 +264,27 @@ jobs:
           pwsh -NoProfile -File tools\static15.ps1 . -Compiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "static error diagnostics are incomplete" }
 
-      # The fixed point was only ever proven on the gate's one machine. The hash is
-      # per target - the IR names the triple - so proving it here proves it for the
-      # platform that ships, which is the claim that matters to whoever downloads
-      # this archive.
+      # The fixed point was only ever proven on the gate's one machine. It turns out
+      # the hash is the same everywhere - F873D37296DBC1A1 on all four of these
+      # platforms and on Windows - because the IR carries no target triple and no
+      # datalayout: the triple is supplied when the IR is linked, not when it is
+      # emitted. That is worth asserting rather than assuming, since a backend change
+      # that started baking the triple into the IR would show up here as four
+      # differing hashes.
       - name: Self-hosting reaches a fixed point here too
         shell: pwsh
         run: |
           pwsh -NoProfile -File tools/bootstrap.ps1 -RepoRoot . -StartCompiler stage1/miko
           if ($LASTEXITCODE -ne 0) { throw "bootstrap fixed point did not hold" }
+          # The fixed point has to be the same number here as on the other five
+          # platforms, because the IR carries no triple and no datalayout. Pinning it
+          # turns "we looked once and they matched" into a check: if the backend ever
+          # starts emitting a target-specific constant, this job fails with a hash
+          # that differs from the rest.
+          $expected = 'F873D37296DBC1A1'
+          $hash = (Get-FileHash 'out/bootstrap-check/gen2.ll' -Algorithm SHA256).Hash.Substring(0, 16)
+          Write-Host "bootstrap: gen2 hash $hash (expected $expected)"
+          if ($hash -ne $expected) { throw "bootstrap fixed point differs from the other platforms: $hash" }
 
       # ---- assemble the package --------------------------------------------
       # The layout is flat on purpose. The compiler resolves two things by relative
