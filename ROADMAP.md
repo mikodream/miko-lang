@@ -901,7 +901,11 @@ define i32 @main(...)  !dbg !7 {
 
 定点随源码改变，从 `F873D37296DBC1A1` 变为 `7D93916D417DC252`（`3554991` → `3610636` 字节），`release.yml` 里钉的值同步更新。
 
-### 9.17 没解决的
+### 9.17 成熟跨平台高性能语言还差什么
+
+三项最高优先级问题和验收条件已整理到 [`docs/MATURITY.md`](docs/MATURITY.md)。当前第一步已经落地：runtime 增加显式 `MikoFile` 生命周期 API，gate 和 release 都执行 `runtime-resource-test.ps1`；macOS x64 的 LLVM 安装增加 22.1.8 版本门禁，防止 Homebrew 升级后静默使用不兼容版本。
+
+### 9.18 没解决的
 
 - **没选 LICENSE**。仓库没有 LICENSE 文件，README 也没有许可声明。这是只有作者能决定的事，没替他编一个。
 - **`.miko` 文件的换行已统一为 LF**。此前 24 个受版本控制的源码文件含 CRLF，已统一规范化，并在 gate 中加入 `tools/check-line-endings.ps1`，防止跨平台提交重新引入 CRLF。

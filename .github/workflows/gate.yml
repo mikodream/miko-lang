@@ -90,6 +90,12 @@ jobs:
           gcc --version
           cmake --version
 
+      - name: Runtime resource lifecycle
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools\runtime-resource-test.ps1 -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "runtime resource lifecycle test failed" }
+
       # Which Visual Studio the runner image ships is not something this workflow
       # should know. It used to say "Visual Studio 17 2022" and that is exactly how
       # the first real run failed: windows-latest had already moved to Visual

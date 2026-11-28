@@ -17,6 +17,8 @@
 #include <string.h>
 #include <setjmp.h>
 
+#include "miko_runtime.h"
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -761,6 +763,64 @@ void miko_eprint_i64(long long value) {
 // produces an executable instead of stopping at an intermediate .ll.
 int miko_run_command(const char* command) {
     return system(command);
+}
+
+/* Explicit file handles for standard-library code that needs a resource to
+ * outlive one call. A closed handle remains allocated until destroy, so close is
+ * safe to call from both normal and error cleanup paths. */
+struct MikoFile {
+    FILE* stream;
+    int open;
+};
+
+MikoFile* miko_file_open(const char* path, const char* mode) {
+    MikoFile* file = (MikoFile*)calloc(1, sizeof(MikoFile));
+    if (file == NULL) {
+        return NULL;
+    }
+    file->stream = fopen(path, mode);
+    if (file->stream == NULL) {
+        free(file);
+        return NULL;
+    }
+    file->open = 1;
+    return file;
+}
+
+int miko_file_is_open(const MikoFile* file) {
+    return file != NULL && file->open && file->stream != NULL;
+}
+
+size_t miko_file_read(MikoFile* file, void* buffer, size_t bytes) {
+    if (!miko_file_is_open(file)) {
+        return 0;
+    }
+    return fread(buffer, 1, bytes, file->stream);
+}
+
+size_t miko_file_write(MikoFile* file, const void* buffer, size_t bytes) {
+    if (!miko_file_is_open(file)) {
+        return 0;
+    }
+    return fwrite(buffer, 1, bytes, file->stream);
+}
+
+int miko_file_close(MikoFile* file) {
+    if (!miko_file_is_open(file)) {
+        return 0;
+    }
+    int result = fclose(file->stream) == 0 ? 1 : 0;
+    file->stream = NULL;
+    file->open = 0;
+    return result;
+}
+
+void miko_file_destroy(MikoFile* file) {
+    if (file == NULL) {
+        return;
+    }
+    miko_file_close(file);
+    free(file);
 }
 
 // 1 when the path can be opened for reading, 0 otherwise.

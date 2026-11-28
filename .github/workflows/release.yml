@@ -117,6 +117,9 @@ jobs:
           # linker has no libtinfo.so to resolve set_curterm against.
           sudo apt-get install -y llvm-18 llvm-18-dev clang-18 libclang-18-dev gcc \
             libtinfo-dev zlib1g-dev libzstd-dev
+          version=$(llvm-config-18 --version)
+          case "$version" in 18.*) ;; *) echo "unsupported Linux LLVM version: $version" >&2; exit 1 ;; esac
+          echo "LLVM_VERSION=$version" >> "$GITHUB_ENV"
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
@@ -180,7 +183,9 @@ jobs:
           # not found" while compiling the C runtime. It also keeps the -isystem above
           # from being the only thing that knows where the platform headers live.
           echo "SDKROOT=$sdk" >> "$GITHUB_ENV"
-          ./llvm-dist/bin/llvm-config --version
+          version=$(./llvm-dist/bin/llvm-config --version)
+          test "$version" = "22.1.8" || { echo "unsupported macOS arm64 LLVM version: $version" >&2; exit 1; }
+          echo "LLVM_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Install LLVM (macOS x64)
         if: runner.os == 'macOS' && matrix.target == 'macos-x64'
@@ -194,13 +199,21 @@ jobs:
           echo "$prefix/bin" >> "$GITHUB_PATH"
           # find_library consults these through the hints CMakeLists passes it.
           echo "LIBRARY_PATH=$(brew --prefix zstd)/lib:$(brew --prefix zlib)/lib" >> "$GITHUB_ENV"
-          "$prefix/bin/llvm-config" --version
+          version=$("$prefix/bin/llvm-config" --version)
+          test "$version" = "22.1.8" || { echo "unsupported macOS x64 LLVM version: $version" >&2; exit 1; }
+          echo "LLVM_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Report the toolchain
         run: |
           cmake --version
           clang --version || true
           echo "LLVM_DIR=${LLVM_DIR:-unset}"
+
+      - name: Runtime resource lifecycle
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/runtime-resource-test.ps1 -RepoRoot .
+          if ($LASTEXITCODE -ne 0) { throw "runtime resource lifecycle test failed" }
 
       # ---- stage 0: the C++ compiler ---------------------------------------
       - name: Configure and build stage 0
@@ -301,7 +314,7 @@ jobs:
           cp dist/miko-link.sh "$root/miko-link.sh"
           chmod +x "$root/miko-link.sh"
           printf './miko-link.sh\n' > "$root/miko.toolchain"
-          cp runtime/miko_runtime.c "$root/runtime/"
+          cp runtime/miko_runtime.c runtime/miko_runtime.h "$root/runtime/"
           cp -r stdlib/core "$root/stdlib/"
           cp compiler/*.miko "$root/compiler/"
           cp README.md BUILD.md TUTORIAL.md BOOTSTRAP.md ROADMAP.md "$root/"
@@ -345,6 +358,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-18 llvm-18-dev clang-18 libclang-18-dev gcc \
             libtinfo-dev zlib1g-dev libzstd-dev
+          version=$(llvm-config-18 --version)
+          case "$version" in 18.*) ;; *) echo "unsupported Linux LLVM version: $version" >&2; exit 1 ;; esac
+          echo "LLVM_VERSION=$version" >> "$GITHUB_ENV"
           echo "LLVM_DIR=$(llvm-config-18 --cmakedir)" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
 
@@ -417,7 +433,7 @@ jobs:
             "$clang" --target="$triple" -print-file-name=libc++.a > /dev/null
             cp dist/miko-link.bat "$root/miko-link.bat"
             printf 'miko-link.bat\n' > "$root/miko.toolchain"
-            cp runtime/miko_runtime.c "$root/runtime/"
+            cp runtime/miko_runtime.c runtime/miko_runtime.h "$root/runtime/"
             cp -r stdlib/core "$root/stdlib/"
             cp compiler/*.miko "$root/compiler/"
             cp README.md BUILD.md TUTORIAL.md BOOTSTRAP.md ROADMAP.md "$root/"
@@ -620,8 +636,11 @@ jobs:
           # for the same reason: they are an artefact of capture, not of the program.
           function Normalize([string]$text) {
             if ($null -eq $text) { return "" }
-            $t = $text -replace "`r`n", "`n"
-            $t = $t -replace "`r", "`n"
+            $t = $text -replace "`r
+", "
+"
+            $t = $t -replace "`r", "
+"
             return $t.Trim()
           }
           New-Item -ItemType Directory -Force -Path tests\diff | Out-Null
